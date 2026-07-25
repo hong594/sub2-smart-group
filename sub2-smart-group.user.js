@@ -2,7 +2,7 @@
 // @name         Sub2 & AIHub Smart Group
 // @name:zh-CN   Sub2 与 AIHub 智能分组
 // @namespace    local.sub2.smart-group
-// @version      1.4.0
+// @version      1.4.1
 // @description  AIHub group recommendation + sub2api account health and routing management (based on real traffic, no active probing).
 // @description:zh-CN 保留 AIHub 智能分组；并为 sub2api 增加基于真实流量的账号健康度可视化与路由管理（不主动测活）
 // @license      MIT
@@ -1797,7 +1797,7 @@
   const SUB2_POLL_SECONDS = 30;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '1.4.0';
+    : '1.4.1';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -2397,9 +2397,13 @@
       this.mount();
       this.refresh();
       this.refreshTimer = window.setInterval(() => this.refresh(), SUB2_POLL_SECONDS * 1000);
-      // 每秒仅重绘倒计时文案，不发请求。
+      // 每秒重绘倒计时：仅当存在“冷却中”的账号时才重建列表，
+      // 避免无谓的每秒全量重建把滚动位置顶掉（会表现为面板每秒自己往下滚）。
       this.tickTimer = window.setInterval(() => {
-        if (!this.minimized && this.accounts.length) this.renderList();
+        if (this.minimized || !this.accounts.length) return;
+        const now = Date.now();
+        const hasCountdown = this.accounts.some((account) => sub2ComputeHealth(account, now).coolingUntil > now);
+        if (hasCountdown) this.renderList();
       }, 1000);
       if (typeof GM_registerMenuCommand === 'function') {
         GM_registerMenuCommand('显示 Sub2 智能分组面板', () => this.setMinimized(false));
@@ -2666,6 +2670,8 @@
 
     renderList() {
       if (!this.listElement) return;
+      // 记录当前滚动位置，重建 DOM 后恢复，避免列表跳动。
+      const savedScrollTop = this.listElement.scrollTop;
       const now = Date.now();
       const filters = {
         groupFilter: this.groupFilter,
@@ -2696,6 +2702,7 @@
         for (const section of sections) {
           this.listElement.appendChild(this.buildGroupSection(section, now));
         }
+        this.listElement.scrollTop = savedScrollTop;
         return;
       }
 
@@ -2708,6 +2715,7 @@
       for (const account of rows) {
         this.listElement.appendChild(this.buildRow(account, now));
       }
+      this.listElement.scrollTop = savedScrollTop;
     }
 
     buildGroupSection(section, now) {
