@@ -2,7 +2,7 @@
 // @name         Sub2 & AIHub Smart Group
 // @name:zh-CN   Sub2 与 AIHub 智能分组
 // @namespace    local.sub2.smart-group
-// @version      1.7.1
+// @version      1.7.2
 // @description  AIHub group recommendation + sub2api account health, routing, and manual upstream model sync (no active health probing).
 // @description:zh-CN 保留 AIHub 智能分组；并为 sub2api 增加账号健康度、路由管理与手动上游模型同步（不主动测活）
 // @license      MIT
@@ -1802,7 +1802,7 @@
   const SUB2_ROUTING_LOOKBACK_MS = 30 * 60 * 1000;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '1.7.1';
+    : '1.7.2';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -2684,15 +2684,15 @@
       background:#fff;color:#0f172a;font-size:12px;outline:none;}
     #${SUB2_PANEL_ID} .sub2-account-search:focus,#${SUB2_PANEL_ID} .sub2-controls select:focus,
     #${SUB2_PANEL_ID} .sub2-groupfilter-btn:focus{border-color:#60a5fa;box-shadow:0 0 0 2px rgba(59,130,246,.12);}
-    #${SUB2_PANEL_ID} .sub2-filter-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;}
-    #${SUB2_PANEL_ID} .sub2-controls select{width:100%;min-width:0;border:1px solid #cbd5e1;border-radius:8px;padding:6px 8px;
-      background:#fff;color:#334155;font-size:12px;outline:none;cursor:pointer;}
-    #${SUB2_PANEL_ID} .sub2-groupfilter{position:relative;min-width:0;grid-column:1 / -1;}
+    #${SUB2_PANEL_ID} .sub2-filter-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:4px;}
+    #${SUB2_PANEL_ID} .sub2-controls select{width:100%;min-width:0;height:28px;border:1px solid #cbd5e1;border-radius:7px;
+      padding:4px 2px;background:#fff;color:#334155;font-size:10px;outline:none;cursor:pointer;}
+    #${SUB2_PANEL_ID} .sub2-groupfilter{position:relative;min-width:0;}
     #${SUB2_PANEL_ID} .sub2-groupfilter-btn{width:100%;display:flex;align-items:center;justify-content:space-between;gap:4px;
-      border:1px solid #cbd5e1;border-radius:8px;padding:6px 8px;font-size:12px;background:#fff;color:#334155;cursor:pointer;outline:none;}
+      height:28px;border:1px solid #cbd5e1;border-radius:7px;padding:4px 5px;font-size:10px;background:#fff;color:#334155;cursor:pointer;outline:none;}
     #${SUB2_PANEL_ID} .sub2-groupfilter-btn .sub2-gf-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-groupfilter-btn .sub2-gf-caret{color:#94a3b8;font-size:10px;}
-    #${SUB2_PANEL_ID} .sub2-groupfilter-pop{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:5;background:#fff;
+    #${SUB2_PANEL_ID} .sub2-groupfilter-pop{position:absolute;left:0;top:calc(100% + 4px);z-index:5;width:220px;max-width:calc(100vw - 52px);background:#fff;
       border:1px solid #cbd5e1;border-radius:8px;box-shadow:0 8px 24px rgba(15,23,42,.18);padding:6px;display:none;}
     #${SUB2_PANEL_ID} .sub2-groupfilter.open .sub2-groupfilter-pop{display:block;}
     #${SUB2_PANEL_ID} .sub2-groupfilter-pop input{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:6px;
@@ -2924,20 +2924,20 @@
             <select class="sub2-platform-filter" title="按平台筛选"></select>
             <select class="sub2-health-filter" title="按健康状态筛选">
               <option value="all">全部状态</option>
-              <option value="down">仅不可用</option>
-              <option value="warn">仅注意</option>
-              <option value="ok">仅正常</option>
-              <option value="paused">仅停用</option>
+              <option value="down">不可用</option>
+              <option value="warn">注意</option>
+              <option value="ok">正常</option>
+              <option value="paused">停用</option>
             </select>
             <select class="sub2-sort" title="账号排序">
-              <option value="health">排序：健康度</option>
-              <option value="priority">排序：优先级</option>
-              <option value="cost">排序：今日花费</option>
-              <option value="name">排序：名称</option>
+              <option value="health">按健康</option>
+              <option value="priority">按优先级</option>
+              <option value="cost">按花费</option>
+              <option value="name">按名称</option>
             </select>
             <select class="sub2-view" title="列表视图">
-              <option value="group">视图：按分组</option>
-              <option value="flat">视图：全部账号</option>
+              <option value="group">分组视图</option>
+              <option value="flat">账号视图</option>
             </select>
           </div>
         </div>
