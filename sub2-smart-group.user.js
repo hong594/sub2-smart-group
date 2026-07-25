@@ -2,7 +2,7 @@
 // @name         Sub2 & AIHub Smart Group
 // @name:zh-CN   Sub2 与 AIHub 智能分组
 // @namespace    local.sub2.smart-group
-// @version      1.1.0
+// @version      1.2.0
 // @description  AIHub group recommendation + sub2api account health and routing management (based on real traffic, no active probing).
 // @description:zh-CN 保留 AIHub 智能分组；并为 sub2api 增加基于真实流量的账号健康度可视化与路由管理（不主动测活）
 // @license      MIT
@@ -1794,6 +1794,9 @@
   const SUB2_API_BASE = '/api/v1';
   const SUB2_POLL_SECONDS = 30;
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
+  // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
+  // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
+  const SUB2_SORT_RANK = Object.freeze({ down: 3, warn: 2, ok: 1, paused: 0 });
   const SUB2_TONE_LABELS = Object.freeze({ ok: '正常', warn: '注意', paused: '已停用', down: '不可用' });
   const SUB2_SORT_LABELS = Object.freeze({ health: '健康度', priority: '优先级', cost: '今日花费', name: '名称' });
 
@@ -1929,7 +1932,7 @@
 
   function sub2SortAccounts(accounts, statsById, mode, now = Date.now()) {
     const rows = Array.isArray(accounts) ? accounts.slice() : [];
-    const healthRank = (account) => SUB2_TONE_RANK[sub2ComputeHealth(account, now).tone] || 0;
+    const healthRank = (account) => SUB2_SORT_RANK[sub2ComputeHealth(account, now).tone] ?? 0;
     const costOf = (account) => Number(statsById?.[account?.id]?.cost) || 0;
     const nameOf = (account) => String(account?.name || '').trim();
     if (mode === 'priority') {
@@ -1939,7 +1942,7 @@
     } else if (mode === 'name') {
       rows.sort((a, b) => nameOf(a).localeCompare(nameOf(b)));
     } else {
-      // health：坏的排前面，方便你优先处理
+      // health：真正有问题的（不可用/注意）置顶，正常居中，主动停用沉底
       rows.sort((a, b) => healthRank(b) - healthRank(a)
         || (Number(a.priority) || 0) - (Number(b.priority) || 0)
         || nameOf(a).localeCompare(nameOf(b)));
