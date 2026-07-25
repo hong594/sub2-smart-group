@@ -2,7 +2,7 @@
 // @name         Sub2 & AIHub Smart Group
 // @name:zh-CN   Sub2 与 AIHub 智能分组
 // @namespace    local.sub2.smart-group
-// @version      1.7.0
+// @version      1.7.1
 // @description  AIHub group recommendation + sub2api account health, routing, and manual upstream model sync (no active health probing).
 // @description:zh-CN 保留 AIHub 智能分组；并为 sub2api 增加账号健康度、路由管理与手动上游模型同步（不主动测活）
 // @license      MIT
@@ -1802,7 +1802,7 @@
   const SUB2_ROUTING_LOOKBACK_MS = 30 * 60 * 1000;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '1.7.0';
+    : '1.7.1';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -2724,7 +2724,9 @@
     #${SUB2_PANEL_ID} .sub2-row.tone-warn{border-color:#fde68a;background:#fffbeb;}
     #${SUB2_PANEL_ID} .sub2-row.tone-paused{background:#f8fafc;}
     #${SUB2_PANEL_ID} .sub2-row-top{display:flex;align-items:center;gap:6px;}
-    #${SUB2_PANEL_ID} .sub2-name{font-weight:700;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#0f172a;}
+    #${SUB2_PANEL_ID} .sub2-name-slot{flex:1;min-width:0;overflow:hidden;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-name{display:inline-block;max-width:100%;font-weight:700;overflow:hidden;text-overflow:ellipsis;
+      white-space:nowrap;color:#0f172a;vertical-align:top;}
     #${SUB2_PANEL_ID} .sub2-name-link{text-decoration:none;cursor:pointer;}
     #${SUB2_PANEL_ID} .sub2-name-link:hover{color:#2563eb;text-decoration:underline;}
     #${SUB2_PANEL_ID} .sub2-name-link::after{content:" ↗";color:#60a5fa;font-size:10px;text-decoration:none;}
@@ -3352,6 +3354,10 @@
         name.target = '_blank';
         name.rel = 'noopener noreferrer';
       }
+      // 只有名称文字和外链图标可点击；外层占据剩余宽度，避免整段空白成为链接热区。
+      const nameSlot = document.createElement('div');
+      nameSlot.className = 'sub2-name-slot';
+      nameSlot.appendChild(name);
       const priority = document.createElement('span');
       priority.className = 'sub2-priority';
       priority.title = '账号优先级：数值越小越优先';
@@ -3366,7 +3372,7 @@
       const platform = document.createElement('span');
       platform.className = 'sub2-platform';
       platform.textContent = String(account.platform || '');
-      top.append(name, priority);
+      top.append(nameSlot, priority);
       if (this.latestHit && Number(account.id) === this.latestHit.accountId) {
         const latestHitBadge = document.createElement('span');
         latestHitBadge.className = 'sub2-hit-badge';
