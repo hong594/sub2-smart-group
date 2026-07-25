@@ -2,9 +2,9 @@
 // @name         Sub2 & AIHub Smart Group
 // @name:zh-CN   Sub2 与 AIHub 智能分组
 // @namespace    local.sub2.smart-group
-// @version      1.4.2
-// @description  AIHub group recommendation + sub2api account health and routing management (based on real traffic, no active probing).
-// @description:zh-CN 保留 AIHub 智能分组；并为 sub2api 增加基于真实流量的账号健康度可视化与路由管理（不主动测活）
+// @version      1.5.0
+// @description  AIHub group recommendation + sub2api account health, routing, and manual upstream model sync (no active health probing).
+// @description:zh-CN 保留 AIHub 智能分组；并为 sub2api 增加账号健康度、路由管理与手动上游模型同步（不主动测活）
 // @license      MIT
 // @homepageURL   https://github.com/hong594/sub2-smart-group
 // @supportURL    https://github.com/hong594/sub2-smart-group/issues
@@ -1783,11 +1783,15 @@
   //   GET  /api/v1/admin/accounts                     账号列表（含健康/冷却字段）
   //   POST /api/v1/admin/accounts/today-stats/batch   今日真实用量（请求数 / 花费）
   //   GET  /api/v1/admin/groups/all                    完整分组列表
-  // 手动路由操作（不读取或提交 API Key）：
+  // 手动操作（不读取或提交 API Key）：
   //   POST /api/v1/admin/accounts/:id/schedulable      摘出 / 挂回调度池
   //   POST /api/v1/admin/accounts/:id/recover-state    清除冷却 / 恢复
   //   PUT  /api/v1/admin/accounts/:id                  仅调整账号优先级
-  // 全程不调用任何 test / probe / 测活类接口。健康度只反映“真实流量触发的状态”。
+  //   GET  /api/v1/admin/accounts/:id/models           查看 sub2 已保存的模型
+  //   POST /api/v1/admin/accounts/:id/models/sync-upstream
+  //                                                        用户点击后拉取并同步上游模型
+  // 不调用任何 test / probe / 测活类接口。模型同步只会由用户明确点击触发，
+  // 健康度仍然只反映“真实流量触发的状态”。
   // ===========================================================================
 
   const SUB2_PANEL_ID = 'sub2-smart-group-panel';
@@ -1797,7 +1801,7 @@
   const SUB2_POLL_SECONDS = 30;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '1.4.2';
+    : '1.5.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -1879,6 +1883,37 @@
     if (hours < 24) return `${hours} 小时前`;
     const days = Math.floor(hours / 24);
     return `${days} 天前`;
+  }
+
+  function sub2NormalizeModels(payload) {
+    const candidateCollections = [
+      payload,
+      payload?.models,
+      payload?.items,
+      payload?.list,
+      payload?.data,
+    ];
+    const sourceModels = candidateCollections.find((candidate) => Array.isArray(candidate)) || [];
+    const normalizedModels = [];
+    const seenModelIds = new Set();
+
+    for (const sourceModel of sourceModels) {
+      const modelId = String(
+        typeof sourceModel === 'string'
+          ? sourceModel
+          : sourceModel?.id ?? sourceModel?.model ?? sourceModel?.name ?? '',
+      ).trim();
+      if (!modelId || seenModelIds.has(modelId)) continue;
+      seenModelIds.add(modelId);
+      normalizedModels.push({
+        id: modelId,
+        displayName: String(sourceModel?.display_name ?? sourceModel?.displayName ?? modelId).trim() || modelId,
+        owner: String(sourceModel?.owned_by ?? sourceModel?.owner ?? '').trim(),
+        type: String(sourceModel?.type ?? sourceModel?.object ?? '').trim(),
+      });
+    }
+
+    return normalizedModels.sort((leftModel, rightModel) => leftModel.id.localeCompare(rightModel.id));
   }
 
   // 纯函数：根据账号的真实状态字段（非测活）推断健康度。
@@ -2265,6 +2300,17 @@
     return data?.stats || {};
   }
 
+  async function sub2FetchAccountModels(accountId) {
+    const data = await sub2ApiRequest('GET', `/admin/accounts/${accountId}/models`);
+    return sub2NormalizeModels(data);
+  }
+
+  async function sub2SyncAccountModels(accountId) {
+    // 该 POST 会访问上游并同步账号模型配置，只能由模型抽屉里的手动按钮触发。
+    await sub2ApiRequest('POST', `/admin/accounts/${accountId}/models/sync-upstream`);
+    return sub2FetchAccountModels(accountId);
+  }
+
   async function sub2SetSchedulable(accountId, schedulable) {
     return sub2ApiRequest('POST', `/admin/accounts/${accountId}/schedulable`, { schedulable });
   }
@@ -2282,10 +2328,10 @@
     #${SUB2_TOGGLE_ID}{position:fixed;right:18px;bottom:18px;z-index:2147483000;width:46px;height:46px;border-radius:50%;
       background:#2563eb;color:#fff;border:none;box-shadow:0 6px 18px rgba(37,99,235,.4);cursor:pointer;font-size:13px;font-weight:700;}
     #${SUB2_TOGGLE_ID}:hover{background:#1d4ed8;}
-    #${SUB2_PANEL_ID}{position:fixed;right:18px;bottom:74px;z-index:2147483000;width:420px;max-width:calc(100vw - 36px);
-      max-height:calc(100vh - 110px);display:flex;flex-direction:column;background:#fff;color:#0f172a;border:1px solid #e2e8f0;
+    #${SUB2_PANEL_ID}{position:fixed;right:18px;bottom:74px;z-index:2147483000;width:860px;max-width:calc(100vw - 36px);
+      height:clamp(420px,62vh,620px);max-height:calc(100vh - 110px);display:flex;flex-direction:column;background:#fff;color:#0f172a;border:1px solid #e2e8f0;
       border-radius:12px;box-shadow:0 12px 40px rgba(15,23,42,.22);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      font-size:13px;overflow:hidden;}
+      font-size:13px;overflow:hidden;isolation:isolate;}
     #${SUB2_PANEL_ID}.sub2-hidden{display:none;}
     #${SUB2_PANEL_ID} .sub2-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;
       background:#0f172a;color:#fff;}
@@ -2322,7 +2368,8 @@
     #${SUB2_PANEL_ID} .sub2-gf-option.active .sub2-gf-count{color:#60a5fa;}
     #${SUB2_PANEL_ID} .sub2-gf-empty{padding:6px 7px;color:#94a3b8;font-size:11px;}
     #${SUB2_PANEL_ID} .sub2-refresh{background:#2563eb;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px;}
-    #${SUB2_PANEL_ID} .sub2-list{overflow-y:auto;padding:6px 8px;display:flex;flex-direction:column;gap:6px;}
+    #${SUB2_PANEL_ID} .sub2-list{flex:1 1 auto;min-height:0;overflow-y:auto;padding:6px 8px;display:flex;flex-direction:column;gap:6px;}
+    #${SUB2_PANEL_ID} .sub2-list.sub2-flat-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-content:start;}
     #${SUB2_PANEL_ID} .sub2-group{border:1px solid #cbd5e1;border-radius:9px;background:#f8fafc;overflow:hidden;}
     #${SUB2_PANEL_ID} .sub2-group-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;padding:8px 9px;
       border-bottom:1px solid #e2e8f0;background:#eef2ff;}
@@ -2330,7 +2377,7 @@
     #${SUB2_PANEL_ID} .sub2-group-title strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#1e3a8a;}
     #${SUB2_PANEL_ID} .sub2-group-platform{padding:1px 6px;border-radius:999px;background:#dbeafe;color:#1d4ed8;font-size:10px;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-group-summary{max-width:58%;color:#64748b;font-size:10px;line-height:1.4;text-align:right;}
-    #${SUB2_PANEL_ID} .sub2-group-list{display:flex;flex-direction:column;gap:6px;padding:6px;}
+    #${SUB2_PANEL_ID} .sub2-group-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;gap:6px;padding:6px;}
     #${SUB2_PANEL_ID} .sub2-group-membership{color:#1d4ed8;}
     #${SUB2_PANEL_ID} .sub2-row{border:1px solid #e2e8f0;border-radius:8px;padding:8px;display:flex;flex-direction:column;gap:6px;}
     #${SUB2_PANEL_ID} .sub2-row.tone-down{border-color:#fecaca;background:#fef2f2;}
@@ -2354,6 +2401,34 @@
     #${SUB2_PANEL_ID} .sub2-btn:disabled{opacity:.5;cursor:not-allowed;}
     #${SUB2_PANEL_ID} .sub2-status{padding:6px 12px;border-top:1px solid #f1f5f9;font-size:11px;color:#64748b;}
     #${SUB2_PANEL_ID} .sub2-status.error{color:#b91c1c;}
+    #${SUB2_PANEL_ID} .sub2-model-overlay{position:absolute;inset:0;z-index:20;display:flex;justify-content:flex-end;
+      background:rgba(15,23,42,.36);backdrop-filter:blur(1px);}
+    #${SUB2_PANEL_ID} .sub2-model-overlay[hidden]{display:none;}
+    #${SUB2_PANEL_ID} .sub2-model-drawer{width:min(470px,100%);height:100%;display:flex;flex-direction:column;background:#fff;
+      border-left:1px solid #cbd5e1;box-shadow:-10px 0 28px rgba(15,23,42,.16);}
+    #${SUB2_PANEL_ID} .sub2-model-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:12px 14px;
+      border-bottom:1px solid #e2e8f0;background:#f8fafc;}
+    #${SUB2_PANEL_ID} .sub2-model-heading{min-width:0;}
+    #${SUB2_PANEL_ID} .sub2-model-title{display:block;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-model-subtitle{margin-top:3px;color:#64748b;font-size:11px;line-height:1.4;}
+    #${SUB2_PANEL_ID} .sub2-model-close{border:none;background:transparent;color:#64748b;cursor:pointer;font-size:20px;line-height:1;padding:0 2px;}
+    #${SUB2_PANEL_ID} .sub2-model-toolbar{display:flex;align-items:center;gap:7px;padding:9px 12px;border-bottom:1px solid #f1f5f9;}
+    #${SUB2_PANEL_ID} .sub2-model-toolbar input{flex:1;min-width:0;border:1px solid #cbd5e1;border-radius:6px;padding:5px 7px;font-size:12px;}
+    #${SUB2_PANEL_ID} .sub2-model-sync{white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-model-notice{padding:7px 12px;background:#fff7ed;color:#9a3412;border-bottom:1px solid #fed7aa;font-size:11px;line-height:1.45;}
+    #${SUB2_PANEL_ID} .sub2-model-state{padding:7px 12px;color:#64748b;font-size:11px;border-bottom:1px solid #f1f5f9;}
+    #${SUB2_PANEL_ID} .sub2-model-state.error{color:#b91c1c;background:#fef2f2;}
+    #${SUB2_PANEL_ID} .sub2-model-list{flex:1;min-height:0;overflow-y:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
+      align-content:start;gap:6px;padding:9px 10px;}
+    #${SUB2_PANEL_ID} .sub2-model-item{min-width:0;padding:7px 8px;border:1px solid #e2e8f0;border-radius:7px;background:#f8fafc;}
+    #${SUB2_PANEL_ID} .sub2-model-id{display:block;color:#0f172a;font-size:11px;font-weight:650;overflow-wrap:anywhere;}
+    #${SUB2_PANEL_ID} .sub2-model-meta{display:block;margin-top:3px;color:#64748b;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-model-empty{grid-column:1 / -1;padding:24px 12px;color:#64748b;text-align:center;line-height:1.6;}
+    @media (max-width:760px){
+      #${SUB2_PANEL_ID}{width:calc(100vw - 24px);right:12px;bottom:70px;height:min(68vh,560px);}
+      #${SUB2_PANEL_ID} .sub2-list.sub2-flat-list,#${SUB2_PANEL_ID} .sub2-group-list{grid-template-columns:1fr;}
+      #${SUB2_PANEL_ID} .sub2-model-list{grid-template-columns:1fr;}
+    }
   `;
 
   class Sub2Controller {
@@ -2369,6 +2444,12 @@
       this.groupElement = null;
       this.platformElement = null;
       this.healthElement = null;
+      this.modelOverlayElement = null;
+      this.modelTitleElement = null;
+      this.modelSearchElement = null;
+      this.modelSyncButtonElement = null;
+      this.modelStateElement = null;
+      this.modelListElement = null;
       this.accounts = [];
       this.groupsById = new Map();
       this.statsById = {};
@@ -2390,6 +2471,14 @@
       this.minimized = sub2StorageGet('minimized', false) === true;
       this.lastError = '';
       this.lastUpdatedAt = 0;
+      this.modelAccount = null;
+      this.models = [];
+      this.modelFilterText = '';
+      this.modelLoading = false;
+      this.modelSyncing = false;
+      this.modelMessage = '';
+      this.modelError = '';
+      this.modelRequestSequence = 0;
     }
 
     start() {
@@ -2465,6 +2554,24 @@
         </div>
         <div class="sub2-list"></div>
         <div class="sub2-status">加载中…</div>
+        <div class="sub2-model-overlay" hidden>
+          <section class="sub2-model-drawer" role="dialog" aria-modal="true" aria-labelledby="sub2-model-title">
+            <div class="sub2-model-head">
+              <div class="sub2-model-heading">
+                <strong id="sub2-model-title" class="sub2-model-title">账号模型</strong>
+                <div class="sub2-model-subtitle">默认只读取 sub2 已保存的数据，不会访问上游。</div>
+              </div>
+              <button type="button" class="sub2-model-close" title="关闭" aria-label="关闭模型列表">×</button>
+            </div>
+            <div class="sub2-model-toolbar">
+              <input type="text" class="sub2-model-search" placeholder="搜索模型…" />
+              <button type="button" class="sub2-btn primary sub2-model-sync">拉取并同步上游</button>
+            </div>
+            <div class="sub2-model-notice">“拉取并同步上游”会真实访问一次该账号的模型接口，并由 sub2 更新账号保存的模型配置；脚本不会自动执行。</div>
+            <div class="sub2-model-state">正在读取已保存模型…</div>
+            <div class="sub2-model-list"></div>
+          </section>
+        </div>
       `;
       document.body.appendChild(this.root);
 
@@ -2481,6 +2588,12 @@
       this.groupFilterOptionsEl = this.root.querySelector('.sub2-groupfilter-options');
       this.platformFilterEl = this.root.querySelector('.sub2-platform-filter');
       this.healthFilterEl = this.root.querySelector('.sub2-health-filter');
+      this.modelOverlayElement = this.root.querySelector('.sub2-model-overlay');
+      this.modelTitleElement = this.root.querySelector('.sub2-model-title');
+      this.modelSearchElement = this.root.querySelector('.sub2-model-search');
+      this.modelSyncButtonElement = this.root.querySelector('.sub2-model-sync');
+      this.modelStateElement = this.root.querySelector('.sub2-model-state');
+      this.modelListElement = this.root.querySelector('.sub2-model-list');
 
       this.viewElement.value = this.viewMode;
       this.sortElement.value = this.sortMode;
@@ -2527,6 +2640,16 @@
         }
       };
       document.addEventListener('click', this.outsideClickHandler);
+
+      this.root.querySelector('.sub2-model-close')?.addEventListener('click', () => this.closeModelDrawer());
+      this.modelOverlayElement?.addEventListener('click', (event) => {
+        if (event.target === this.modelOverlayElement) this.closeModelDrawer();
+      });
+      this.modelSearchElement?.addEventListener('input', () => {
+        this.modelFilterText = this.modelSearchElement.value.trim().toLocaleLowerCase();
+        this.renderModelDrawer();
+      });
+      this.modelSyncButtonElement?.addEventListener('click', () => this.handleSyncModels());
 
       this.applyMinimized();
     }
@@ -2670,6 +2793,7 @@
 
     renderList() {
       if (!this.listElement) return;
+      this.listElement.classList.toggle('sub2-flat-list', this.viewMode === 'flat');
       // 记录当前滚动位置，重建 DOM 后恢复，避免列表跳动。
       const savedScrollTop = this.listElement.scrollTop;
       const now = Date.now();
@@ -2843,8 +2967,159 @@
       downBtn.addEventListener('click', () => this.handlePriority(account, 1));
       actions.appendChild(downBtn);
 
+      const modelsBtn = document.createElement('button');
+      modelsBtn.className = 'sub2-btn primary';
+      modelsBtn.textContent = '模型';
+      modelsBtn.title = '先查看 sub2 已保存的模型；需要时可在抽屉中手动拉取上游';
+      modelsBtn.disabled = busy;
+      modelsBtn.addEventListener('click', () => this.openModelDrawer(account));
+      actions.appendChild(modelsBtn);
+
       row.append(top, meta, reasons, actions);
       return row;
+    }
+
+    async openModelDrawer(account) {
+      const requestSequence = ++this.modelRequestSequence;
+      this.modelAccount = account;
+      this.models = [];
+      this.modelFilterText = '';
+      this.modelLoading = true;
+      this.modelSyncing = false;
+      this.modelMessage = '';
+      this.modelError = '';
+      if (this.modelSearchElement) this.modelSearchElement.value = '';
+      if (this.modelOverlayElement) this.modelOverlayElement.hidden = false;
+      this.renderModelDrawer();
+
+      try {
+        const models = await sub2FetchAccountModels(account.id);
+        if (requestSequence !== this.modelRequestSequence) return;
+        this.models = models;
+        this.modelMessage = `已读取 sub2 保存的 ${models.length} 个模型，未访问上游。`;
+      } catch (error) {
+        if (requestSequence !== this.modelRequestSequence) return;
+        this.modelError = `读取已保存模型失败：${error?.message || error}`;
+      } finally {
+        if (requestSequence === this.modelRequestSequence) {
+          this.modelLoading = false;
+          this.renderModelDrawer();
+        }
+      }
+    }
+
+    closeModelDrawer() {
+      this.modelRequestSequence += 1;
+      this.modelAccount = null;
+      this.models = [];
+      this.modelFilterText = '';
+      this.modelLoading = false;
+      this.modelSyncing = false;
+      this.modelMessage = '';
+      this.modelError = '';
+      if (this.modelOverlayElement) this.modelOverlayElement.hidden = true;
+    }
+
+    renderModelDrawer() {
+      if (!this.modelAccount || !this.modelOverlayElement || !this.modelListElement) return;
+      this.modelOverlayElement.hidden = false;
+      const accountName = String(this.modelAccount.name || `账号 ${this.modelAccount.id}`).trim() || `账号 ${this.modelAccount.id}`;
+      if (this.modelTitleElement) {
+        this.modelTitleElement.textContent = `${accountName} · 模型`;
+        this.modelTitleElement.title = this.modelTitleElement.textContent;
+      }
+
+      if (this.modelSyncButtonElement) {
+        this.modelSyncButtonElement.disabled = this.modelLoading || this.modelSyncing;
+        this.modelSyncButtonElement.textContent = this.modelSyncing ? '同步中…' : '拉取并同步上游';
+      }
+      if (this.modelSearchElement) this.modelSearchElement.disabled = this.modelLoading;
+
+      if (this.modelStateElement) {
+        this.modelStateElement.classList.toggle('error', Boolean(this.modelError));
+        if (this.modelSyncing) {
+          this.modelStateElement.textContent = '正在访问上游模型接口并同步，请稍候…';
+        } else if (this.modelLoading) {
+          this.modelStateElement.textContent = '正在读取 sub2 已保存的模型，不访问上游…';
+        } else if (this.modelError) {
+          this.modelStateElement.textContent = this.modelError;
+        } else {
+          this.modelStateElement.textContent = this.modelMessage || `sub2 当前保存了 ${this.models.length} 个模型。`;
+        }
+      }
+
+      const matchingModels = this.models.filter((model) => {
+        if (!this.modelFilterText) return true;
+        return [model.id, model.displayName, model.owner, model.type]
+          .some((value) => String(value || '').toLocaleLowerCase().includes(this.modelFilterText));
+      });
+
+      this.modelListElement.textContent = '';
+      if (this.modelLoading) {
+        const loading = document.createElement('div');
+        loading.className = 'sub2-model-empty';
+        loading.textContent = '正在读取…';
+        this.modelListElement.appendChild(loading);
+        return;
+      }
+
+      if (!matchingModels.length) {
+        const empty = document.createElement('div');
+        empty.className = 'sub2-model-empty';
+        empty.textContent = this.models.length
+          ? '没有匹配的模型。'
+          : 'sub2 当前没有保存模型。需要时可点击“拉取并同步上游”。';
+        this.modelListElement.appendChild(empty);
+        return;
+      }
+
+      for (const model of matchingModels) {
+        const item = document.createElement('div');
+        item.className = 'sub2-model-item';
+        const modelId = document.createElement('span');
+        modelId.className = 'sub2-model-id';
+        modelId.textContent = model.id;
+        modelId.title = model.id;
+        item.appendChild(modelId);
+
+        const metadataParts = [];
+        if (model.displayName && model.displayName !== model.id) metadataParts.push(model.displayName);
+        if (model.owner) metadataParts.push(model.owner);
+        if (model.type && model.type !== 'model') metadataParts.push(model.type);
+        if (metadataParts.length) {
+          const metadata = document.createElement('span');
+          metadata.className = 'sub2-model-meta';
+          metadata.textContent = metadataParts.join(' · ');
+          metadata.title = metadata.textContent;
+          item.appendChild(metadata);
+        }
+        this.modelListElement.appendChild(item);
+      }
+    }
+
+    async handleSyncModels() {
+      if (!this.modelAccount || this.modelLoading || this.modelSyncing) return;
+      const account = this.modelAccount;
+      const requestSequence = ++this.modelRequestSequence;
+      this.modelSyncing = true;
+      this.modelMessage = '';
+      this.modelError = '';
+      this.renderModelDrawer();
+
+      try {
+        const models = await sub2SyncAccountModels(account.id);
+        if (requestSequence !== this.modelRequestSequence || this.modelAccount?.id !== account.id) return;
+        this.models = models;
+        this.modelMessage = `已从上游拉取并同步 ${models.length} 个模型。`;
+      } catch (error) {
+        if (requestSequence !== this.modelRequestSequence || this.modelAccount?.id !== account.id) return;
+        this.modelError = `上游模型同步失败：${error?.message || error}`;
+      } finally {
+        if (requestSequence === this.modelRequestSequence && this.modelAccount?.id === account.id) {
+          this.modelSyncing = false;
+          this.renderModelDrawer();
+        }
+      }
     }
 
     renderStatus() {
@@ -3002,6 +3277,7 @@
     shouldRefreshKeys,
     appendLogEntries,
     formatLogLine,
+    sub2NormalizeModels,
     start() {
       if (location.hostname === 'aihub.top') {
         new AppRouter().start();
