@@ -2,7 +2,7 @@
 // @name         Sub2 & AIHub Smart Group
 // @name:zh-CN   Sub2 与 AIHub 智能分组
 // @namespace    local.sub2.smart-group
-// @version      1.4.1
+// @version      1.4.2
 // @description  AIHub group recommendation + sub2api account health and routing management (based on real traffic, no active probing).
 // @description:zh-CN 保留 AIHub 智能分组；并为 sub2api 增加基于真实流量的账号健康度可视化与路由管理（不主动测活）
 // @license      MIT
@@ -1797,7 +1797,7 @@
   const SUB2_POLL_SECONDS = 30;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '1.4.1';
+    : '1.4.2';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -2867,8 +2867,6 @@
 
     async handleToggleSchedulable(account) {
       const target = !(account.schedulable !== false);
-      const verb = target ? '挂回调度池' : '摘出调度池';
-      if (!window.confirm(`确认将账号「${account.name}」${verb}？`)) return;
       this.setBusy(account.id, true);
       try {
         await sub2SetSchedulable(account.id, target);
@@ -2882,7 +2880,6 @@
     }
 
     async handleRecover(account) {
-      if (!window.confirm(`确认清除账号「${account.name}」的冷却/限流状态并恢复调度？`)) return;
       this.setBusy(account.id, true);
       try {
         await sub2RecoverState(account.id);
@@ -2899,7 +2896,6 @@
       const current = Number(account.priority) || 0;
       const next = Math.max(0, current + delta);
       if (next === current) return;
-      if (!window.confirm(`将账号「${account.name}」优先级从 ${current} 调整为 ${next}？`)) return;
       this.setBusy(account.id, true);
       try {
         await sub2UpdatePriority(account, next);
