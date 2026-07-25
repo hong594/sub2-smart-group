@@ -2,7 +2,7 @@
 // @name         Sub2 & AIHub Smart Group
 // @name:zh-CN   Sub2 与 AIHub 智能分组
 // @namespace    local.sub2.smart-group
-// @version      1.3.0
+// @version      1.4.0
 // @description  AIHub group recommendation + sub2api account health and routing management (based on real traffic, no active probing).
 // @description:zh-CN 保留 AIHub 智能分组；并为 sub2api 增加基于真实流量的账号健康度可视化与路由管理（不主动测活）
 // @license      MIT
@@ -1797,7 +1797,7 @@
   const SUB2_POLL_SECONDS = 30;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '1.3.0';
+    : '1.4.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -2143,6 +2143,79 @@
     return groupKeys.size;
   }
 
+  // 收集当前账号里出现过的平台（去重、按名称排序），用于生成平台筛选下拉。
+  function sub2CollectPlatforms(accounts) {
+    const platforms = new Set();
+    for (const account of Array.isArray(accounts) ? accounts : []) {
+      const platform = String(account?.platform || '').trim();
+      if (platform) platforms.add(platform);
+    }
+    return [...platforms].sort((left, right) => left.localeCompare(right));
+  }
+
+  // 收集分组下拉的选项：全部分组 / 未分配分组 / 各分组（带账号计数）。
+  // 返回 [{ key, name, count, special? }]，special 标记 all / ungrouped。
+  function sub2CollectGroupOptions(accounts, groupsById = null) {
+    const sourceAccounts = Array.isArray(accounts) ? accounts : [];
+    const optionsByKey = new Map();
+    let ungroupedCount = 0;
+
+    for (const account of sourceAccounts) {
+      const memberships = sub2GetGroupMemberships(account, groupsById);
+      if (!memberships.length) {
+        ungroupedCount += 1;
+        continue;
+      }
+      for (const membership of memberships) {
+        if (!optionsByKey.has(membership.groupKey)) {
+          optionsByKey.set(membership.groupKey, {
+            key: membership.groupKey,
+            name: membership.name,
+            groupId: membership.groupId,
+            count: 0,
+          });
+        }
+        optionsByKey.get(membership.groupKey).count += 1;
+      }
+    }
+
+    const groupOptions = [...optionsByKey.values()].sort((left, right) => {
+      if (left.groupId !== null && right.groupId !== null && left.groupId !== right.groupId) {
+        return left.groupId - right.groupId;
+      }
+      return left.name.localeCompare(right.name);
+    });
+
+    const options = [{ key: '', name: '全部分组', count: sourceAccounts.length, special: 'all' }];
+    if (ungroupedCount > 0) {
+      options.push({ key: 'ungrouped', name: '未分配分组', count: ungroupedCount, special: 'ungrouped' });
+    }
+    return options.concat(groupOptions);
+  }
+
+  // 判断账号是否命中当前激活的筛选（分组 / 平台 / 健康 / 文字）。纯函数，便于测试。
+  function sub2AccountMatchesActiveFilters(account, memberships, filters, now = Date.now()) {
+    const groupFilter = String(filters?.groupFilter || '');
+    const platformFilter = String(filters?.platformFilter || '');
+    const healthFilter = String(filters?.healthFilter || '');
+    const filterText = String(filters?.filterText || '').trim().toLocaleLowerCase();
+    const membershipList = Array.isArray(memberships) ? memberships : [];
+
+    if (groupFilter === 'ungrouped') {
+      if (membershipList.length) return false;
+    } else if (groupFilter) {
+      if (!membershipList.some((membership) => membership.groupKey === groupFilter)) return false;
+    }
+
+    if (platformFilter && String(account?.platform || '').trim() !== platformFilter) return false;
+
+    if (healthFilter && sub2ComputeHealth(account, now).tone !== healthFilter) return false;
+
+    if (filterText && !sub2AccountMatchesFilter(account, membershipList, filterText)) return false;
+
+    return true;
+  }
+
   async function sub2ApiRequest(method, path, body) {
     const token = sub2ReadAuthToken();
     const headers = { Accept: 'application/json' };
@@ -2230,6 +2303,24 @@
       border:1px solid #cbd5e1;border-radius:6px;padding:4px 6px;font-size:12px;}
     #${SUB2_PANEL_ID} .sub2-controls input{flex:1 1 130px;min-width:0;}
     #${SUB2_PANEL_ID} .sub2-controls select{max-width:92px;}
+    #${SUB2_PANEL_ID} .sub2-groupfilter{position:relative;flex:1 1 130px;min-width:0;}
+    #${SUB2_PANEL_ID} .sub2-groupfilter-btn{width:100%;display:flex;align-items:center;justify-content:space-between;gap:4px;
+      border:1px solid #cbd5e1;border-radius:6px;padding:4px 6px;font-size:12px;background:#fff;color:#0f172a;cursor:pointer;}
+    #${SUB2_PANEL_ID} .sub2-groupfilter-btn .sub2-gf-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-groupfilter-btn .sub2-gf-caret{color:#94a3b8;font-size:10px;}
+    #${SUB2_PANEL_ID} .sub2-groupfilter-pop{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:5;background:#fff;
+      border:1px solid #cbd5e1;border-radius:8px;box-shadow:0 8px 24px rgba(15,23,42,.18);padding:6px;display:none;}
+    #${SUB2_PANEL_ID} .sub2-groupfilter.open .sub2-groupfilter-pop{display:block;}
+    #${SUB2_PANEL_ID} .sub2-groupfilter-pop input{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:6px;
+      padding:4px 6px;font-size:12px;margin-bottom:6px;}
+    #${SUB2_PANEL_ID} .sub2-groupfilter-options{max-height:180px;overflow-y:auto;display:flex;flex-direction:column;}
+    #${SUB2_PANEL_ID} .sub2-gf-option{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:5px 7px;
+      border-radius:6px;cursor:pointer;font-size:12px;color:#0f172a;}
+    #${SUB2_PANEL_ID} .sub2-gf-option:hover{background:#f1f5f9;}
+    #${SUB2_PANEL_ID} .sub2-gf-option.active{background:#eff6ff;color:#1d4ed8;font-weight:600;}
+    #${SUB2_PANEL_ID} .sub2-gf-option .sub2-gf-count{color:#94a3b8;font-size:11px;font-weight:400;}
+    #${SUB2_PANEL_ID} .sub2-gf-option.active .sub2-gf-count{color:#60a5fa;}
+    #${SUB2_PANEL_ID} .sub2-gf-empty{padding:6px 7px;color:#94a3b8;font-size:11px;}
     #${SUB2_PANEL_ID} .sub2-refresh{background:#2563eb;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px;}
     #${SUB2_PANEL_ID} .sub2-list{overflow-y:auto;padding:6px 8px;display:flex;flex-direction:column;gap:6px;}
     #${SUB2_PANEL_ID} .sub2-group{border:1px solid #cbd5e1;border-radius:9px;background:#f8fafc;overflow:hidden;}
@@ -2275,6 +2366,9 @@
       this.searchElement = null;
       this.viewElement = null;
       this.sortElement = null;
+      this.groupElement = null;
+      this.platformElement = null;
+      this.healthElement = null;
       this.accounts = [];
       this.groupsById = new Map();
       this.statsById = {};
@@ -2285,6 +2379,14 @@
       this.filterText = '';
       this.viewMode = String(sub2StorageGet('viewMode', 'group')) === 'flat' ? 'flat' : 'group';
       this.sortMode = String(sub2StorageGet('sortMode', 'health'));
+      // 分组筛选：'' 表示全部；'ungrouped' 表示未分配分组；否则为分组 key（id:N 或 name:xxx）。
+      this.groupFilter = String(sub2StorageGet('groupFilter', ''));
+      // 平台筛选：'' 表示全部；否则为具体平台（openai/grok/anthropic/gemini…）。
+      this.platformFilter = String(sub2StorageGet('platformFilter', ''));
+      // 健康筛选：'' 表示全部；否则为 tone（down/warn/ok/paused）。
+      this.healthFilter = String(sub2StorageGet('healthFilter', ''));
+      this.groupFilterOpen = false;
+      this.groupFilterSearchText = '';
       this.minimized = sub2StorageGet('minimized', false) === true;
       this.lastError = '';
       this.lastUpdatedAt = 0;
@@ -2326,7 +2428,25 @@
         </div>
         <div class="sub2-summary"></div>
         <div class="sub2-controls">
-          <input type="text" placeholder="按账号 / 分组筛选…" />
+          <input type="text" placeholder="按账号名筛选…" />
+          <div class="sub2-groupfilter">
+            <button type="button" class="sub2-groupfilter-btn" title="按分组筛选">
+              <span class="sub2-gf-label">全部分组</span>
+              <span class="sub2-gf-caret">▼</span>
+            </button>
+            <div class="sub2-groupfilter-pop">
+              <input type="text" class="sub2-gf-search" placeholder="搜索分组…" />
+              <div class="sub2-groupfilter-options"></div>
+            </div>
+          </div>
+          <select class="sub2-platform-filter" title="按平台筛选"></select>
+          <select class="sub2-health-filter" title="按健康状态筛选">
+            <option value="all">全部状态</option>
+            <option value="down">仅不可用</option>
+            <option value="warn">仅注意</option>
+            <option value="ok">仅正常</option>
+            <option value="paused">仅停用</option>
+          </select>
           <select class="sub2-view" title="列表视图">
             <option value="group">按分组</option>
             <option value="flat">全部账号</option>
@@ -2350,6 +2470,13 @@
       this.searchElement = this.root.querySelector('.sub2-controls input');
       this.viewElement = this.root.querySelector('.sub2-view');
       this.sortElement = this.root.querySelector('.sub2-sort');
+      this.groupFilterEl = this.root.querySelector('.sub2-groupfilter');
+      this.groupFilterBtn = this.root.querySelector('.sub2-groupfilter-btn');
+      this.groupFilterLabelEl = this.root.querySelector('.sub2-gf-label');
+      this.groupFilterSearchEl = this.root.querySelector('.sub2-gf-search');
+      this.groupFilterOptionsEl = this.root.querySelector('.sub2-groupfilter-options');
+      this.platformFilterEl = this.root.querySelector('.sub2-platform-filter');
+      this.healthFilterEl = this.root.querySelector('.sub2-health-filter');
 
       this.viewElement.value = this.viewMode;
       this.sortElement.value = this.sortMode;
@@ -2369,6 +2496,33 @@
         sub2StorageSet('sortMode', this.sortMode);
         this.renderList();
       });
+
+      if (this.healthFilterEl) this.healthFilterEl.value = this.healthFilter || 'all';
+      this.platformFilterEl?.addEventListener('change', () => {
+        this.platformFilter = this.platformFilterEl.value === 'all' ? '' : this.platformFilterEl.value;
+        sub2StorageSet('platformFilter', this.platformFilter);
+        this.renderList();
+      });
+      this.healthFilterEl?.addEventListener('change', () => {
+        this.healthFilter = this.healthFilterEl.value === 'all' ? '' : this.healthFilterEl.value;
+        sub2StorageSet('healthFilter', this.healthFilter);
+        this.renderList();
+      });
+      this.groupFilterBtn?.addEventListener('click', (event) => {
+        event.stopPropagation();
+        this.setGroupFilterOpen(!this.groupFilterOpen);
+      });
+      this.groupFilterSearchEl?.addEventListener('input', () => {
+        this.groupFilterSearchText = this.groupFilterSearchEl.value.trim().toLocaleLowerCase();
+        this.renderGroupFilterOptions();
+      });
+      // 点击面板外部时关闭分组下拉。
+      this.outsideClickHandler = (event) => {
+        if (this.groupFilterOpen && this.groupFilterEl && !this.groupFilterEl.contains(event.target)) {
+          this.setGroupFilterOpen(false);
+        }
+      };
+      document.addEventListener('click', this.outsideClickHandler);
 
       this.applyMinimized();
     }
@@ -2415,8 +2569,84 @@
 
     render() {
       this.renderSummary();
+      this.renderFilters();
       this.renderList();
       this.renderStatus();
+    }
+
+    renderFilters() {
+      this.renderPlatformFilterOptions();
+      this.renderGroupFilterOptions();
+      this.updateGroupFilterLabel();
+    }
+
+    renderPlatformFilterOptions() {
+      if (!this.platformFilterEl) return;
+      const platforms = sub2CollectPlatforms(this.accounts);
+      const current = this.platformFilter || 'all';
+      const options = ['<option value="all">全部平台</option>']
+        .concat(platforms.map((platform) => {
+          const safe = platform.replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+          return `<option value="${safe}">${safe}</option>`;
+        }));
+      this.platformFilterEl.innerHTML = options.join('');
+      this.platformFilterEl.value = platforms.includes(this.platformFilter) ? this.platformFilter : 'all';
+      if (this.platformFilterEl.value === 'all') this.platformFilter = '';
+    }
+
+    updateGroupFilterLabel() {
+      if (!this.groupFilterLabelEl) return;
+      if (!this.groupFilter) {
+        this.groupFilterLabelEl.textContent = '全部分组';
+        return;
+      }
+      if (this.groupFilter === 'ungrouped') {
+        this.groupFilterLabelEl.textContent = '未分配分组';
+        return;
+      }
+      const options = sub2CollectGroupOptions(this.accounts, this.groupsById);
+      const matched = options.find((option) => option.key === this.groupFilter);
+      this.groupFilterLabelEl.textContent = matched ? matched.name : '全部分组';
+      if (!matched) this.groupFilter = '';
+    }
+
+    setGroupFilterOpen(open) {
+      this.groupFilterOpen = open === true;
+      if (this.groupFilterEl) this.groupFilterEl.classList.toggle('open', this.groupFilterOpen);
+      if (this.groupFilterOpen) {
+        this.renderGroupFilterOptions();
+        this.groupFilterSearchEl?.focus();
+      }
+    }
+
+    renderGroupFilterOptions() {
+      if (!this.groupFilterOptionsEl) return;
+      const options = sub2CollectGroupOptions(this.accounts, this.groupsById);
+      const search = this.groupFilterSearchText || '';
+      const filtered = options.filter((option) => option.special || !search || option.name.toLocaleLowerCase().includes(search));
+      if (!filtered.length) {
+        this.groupFilterOptionsEl.innerHTML = '<div class="sub2-gf-empty">没有匹配的分组</div>';
+        return;
+      }
+      this.groupFilterOptionsEl.textContent = '';
+      for (const option of filtered) {
+        const item = document.createElement('div');
+        item.className = 'sub2-gf-option' + (option.key === this.groupFilter ? ' active' : '');
+        const label = document.createElement('span');
+        label.textContent = option.name;
+        const count = document.createElement('span');
+        count.className = 'sub2-gf-count';
+        count.textContent = String(option.count);
+        item.append(label, count);
+        item.addEventListener('click', () => {
+          this.groupFilter = option.key;
+          sub2StorageSet('groupFilter', this.groupFilter);
+          this.setGroupFilterOpen(false);
+          this.updateGroupFilterLabel();
+          this.renderList();
+        });
+        this.groupFilterOptionsEl.appendChild(item);
+      }
     }
 
     renderSummary() {
@@ -2437,15 +2667,27 @@
     renderList() {
       if (!this.listElement) return;
       const now = Date.now();
+      const filters = {
+        groupFilter: this.groupFilter,
+        platformFilter: this.platformFilter,
+        healthFilter: this.healthFilter,
+        filterText: this.filterText,
+      };
+      const visibleAccounts = this.accounts.filter((account) => sub2AccountMatchesActiveFilters(
+        account,
+        sub2GetGroupMemberships(account, this.groupsById),
+        filters,
+        now,
+      ));
+
       if (this.viewMode === 'group') {
-        const sections = sub2BuildGroupedSections(
-          this.accounts,
-          this.statsById,
-          this.sortMode,
-          this.filterText,
-          now,
-          this.groupsById,
-        );
+        let sections = sub2BuildGroupedSections(visibleAccounts, this.statsById, this.sortMode, '', now, this.groupsById);
+        // 指定具体分组时，只保留该分节（账号可能同时属于多个分组）。
+        if (this.groupFilter === 'ungrouped') {
+          sections = sections.filter((section) => section.ungrouped);
+        } else if (this.groupFilter) {
+          sections = sections.filter((section) => section.groupKey === this.groupFilter);
+        }
         if (!sections.length) {
           this.listElement.innerHTML = '<div class="sub2-reasons" style="padding:10px;">没有匹配的账号或分组。</div>';
           return;
@@ -2457,14 +2699,7 @@
         return;
       }
 
-      let rows = sub2SortAccounts(this.accounts, this.statsById, this.sortMode, now);
-      if (this.filterText) {
-        rows = rows.filter((account) => sub2AccountMatchesFilter(
-          account,
-          sub2GetGroupMemberships(account, this.groupsById),
-          this.filterText,
-        ));
-      }
+      const rows = sub2SortAccounts(visibleAccounts, this.statsById, this.sortMode, now);
       if (!rows.length) {
         this.listElement.innerHTML = '<div class="sub2-reasons" style="padding:10px;">没有匹配的账号。</div>';
         return;
