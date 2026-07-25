@@ -2,7 +2,7 @@
 // @name         Sub2 & AIHub Smart Group
 // @name:zh-CN   Sub2 与 AIHub 智能分组
 // @namespace    local.sub2.smart-group
-// @version      1.2.0
+// @version      1.3.0
 // @description  AIHub group recommendation + sub2api account health and routing management (based on real traffic, no active probing).
 // @description:zh-CN 保留 AIHub 智能分组；并为 sub2api 增加基于真实流量的账号健康度可视化与路由管理（不主动测活）
 // @license      MIT
@@ -17,6 +17,7 @@
 // @match        http://127.0.0.1:8080/*
 // @grant        GM_addStyle
 // @grant        GM_getValue
+// @grant        GM_info
 // @grant        GM_registerMenuCommand
 // @grant        GM_setValue
 // @grant        unsafeWindow
@@ -25,12 +26,13 @@
 
 //
 // 说明：本脚本默认匹配 localhost:18080 / 8080 等本地地址。
-// 如果你通过内网 IP、自定义域名或 HTTPS 访问 sub2api 后台，请自行补一行 @match，例如：
+// 如果你通过内网 IP、自定义域名或 HTTPS 访问 sub2api 后台，请在 Tampermonkey 设置中
+// 添加“用户匹配”，或自行补一行 @match，例如：
 //   // @match http://192.168.x.x:18080/*
 //   // @match https://your-sub2-domain.com/*
 // 脚本在 aihub.top 上的行为与原版完全一致；其它匹配站点会尝试识别为 sub2api 后台。
 
-/* global module */
+/* global module, GM_info */
 
 (function (factory) {
   const exported = factory();
@@ -1780,11 +1782,11 @@
   // 数据全部来自 sub2api 后台自身已有的 admin API（同源，复用页面里的 JWT）：
   //   GET  /api/v1/admin/accounts                     账号列表（含健康/冷却字段）
   //   POST /api/v1/admin/accounts/today-stats/batch   今日真实用量（请求数 / 花费）
-  //   GET  /api/v1/admin/groups                        分组列表
-  // 手动路由操作（均已验证：不会清空 API Key）：
+  //   GET  /api/v1/admin/groups/all                    完整分组列表
+  // 手动路由操作（不读取或提交 API Key）：
   //   POST /api/v1/admin/accounts/:id/schedulable      摘出 / 挂回调度池
   //   POST /api/v1/admin/accounts/:id/recover-state    清除冷却 / 恢复
-  //   PUT  /api/v1/admin/accounts/:id                  调整优先级（携带 group_ids）
+  //   PUT  /api/v1/admin/accounts/:id                  仅调整账号优先级
   // 全程不调用任何 test / probe / 测活类接口。健康度只反映“真实流量触发的状态”。
   // ===========================================================================
 
@@ -1793,6 +1795,9 @@
   const SUB2_STORAGE_PREFIX = 'sub2-smart-group:';
   const SUB2_API_BASE = '/api/v1';
   const SUB2_POLL_SECONDS = 30;
+  const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
+    ? String(GM_info.script.version)
+    : '1.3.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -1950,6 +1955,194 @@
     return rows;
   }
 
+  function sub2NormalizeOptionalPriority(value) {
+    if (value === null || value === undefined || String(value).trim() === '') return null;
+    const numericPriority = Number(value);
+    return Number.isFinite(numericPriority) ? numericPriority : null;
+  }
+
+  function sub2BuildGroupIndex(groups) {
+    const groupsById = new Map();
+    for (const group of Array.isArray(groups) ? groups : []) {
+      const numericGroupId = Number(group?.id);
+      if (!Number.isInteger(numericGroupId) || numericGroupId <= 0) continue;
+      groupsById.set(numericGroupId, group);
+    }
+    return groupsById;
+  }
+
+  function sub2GetIndexedGroup(groupsById, groupId) {
+    if (!groupsById || groupId === null) return {};
+    if (typeof groupsById.get === 'function') {
+      return groupsById.get(groupId) || groupsById.get(String(groupId)) || {};
+    }
+    return groupsById[groupId] || groupsById[String(groupId)] || {};
+  }
+
+  function sub2GetGroupMemberships(account, groupsById = null) {
+    const accountGroups = Array.isArray(account?.account_groups) ? account.account_groups : [];
+    const memberships = [];
+    const seenGroupKeys = new Set();
+
+    for (const accountGroup of accountGroups) {
+      const inlineGroup = accountGroup?.group && typeof accountGroup.group === 'object' ? accountGroup.group : {};
+      const numericGroupId = Number(accountGroup?.group_id ?? inlineGroup.id);
+      const groupId = Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null;
+      const indexedGroup = sub2GetIndexedGroup(groupsById, groupId);
+      const groupName = String(inlineGroup.name || indexedGroup.name || (groupId ? `分组 ${groupId}` : '未命名分组')).trim();
+      const groupKey = groupId ? `id:${groupId}` : `name:${groupName.toLocaleLowerCase()}`;
+      if (seenGroupKeys.has(groupKey)) continue;
+      seenGroupKeys.add(groupKey);
+
+      memberships.push({
+        groupId,
+        groupKey,
+        name: groupName,
+        platform: String(inlineGroup.platform || indexedGroup.platform || account?.platform || '').trim(),
+        priority: sub2NormalizeOptionalPriority(accountGroup?.priority),
+        status: String(inlineGroup.status || indexedGroup.status || '').trim(),
+      });
+    }
+
+    // 兼容只返回 groups、没有 account_groups 的旧版接口。
+    if (!memberships.length && Array.isArray(account?.groups)) {
+      for (const group of account.groups) {
+        const numericGroupId = Number(group?.id);
+        const groupId = Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null;
+        const indexedGroup = sub2GetIndexedGroup(groupsById, groupId);
+        const groupName = String(group?.name || indexedGroup.name || (groupId ? `分组 ${groupId}` : '未命名分组')).trim();
+        const groupKey = groupId ? `id:${groupId}` : `name:${groupName.toLocaleLowerCase()}`;
+        if (seenGroupKeys.has(groupKey)) continue;
+        seenGroupKeys.add(groupKey);
+        memberships.push({
+          groupId,
+          groupKey,
+          name: groupName,
+          platform: String(group?.platform || indexedGroup.platform || account?.platform || '').trim(),
+          priority: null,
+          status: String(group?.status || indexedGroup.status || '').trim(),
+        });
+      }
+    }
+
+    // 兼容只返回 group_ids 的接口；分组名称由 /admin/groups 的只读结果补全。
+    if (!memberships.length && Array.isArray(account?.group_ids)) {
+      for (const rawGroupId of account.group_ids) {
+        const numericGroupId = Number(rawGroupId);
+        if (!Number.isInteger(numericGroupId) || numericGroupId <= 0) continue;
+        const indexedGroup = sub2GetIndexedGroup(groupsById, numericGroupId);
+        const groupKey = `id:${numericGroupId}`;
+        if (seenGroupKeys.has(groupKey)) continue;
+        seenGroupKeys.add(groupKey);
+        memberships.push({
+          groupId: numericGroupId,
+          groupKey,
+          name: String(indexedGroup.name || `分组 ${numericGroupId}`).trim(),
+          platform: String(indexedGroup.platform || account?.platform || '').trim(),
+          priority: null,
+          status: String(indexedGroup.status || '').trim(),
+        });
+      }
+    }
+
+    return memberships;
+  }
+
+  function sub2AccountMatchesFilter(account, memberships, filterText) {
+    const normalizedFilter = String(filterText || '').trim().toLocaleLowerCase();
+    if (!normalizedFilter) return true;
+    const searchableValues = [account?.name, account?.platform];
+    for (const membership of memberships) {
+      searchableValues.push(membership.name, membership.platform);
+    }
+    return searchableValues.some((value) => String(value || '').toLocaleLowerCase().includes(normalizedFilter));
+  }
+
+  function sub2BuildGroupedSections(accounts, statsById, sortMode, filterText, now = Date.now(), groupsById = null) {
+    const sectionsByKey = new Map();
+    const ungroupedMembership = {
+      groupId: null,
+      groupKey: 'ungrouped',
+      name: '未分组',
+      platform: '',
+      priority: null,
+      status: '',
+      ungrouped: true,
+    };
+
+    for (const account of Array.isArray(accounts) ? accounts : []) {
+      const memberships = sub2GetGroupMemberships(account, groupsById);
+      const displayMemberships = memberships.length ? memberships : [ungroupedMembership];
+      const normalizedFilter = String(filterText || '').trim().toLocaleLowerCase();
+      const accountMatches = !normalizedFilter
+        || String(account?.name || '').toLocaleLowerCase().includes(normalizedFilter)
+        || String(account?.platform || '').toLocaleLowerCase().includes(normalizedFilter);
+
+      for (const membership of displayMemberships) {
+        const groupMatches = !normalizedFilter
+          || membership.name.toLocaleLowerCase().includes(normalizedFilter)
+          || membership.platform.toLocaleLowerCase().includes(normalizedFilter);
+        if (!accountMatches && !groupMatches) continue;
+
+        if (!sectionsByKey.has(membership.groupKey)) {
+          sectionsByKey.set(membership.groupKey, {
+            groupId: membership.groupId,
+            groupKey: membership.groupKey,
+            name: membership.name,
+            platform: membership.platform,
+            status: membership.status,
+            ungrouped: membership.ungrouped === true,
+            entries: [],
+          });
+        }
+        sectionsByKey.get(membership.groupKey).entries.push({
+          account,
+          membership: membership.ungrouped ? null : membership,
+        });
+      }
+    }
+
+    const sections = [...sectionsByKey.values()];
+    for (const section of sections) {
+      if (sortMode === 'priority') {
+        section.entries.sort((left, right) => {
+          const leftGroupPriority = left.membership?.priority ?? Number.POSITIVE_INFINITY;
+          const rightGroupPriority = right.membership?.priority ?? Number.POSITIVE_INFINITY;
+          return leftGroupPriority - rightGroupPriority
+            || (Number(left.account.priority) || 0) - (Number(right.account.priority) || 0)
+            || String(left.account.name || '').localeCompare(String(right.account.name || ''));
+        });
+      } else {
+        const entriesByAccountId = new Map(section.entries.map((entry) => [String(entry.account.id), entry]));
+        const sortedAccounts = sub2SortAccounts(
+          section.entries.map((entry) => entry.account),
+          statsById,
+          sortMode,
+          now,
+        );
+        section.entries = sortedAccounts.map((account) => entriesByAccountId.get(String(account.id)));
+      }
+    }
+
+    sections.sort((left, right) => {
+      if (left.ungrouped !== right.ungrouped) return left.ungrouped ? 1 : -1;
+      if (left.groupId !== null && right.groupId !== null && left.groupId !== right.groupId) {
+        return left.groupId - right.groupId;
+      }
+      return left.name.localeCompare(right.name);
+    });
+    return sections;
+  }
+
+  function sub2CountDistinctGroups(accounts, groupsById = null) {
+    const groupKeys = new Set();
+    for (const account of Array.isArray(accounts) ? accounts : []) {
+      const memberships = sub2GetGroupMemberships(account, groupsById);
+      for (const membership of memberships) groupKeys.add(membership.groupKey);
+    }
+    return groupKeys.size;
+  }
+
   async function sub2ApiRequest(method, path, body) {
     const token = sub2ReadAuthToken();
     const headers = { Accept: 'application/json' };
@@ -1984,6 +2177,15 @@
     return Array.isArray(data?.items) ? data.items : [];
   }
 
+  async function sub2FetchGroups() {
+    const data = await sub2ApiRequest('GET', '/admin/groups/all?include_inactive=true');
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data?.items)) return data.items;
+    if (Array.isArray(data?.groups)) return data.groups;
+    if (Array.isArray(data?.list)) return data.list;
+    return [];
+  }
+
   async function sub2FetchTodayStats(accountIds) {
     if (!Array.isArray(accountIds) || !accountIds.length) return {};
     const data = await sub2ApiRequest('POST', '/admin/accounts/today-stats/batch', { account_ids: accountIds });
@@ -1999,11 +2201,8 @@
   }
 
   async function sub2UpdatePriority(account, priority) {
-    // 只提交 priority + group_ids：已验证这样不会清空 credentials（API Key）。
-    const groupIds = Array.isArray(account?.group_ids)
-      ? account.group_ids
-      : (Array.isArray(account?.account_groups) ? account.account_groups.map((entry) => entry.group_id) : []);
-    return sub2ApiRequest('PUT', `/admin/accounts/${account.id}`, { priority, group_ids: groupIds });
+    // 只更新账号级 priority，避免 group_ids 触发分组关联重建并覆盖组内优先级。
+    return sub2ApiRequest('PUT', `/admin/accounts/${account.id}`, { priority });
   }
 
   const SUB2_STYLE = `
@@ -2018,6 +2217,7 @@
     #${SUB2_PANEL_ID} .sub2-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;
       background:#0f172a;color:#fff;}
     #${SUB2_PANEL_ID} .sub2-head b{font-size:14px;}
+    #${SUB2_PANEL_ID} .sub2-version{margin-left:5px;color:#93c5fd;font-size:11px;font-weight:600;}
     #${SUB2_PANEL_ID} .sub2-head .sub2-min{background:transparent;border:none;color:#cbd5e1;cursor:pointer;font-size:16px;line-height:1;}
     #${SUB2_PANEL_ID} .sub2-summary{display:flex;gap:6px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid #f1f5f9;}
     #${SUB2_PANEL_ID} .sub2-chip{padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;}
@@ -2025,12 +2225,22 @@
     #${SUB2_PANEL_ID} .sub2-chip.warn{background:#fef9c3;color:#854d0e;}
     #${SUB2_PANEL_ID} .sub2-chip.paused{background:#e2e8f0;color:#475569;}
     #${SUB2_PANEL_ID} .sub2-chip.down{background:#fee2e2;color:#991b1b;}
-    #${SUB2_PANEL_ID} .sub2-controls{display:flex;gap:6px;align-items:center;padding:8px 12px;border-bottom:1px solid #f1f5f9;}
+    #${SUB2_PANEL_ID} .sub2-controls{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid #f1f5f9;}
     #${SUB2_PANEL_ID} .sub2-controls input,#${SUB2_PANEL_ID} .sub2-controls select{
       border:1px solid #cbd5e1;border-radius:6px;padding:4px 6px;font-size:12px;}
-    #${SUB2_PANEL_ID} .sub2-controls input{flex:1;min-width:0;}
+    #${SUB2_PANEL_ID} .sub2-controls input{flex:1 1 130px;min-width:0;}
+    #${SUB2_PANEL_ID} .sub2-controls select{max-width:92px;}
     #${SUB2_PANEL_ID} .sub2-refresh{background:#2563eb;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px;}
     #${SUB2_PANEL_ID} .sub2-list{overflow-y:auto;padding:6px 8px;display:flex;flex-direction:column;gap:6px;}
+    #${SUB2_PANEL_ID} .sub2-group{border:1px solid #cbd5e1;border-radius:9px;background:#f8fafc;overflow:hidden;}
+    #${SUB2_PANEL_ID} .sub2-group-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;padding:8px 9px;
+      border-bottom:1px solid #e2e8f0;background:#eef2ff;}
+    #${SUB2_PANEL_ID} .sub2-group-title{display:flex;align-items:center;gap:6px;min-width:0;}
+    #${SUB2_PANEL_ID} .sub2-group-title strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#1e3a8a;}
+    #${SUB2_PANEL_ID} .sub2-group-platform{padding:1px 6px;border-radius:999px;background:#dbeafe;color:#1d4ed8;font-size:10px;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-group-summary{max-width:58%;color:#64748b;font-size:10px;line-height:1.4;text-align:right;}
+    #${SUB2_PANEL_ID} .sub2-group-list{display:flex;flex-direction:column;gap:6px;padding:6px;}
+    #${SUB2_PANEL_ID} .sub2-group-membership{color:#1d4ed8;}
     #${SUB2_PANEL_ID} .sub2-row{border:1px solid #e2e8f0;border-radius:8px;padding:8px;display:flex;flex-direction:column;gap:6px;}
     #${SUB2_PANEL_ID} .sub2-row.tone-down{border-color:#fecaca;background:#fef2f2;}
     #${SUB2_PANEL_ID} .sub2-row.tone-warn{border-color:#fde68a;background:#fffbeb;}
@@ -2063,14 +2273,17 @@
       this.summaryElement = null;
       this.statusElement = null;
       this.searchElement = null;
+      this.viewElement = null;
       this.sortElement = null;
       this.accounts = [];
+      this.groupsById = new Map();
       this.statsById = {};
       this.refreshTimer = null;
       this.tickTimer = null;
       this.loading = false;
       this.busyIds = new Set();
       this.filterText = '';
+      this.viewMode = String(sub2StorageGet('viewMode', 'group')) === 'flat' ? 'flat' : 'group';
       this.sortMode = String(sub2StorageGet('sortMode', 'health'));
       this.minimized = sub2StorageGet('minimized', false) === true;
       this.lastError = '';
@@ -2100,7 +2313,7 @@
       this.toggle = document.createElement('button');
       this.toggle.id = SUB2_TOGGLE_ID;
       this.toggle.textContent = 'S2';
-      this.toggle.title = 'Sub2 智能分组';
+      this.toggle.title = `Sub2 智能分组 v${SUB2_SCRIPT_VERSION}`;
       this.toggle.addEventListener('click', () => this.setMinimized(!this.minimized));
       document.body.appendChild(this.toggle);
 
@@ -2108,13 +2321,17 @@
       this.root.id = SUB2_PANEL_ID;
       this.root.innerHTML = `
         <div class="sub2-head">
-          <b>Sub2 账号健康 / 路由</b>
+          <b>Sub2 账号健康 / 路由 <span class="sub2-version">v${SUB2_SCRIPT_VERSION}</span></b>
           <button class="sub2-min" title="最小化">—</button>
         </div>
         <div class="sub2-summary"></div>
         <div class="sub2-controls">
-          <input type="text" placeholder="按名称筛选…" />
-          <select>
+          <input type="text" placeholder="按账号 / 分组筛选…" />
+          <select class="sub2-view" title="列表视图">
+            <option value="group">按分组</option>
+            <option value="flat">全部账号</option>
+          </select>
+          <select class="sub2-sort" title="分组内排序">
             <option value="health">按健康度</option>
             <option value="priority">按优先级</option>
             <option value="cost">按今日花费</option>
@@ -2131,13 +2348,20 @@
       this.listElement = this.root.querySelector('.sub2-list');
       this.statusElement = this.root.querySelector('.sub2-status');
       this.searchElement = this.root.querySelector('.sub2-controls input');
-      this.sortElement = this.root.querySelector('.sub2-controls select');
+      this.viewElement = this.root.querySelector('.sub2-view');
+      this.sortElement = this.root.querySelector('.sub2-sort');
 
+      this.viewElement.value = this.viewMode;
       this.sortElement.value = this.sortMode;
       this.root.querySelector('.sub2-min').addEventListener('click', () => this.setMinimized(true));
       this.root.querySelector('.sub2-refresh').addEventListener('click', () => this.refresh());
       this.searchElement.addEventListener('input', () => {
         this.filterText = this.searchElement.value.trim().toLocaleLowerCase();
+        this.renderList();
+      });
+      this.viewElement.addEventListener('change', () => {
+        this.viewMode = this.viewElement.value === 'flat' ? 'flat' : 'group';
+        sub2StorageSet('viewMode', this.viewMode);
         this.renderList();
       });
       this.sortElement.addEventListener('change', () => {
@@ -2165,8 +2389,12 @@
       if (this.loading) return;
       this.loading = true;
       try {
-        const accounts = await sub2FetchAccounts();
+        const [accounts, groups] = await Promise.all([
+          sub2FetchAccounts(),
+          sub2FetchGroups().catch(() => null),
+        ]);
         this.accounts = accounts;
+        if (groups !== null) this.groupsById = sub2BuildGroupIndex(groups);
         const ids = accounts.map((account) => account.id).filter((id) => Number.isFinite(Number(id)));
         try {
           this.statsById = await sub2FetchTodayStats(ids);
@@ -2209,9 +2437,33 @@
     renderList() {
       if (!this.listElement) return;
       const now = Date.now();
+      if (this.viewMode === 'group') {
+        const sections = sub2BuildGroupedSections(
+          this.accounts,
+          this.statsById,
+          this.sortMode,
+          this.filterText,
+          now,
+          this.groupsById,
+        );
+        if (!sections.length) {
+          this.listElement.innerHTML = '<div class="sub2-reasons" style="padding:10px;">没有匹配的账号或分组。</div>';
+          return;
+        }
+        this.listElement.textContent = '';
+        for (const section of sections) {
+          this.listElement.appendChild(this.buildGroupSection(section, now));
+        }
+        return;
+      }
+
       let rows = sub2SortAccounts(this.accounts, this.statsById, this.sortMode, now);
       if (this.filterText) {
-        rows = rows.filter((account) => String(account?.name || '').toLocaleLowerCase().includes(this.filterText));
+        rows = rows.filter((account) => sub2AccountMatchesFilter(
+          account,
+          sub2GetGroupMemberships(account, this.groupsById),
+          this.filterText,
+        ));
       }
       if (!rows.length) {
         this.listElement.innerHTML = '<div class="sub2-reasons" style="padding:10px;">没有匹配的账号。</div>';
@@ -2223,7 +2475,44 @@
       }
     }
 
-    buildRow(account, now) {
+    buildGroupSection(section, now) {
+      const healthCounts = { ok: 0, warn: 0, paused: 0, down: 0 };
+      for (const entry of section.entries) {
+        healthCounts[sub2ComputeHealth(entry.account, now).tone] += 1;
+      }
+
+      const groupSection = document.createElement('section');
+      groupSection.className = 'sub2-group';
+
+      const header = document.createElement('div');
+      header.className = 'sub2-group-head';
+      const title = document.createElement('div');
+      title.className = 'sub2-group-title';
+      const name = document.createElement('strong');
+      name.textContent = section.name;
+      title.appendChild(name);
+      if (section.platform) {
+        const platform = document.createElement('span');
+        platform.className = 'sub2-group-platform';
+        platform.textContent = section.platform;
+        title.appendChild(platform);
+      }
+
+      const summary = document.createElement('div');
+      summary.className = 'sub2-group-summary';
+      summary.textContent = `${section.entries.length} 个账号 · 不可用 ${healthCounts.down} · 注意 ${healthCounts.warn} · 停用 ${healthCounts.paused}`;
+      header.append(title, summary);
+
+      const groupList = document.createElement('div');
+      groupList.className = 'sub2-group-list';
+      for (const entry of section.entries) {
+        groupList.appendChild(this.buildRow(entry.account, now, entry.membership));
+      }
+      groupSection.append(header, groupList);
+      return groupSection;
+    }
+
+    buildRow(account, now, groupMembership = null) {
       const health = sub2ComputeHealth(account, now);
       const stats = this.statsById?.[account.id] || {};
       const busy = this.busyIds.has(account.id);
@@ -2250,10 +2539,27 @@
       const requests = Number(stats.requests) || 0;
       const cost = sub2FormatCost(stats.cost);
       meta.innerHTML = `
-        <span>优先级 <b>${Number(account.priority) || 0}</b></span>
+        <span>账号优先级 <b>${Number(account.priority) || 0}</b></span>
         <span>今日 ${requests} 次 / $${cost}</span>
         <span>最近使用 ${sub2FormatRelative(account.last_used_at, now)}</span>
       `;
+      const groupDescription = document.createElement('span');
+      groupDescription.className = 'sub2-group-membership';
+      if (groupMembership) {
+        const groupPriority = groupMembership.priority === null ? '' : ` · 组内优先级 ${groupMembership.priority}`;
+        groupDescription.textContent = `分组 ${groupMembership.name}${groupPriority}`;
+      } else {
+        const memberships = sub2GetGroupMemberships(account, this.groupsById);
+        if (!memberships.length) {
+          groupDescription.textContent = '未分组';
+        } else {
+          const membershipLabels = memberships.map((membership) => membership.priority === null
+            ? membership.name
+            : `${membership.name} · 组内优先级 ${membership.priority}`);
+          groupDescription.textContent = `分组 ${membershipLabels.join(' / ')}`;
+        }
+      }
+      meta.appendChild(groupDescription);
 
       const reasons = document.createElement('div');
       reasons.className = 'sub2-reasons';
@@ -2280,7 +2586,7 @@
 
       const upBtn = document.createElement('button');
       upBtn.className = 'sub2-btn';
-      upBtn.textContent = '优先级 ↑';
+      upBtn.textContent = '账号优先级 ↑';
       upBtn.title = '数值 -1（更优先被调度）';
       upBtn.disabled = busy;
       upBtn.addEventListener('click', () => this.handlePriority(account, -1));
@@ -2288,7 +2594,7 @@
 
       const downBtn = document.createElement('button');
       downBtn.className = 'sub2-btn';
-      downBtn.textContent = '优先级 ↓';
+      downBtn.textContent = '账号优先级 ↓';
       downBtn.title = '数值 +1（更靠后被调度）';
       downBtn.disabled = busy;
       downBtn.addEventListener('click', () => this.handlePriority(account, 1));
@@ -2306,7 +2612,8 @@
         return;
       }
       const when = this.lastUpdatedAt ? sub2FormatRelative(this.lastUpdatedAt, Date.now()) : '刚刚';
-      this.statusElement.textContent = `共 ${this.accounts.length} 个账号 · 更新于 ${when} · 每 ${SUB2_POLL_SECONDS}s 自动刷新（只读，不测活）`;
+      const groupCount = sub2CountDistinctGroups(this.accounts, this.groupsById);
+      this.statusElement.textContent = `v${SUB2_SCRIPT_VERSION} · ${groupCount} 个分组 / ${this.accounts.length} 个账号 · 更新于 ${when} · 每 ${SUB2_POLL_SECONDS}s 自动刷新（只读，不测活）`;
     }
 
     setBusy(accountId, busy) {
