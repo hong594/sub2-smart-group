@@ -2,7 +2,7 @@
 // @name         Sub2 & AIHub Smart Group
 // @name:zh-CN   Sub2 与 AIHub 智能分组
 // @namespace    local.sub2.smart-group
-// @version      1.5.0
+// @version      1.5.1
 // @description  AIHub group recommendation + sub2api account health, routing, and manual upstream model sync (no active health probing).
 // @description:zh-CN 保留 AIHub 智能分组；并为 sub2api 增加账号健康度、路由管理与手动上游模型同步（不主动测活）
 // @license      MIT
@@ -1801,7 +1801,7 @@
   const SUB2_POLL_SECONDS = 30;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '1.5.0';
+    : '1.5.1';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -2328,8 +2328,8 @@
     #${SUB2_TOGGLE_ID}{position:fixed;right:18px;bottom:18px;z-index:2147483000;width:46px;height:46px;border-radius:50%;
       background:#2563eb;color:#fff;border:none;box-shadow:0 6px 18px rgba(37,99,235,.4);cursor:pointer;font-size:13px;font-weight:700;}
     #${SUB2_TOGGLE_ID}:hover{background:#1d4ed8;}
-    #${SUB2_PANEL_ID}{position:fixed;right:18px;bottom:74px;z-index:2147483000;width:860px;max-width:calc(100vw - 36px);
-      height:clamp(420px,62vh,620px);max-height:calc(100vh - 110px);display:flex;flex-direction:column;background:#fff;color:#0f172a;border:1px solid #e2e8f0;
+    #${SUB2_PANEL_ID}{position:fixed;right:18px;bottom:74px;z-index:2147483000;width:430px;max-width:calc(100vw - 36px);
+      height:clamp(390px,60vh,560px);max-height:calc(100vh - 110px);display:flex;flex-direction:column;background:#fff;color:#0f172a;border:1px solid #e2e8f0;
       border-radius:12px;box-shadow:0 12px 40px rgba(15,23,42,.22);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
       font-size:13px;overflow:hidden;isolation:isolate;}
     #${SUB2_PANEL_ID}.sub2-hidden{display:none;}
@@ -2369,7 +2369,7 @@
     #${SUB2_PANEL_ID} .sub2-gf-empty{padding:6px 7px;color:#94a3b8;font-size:11px;}
     #${SUB2_PANEL_ID} .sub2-refresh{background:#2563eb;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px;}
     #${SUB2_PANEL_ID} .sub2-list{flex:1 1 auto;min-height:0;overflow-y:auto;padding:6px 8px;display:flex;flex-direction:column;gap:6px;}
-    #${SUB2_PANEL_ID} .sub2-list.sub2-flat-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-content:start;}
+    #${SUB2_PANEL_ID} .sub2-list.sub2-flat-list{display:flex;flex-direction:column;}
     #${SUB2_PANEL_ID} .sub2-group{border:1px solid #cbd5e1;border-radius:9px;background:#f8fafc;overflow:hidden;}
     #${SUB2_PANEL_ID} .sub2-group-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;padding:8px 9px;
       border-bottom:1px solid #e2e8f0;background:#eef2ff;}
@@ -2377,7 +2377,7 @@
     #${SUB2_PANEL_ID} .sub2-group-title strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#1e3a8a;}
     #${SUB2_PANEL_ID} .sub2-group-platform{padding:1px 6px;border-radius:999px;background:#dbeafe;color:#1d4ed8;font-size:10px;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-group-summary{max-width:58%;color:#64748b;font-size:10px;line-height:1.4;text-align:right;}
-    #${SUB2_PANEL_ID} .sub2-group-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;gap:6px;padding:6px;}
+    #${SUB2_PANEL_ID} .sub2-group-list{display:flex;flex-direction:column;gap:6px;padding:6px;}
     #${SUB2_PANEL_ID} .sub2-group-membership{color:#1d4ed8;}
     #${SUB2_PANEL_ID} .sub2-row{border:1px solid #e2e8f0;border-radius:8px;padding:8px;display:flex;flex-direction:column;gap:6px;}
     #${SUB2_PANEL_ID} .sub2-row.tone-down{border-color:#fecaca;background:#fef2f2;}
@@ -2404,7 +2404,7 @@
     #${SUB2_PANEL_ID} .sub2-model-overlay{position:absolute;inset:0;z-index:20;display:flex;justify-content:flex-end;
       background:rgba(15,23,42,.36);backdrop-filter:blur(1px);}
     #${SUB2_PANEL_ID} .sub2-model-overlay[hidden]{display:none;}
-    #${SUB2_PANEL_ID} .sub2-model-drawer{width:min(470px,100%);height:100%;display:flex;flex-direction:column;background:#fff;
+    #${SUB2_PANEL_ID} .sub2-model-drawer{width:100%;height:100%;display:flex;flex-direction:column;background:#fff;
       border-left:1px solid #cbd5e1;box-shadow:-10px 0 28px rgba(15,23,42,.16);}
     #${SUB2_PANEL_ID} .sub2-model-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:12px 14px;
       border-bottom:1px solid #e2e8f0;background:#f8fafc;}
@@ -2418,16 +2418,14 @@
     #${SUB2_PANEL_ID} .sub2-model-notice{padding:7px 12px;background:#fff7ed;color:#9a3412;border-bottom:1px solid #fed7aa;font-size:11px;line-height:1.45;}
     #${SUB2_PANEL_ID} .sub2-model-state{padding:7px 12px;color:#64748b;font-size:11px;border-bottom:1px solid #f1f5f9;}
     #${SUB2_PANEL_ID} .sub2-model-state.error{color:#b91c1c;background:#fef2f2;}
-    #${SUB2_PANEL_ID} .sub2-model-list{flex:1;min-height:0;overflow-y:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
+    #${SUB2_PANEL_ID} .sub2-model-list{flex:1;min-height:0;overflow-y:auto;display:grid;grid-template-columns:1fr;
       align-content:start;gap:6px;padding:9px 10px;}
     #${SUB2_PANEL_ID} .sub2-model-item{min-width:0;padding:7px 8px;border:1px solid #e2e8f0;border-radius:7px;background:#f8fafc;}
     #${SUB2_PANEL_ID} .sub2-model-id{display:block;color:#0f172a;font-size:11px;font-weight:650;overflow-wrap:anywhere;}
     #${SUB2_PANEL_ID} .sub2-model-meta{display:block;margin-top:3px;color:#64748b;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-model-empty{grid-column:1 / -1;padding:24px 12px;color:#64748b;text-align:center;line-height:1.6;}
     @media (max-width:760px){
-      #${SUB2_PANEL_ID}{width:calc(100vw - 24px);right:12px;bottom:70px;height:min(68vh,560px);}
-      #${SUB2_PANEL_ID} .sub2-list.sub2-flat-list,#${SUB2_PANEL_ID} .sub2-group-list{grid-template-columns:1fr;}
-      #${SUB2_PANEL_ID} .sub2-model-list{grid-template-columns:1fr;}
+      #${SUB2_PANEL_ID}{width:calc(100vw - 24px);right:12px;bottom:70px;height:min(60vh,520px);}
     }
   `;
 
