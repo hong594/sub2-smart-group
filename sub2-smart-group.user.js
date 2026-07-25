@@ -2,7 +2,7 @@
 // @name         Sub2 & AIHub Smart Group
 // @name:zh-CN   Sub2 与 AIHub 智能分组
 // @namespace    local.sub2.smart-group
-// @version      1.6.0
+// @version      1.7.0
 // @description  AIHub group recommendation + sub2api account health, routing, and manual upstream model sync (no active health probing).
 // @description:zh-CN 保留 AIHub 智能分组；并为 sub2api 增加账号健康度、路由管理与手动上游模型同步（不主动测活）
 // @license      MIT
@@ -1799,9 +1799,10 @@
   const SUB2_STORAGE_PREFIX = 'sub2-smart-group:';
   const SUB2_API_BASE = '/api/v1';
   const SUB2_POLL_SECONDS = 10;
+  const SUB2_ROUTING_LOOKBACK_MS = 30 * 60 * 1000;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '1.6.0';
+    : '1.7.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -1940,6 +1941,231 @@
       updatedExtra.quota_daily_limit = dailyLimit;
     }
     return updatedExtra;
+  }
+
+  function sub2GetPaginatedItems(payload) {
+    if (Array.isArray(payload)) return payload;
+    if (Array.isArray(payload?.items)) return payload.items;
+    if (Array.isArray(payload?.list)) return payload.list;
+    if (Array.isArray(payload?.data)) return payload.data;
+    return [];
+  }
+
+  function sub2NormalizeRecentRequest(payload) {
+    const recentRequest = sub2GetPaginatedItems(payload).find((item) => item?.kind === 'success') || null;
+    if (!recentRequest) return null;
+
+    const accountId = Number(recentRequest.account_id);
+    const createdAt = Date.parse(recentRequest.created_at);
+    if (!Number.isInteger(accountId) || accountId <= 0 || !Number.isFinite(createdAt)) return null;
+
+    const numericGroupId = Number(recentRequest.group_id);
+    return {
+      accountId,
+      createdAt,
+      groupId: Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null,
+      platform: String(recentRequest.platform || '').trim(),
+      model: String(recentRequest.model || '').trim(),
+      requestId: String(recentRequest.request_id || '').trim(),
+      source: 'ops',
+    };
+  }
+
+  function sub2ExtractRoutingStatusCode(errorItem) {
+    const explicitStatusCode = Number(errorItem?.upstream_status_code);
+    if (Number.isInteger(explicitStatusCode) && explicitStatusCode >= 100 && explicitStatusCode <= 599) {
+      return explicitStatusCode;
+    }
+
+    const message = String(errorItem?.message || '');
+    const messageMatch = message.match(/(?:upstream\s+error|HTTP|status(?:\s+code)?)\s*:?\s*(\d{3})/i);
+    if (messageMatch) return Number(messageMatch[1]);
+
+    // upstream-errors 列表会把 COALESCE(upstream_status_code, status_code) 投影为 status_code。
+    const projectedStatusCode = Number(errorItem?.status_code);
+    return Number.isInteger(projectedStatusCode) && projectedStatusCode >= 400 && projectedStatusCode <= 599
+      ? projectedStatusCode
+      : null;
+  }
+
+  function sub2NormalizeCorrelationId(value) {
+    return String(value || '').trim().replace(/^client:/i, '');
+  }
+
+  function sub2NormalizeRoutingError(errorItem) {
+    const accountId = Number(errorItem?.account_id);
+    const createdAt = Date.parse(errorItem?.created_at);
+    if (!Number.isInteger(accountId) || accountId <= 0 || !Number.isFinite(createdAt)) return null;
+
+    const rawMessage = String(errorItem?.message || '').trim();
+    const statusCode = sub2ExtractRoutingStatusCode(errorItem);
+    const recovered = /^Recovered (?:upstream error|account authentication failure)/i.test(rawMessage);
+    const detail = rawMessage
+      .replace(/^Recovered upstream error(?:\s+\d{3})?\s*:?\s*/i, '')
+      .replace(/^Recovered account authentication failure(?:\s+\d{3})?\s*:?\s*/i, '')
+      .replace(/\s*\(request id:.*\)\s*$/i, '')
+      .trim();
+
+    return {
+      accountId,
+      createdAt,
+      statusCode,
+      recovered,
+      detail: detail && detail !== rawMessage ? detail : detail || rawMessage,
+      model: String(errorItem?.model || '').trim(),
+      requestId: String(errorItem?.request_id || '').trim(),
+      clientRequestId: String(errorItem?.client_request_id || '').trim(),
+      correlated: false,
+    };
+  }
+
+  function sub2BuildRecentRoutingErrorIndex(payload, recentRequest = null) {
+    const errorByAccountId = new Map();
+    const recentCorrelationId = sub2NormalizeCorrelationId(recentRequest?.requestId);
+    for (const errorItem of sub2GetPaginatedItems(payload)) {
+      const normalizedError = sub2NormalizeRoutingError(errorItem);
+      if (!normalizedError) continue;
+      const errorCorrelationIds = [normalizedError.requestId, normalizedError.clientRequestId]
+        .map(sub2NormalizeCorrelationId)
+        .filter(Boolean);
+      normalizedError.correlated = Boolean(recentCorrelationId && errorCorrelationIds.includes(recentCorrelationId));
+      const previousError = errorByAccountId.get(normalizedError.accountId);
+      const replacesPrevious = !previousError
+        || (normalizedError.correlated && !previousError.correlated)
+        || (normalizedError.correlated === previousError.correlated && normalizedError.createdAt > previousError.createdAt);
+      if (replacesPrevious) {
+        errorByAccountId.set(normalizedError.accountId, normalizedError);
+      }
+    }
+    return errorByAccountId;
+  }
+
+  function sub2ResolveLatestHit(accounts, recentRequest, allowLastUsedFallback = true) {
+    const accountList = Array.isArray(accounts) ? accounts : [];
+    if (recentRequest) {
+      const matchedAccount = accountList.find((account) => Number(account?.id) === recentRequest.accountId);
+      if (matchedAccount) {
+        return {
+          ...recentRequest,
+          accountName: String(matchedAccount.name || `账号 ${recentRequest.accountId}`).trim(),
+          priority: Number(matchedAccount.priority) || 0,
+        };
+      }
+      // Ops 已给出明确账号，但当前列表没有该账号时，不能把另一个账号误标为最近命中。
+      return null;
+    }
+
+    if (!allowLastUsedFallback) return null;
+
+    let latestHit = null;
+    for (const account of accountList) {
+      const accountId = Number(account?.id);
+      const createdAt = Date.parse(account?.last_used_at);
+      if (!Number.isInteger(accountId) || accountId <= 0 || !Number.isFinite(createdAt)) continue;
+      if (!latestHit || createdAt > latestHit.createdAt) {
+        latestHit = {
+          accountId,
+          createdAt,
+          groupId: null,
+          platform: String(account.platform || '').trim(),
+          model: '',
+          requestId: '',
+          source: 'last_used_at',
+          accountName: String(account.name || `账号 ${accountId}`).trim(),
+          priority: Number(account.priority) || 0,
+        };
+      }
+    }
+    return latestHit;
+  }
+
+  function sub2FormatRoutingError(errorInfo, now = Date.now()) {
+    if (!errorInfo) return '';
+    const statusLabel = errorInfo.statusCode ? String(errorInfo.statusCode) : '上游状态码未知';
+    const detail = String(errorInfo.detail || '').trim();
+    const shortDetail = detail.length > 90 ? `${detail.slice(0, 87)}...` : detail;
+    const ageLabel = sub2FormatRelative(errorInfo.createdAt, now);
+    return `${statusLabel}${shortDetail ? ` · ${shortDetail}` : ''} · ${ageLabel}`;
+  }
+
+  function sub2BuildRoutingExplanation(account, context = {}, now = Date.now()) {
+    const accountId = Number(account?.id);
+    const latestHit = context.latestHit || null;
+    const recentError = context.recentError || null;
+    const errorIsRecent = recentError
+      && now - recentError.createdAt >= 0
+      && now - recentError.createdAt <= SUB2_ROUTING_LOOKBACK_MS;
+
+    if (errorIsRecent) {
+      return {
+        tone: recentError.recovered ? 'verified' : 'down',
+        evidence: '已证实',
+        text: `${recentError.correlated
+          ? (recentError.recovered ? '最近请求真实降级' : '最近请求上游失败')
+          : (recentError.recovered ? '近期真实降级（未与最近请求关联）' : '近期上游失败（未与最近请求关联）')
+        }：${sub2FormatRoutingError(recentError, now)}`,
+      };
+    }
+
+    if (latestHit && accountId === latestHit.accountId) {
+      const modelLabel = latestHit.model ? ` · ${latestHit.model}` : '';
+      return {
+        tone: 'hit',
+        evidence: '已证实',
+        text: `最近成功命中${modelLabel} · ${sub2FormatRelative(latestHit.createdAt, now)}`,
+      };
+    }
+
+    if (!latestHit || (Number(account?.priority) || 0) >= latestHit.priority) return null;
+
+    const health = sub2ComputeHealth(account, now);
+    if (health.tone !== 'ok') {
+      return {
+        tone: 'inferred',
+        evidence: '当前状态',
+        text: `当前不可正常调度：${health.reasons.join('；')}；可能是未命中原因，但 sub2 未保存当时的候选状态`,
+      };
+    }
+
+    if (latestHit.platform && String(account?.platform || '').trim() !== latestHit.platform) {
+      return {
+        tone: 'inferred',
+        evidence: '配置判断',
+        text: `账号当前平台与最近请求平台 ${latestHit.platform} 不同，通常不会进入该请求候选`,
+      };
+    }
+
+    if (latestHit.groupId) {
+      const memberships = sub2GetGroupMemberships(account, context.groupsById);
+      const belongsToRequestGroup = memberships.some((membership) => membership.groupId === latestHit.groupId);
+      if (!belongsToRequestGroup) {
+        const requestGroup = sub2GetIndexedGroup(context.groupsById, latestHit.groupId);
+        const requestGroupName = String(requestGroup?.name || `分组 ${latestHit.groupId}`).trim();
+        return {
+          tone: 'inferred',
+          evidence: '配置判断',
+          text: `账号当前不在最近请求分组「${requestGroupName}」，通常不会进入该请求候选`,
+        };
+      }
+    }
+
+    const accountLastUsedAt = Date.parse(account?.last_used_at);
+    const hasRecentAccountActivity = Number.isFinite(accountLastUsedAt)
+      && Math.abs(latestHit.createdAt - accountLastUsedAt) <= SUB2_ROUTING_LOOKBACK_MS;
+    if (context.errorsAvailable === false) {
+      return {
+        tone: 'inferred',
+        evidence: '推测',
+        text: '较高优先级状态正常；运维故障明细不可用，可能因会话粘连、分组/模型匹配或调度权重未选中',
+      };
+    }
+    return {
+      tone: 'inferred',
+      evidence: '推测',
+      text: hasRecentAccountActivity
+        ? '较高优先级状态正常且近期用过；可能因会话粘连、模型匹配或高级调度权重未选中'
+        : '较高优先级未发现近期请求/失败；可能未进入候选，或被会话粘连、模型匹配、调度权重跳过',
+    };
   }
 
   function sub2NormalizeModels(payload) {
@@ -2308,11 +2534,12 @@
     return true;
   }
 
-  async function sub2ApiRequest(method, path, body) {
+  async function sub2ApiRequest(method, path, body, signal = null) {
     const token = sub2ReadAuthToken();
     const headers = { Accept: 'application/json' };
     if (token) headers.Authorization = `Bearer ${token}`;
     const options = { method, headers, credentials: 'same-origin' };
+    if (signal) options.signal = signal;
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
       options.body = JSON.stringify(body);
@@ -2337,6 +2564,16 @@
     return payload ? payload.data : null;
   }
 
+  async function sub2ApiRequestWithTimeout(method, path, body, timeoutMs = 4000) {
+    const abortController = new AbortController();
+    const timeoutId = window.setTimeout(() => abortController.abort(), timeoutMs);
+    try {
+      return await sub2ApiRequest(method, path, body, abortController.signal);
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  }
+
   async function sub2FetchAccounts() {
     const data = await sub2ApiRequest('GET', '/admin/accounts?page=1&page_size=200');
     return Array.isArray(data?.items) ? data.items : [];
@@ -2359,6 +2596,31 @@
     if (!Array.isArray(accountIds) || !accountIds.length) return {};
     const data = await sub2ApiRequest('POST', '/admin/accounts/today-stats/batch', { account_ids: accountIds });
     return data?.stats || {};
+  }
+
+  async function sub2FetchRecentRoutingActivity() {
+    const [requestResult, errorResult] = await Promise.allSettled([
+      sub2ApiRequestWithTimeout(
+        'GET',
+        '/admin/ops/requests?time_range=30m&kind=success&sort=created_at_desc&page=1&page_size=1',
+      ),
+      sub2ApiRequestWithTimeout(
+        'GET',
+        '/admin/ops/upstream-errors?time_range=30m&page=1&page_size=200',
+      ),
+    ]);
+
+    const recentRequest = requestResult.status === 'fulfilled'
+      ? sub2NormalizeRecentRequest(requestResult.value)
+      : null;
+    return {
+      requestsAvailable: requestResult.status === 'fulfilled',
+      errorsAvailable: errorResult.status === 'fulfilled',
+      recentRequest,
+      errorByAccountId: errorResult.status === 'fulfilled'
+        ? sub2BuildRecentRoutingErrorIndex(errorResult.value, recentRequest)
+        : new Map(),
+    };
   }
 
   async function sub2FetchAccountModels(accountId) {
@@ -2401,7 +2663,7 @@
       background:#2563eb;color:#fff;border:none;box-shadow:0 6px 18px rgba(37,99,235,.4);cursor:pointer;font-size:13px;font-weight:700;}
     #${SUB2_TOGGLE_ID}:hover{background:#1d4ed8;}
     #${SUB2_PANEL_ID}{position:fixed;right:18px;bottom:74px;z-index:2147483000;width:430px;max-width:calc(100vw - 36px);
-      height:clamp(390px,60vh,560px);max-height:calc(100vh - 110px);display:flex;flex-direction:column;background:#fff;color:#0f172a;border:1px solid #e2e8f0;
+      height:clamp(680px,80vh,820px);max-height:calc(100vh - 110px);display:flex;flex-direction:column;background:#fff;color:#0f172a;border:1px solid #e2e8f0;
       border-radius:12px;box-shadow:0 12px 40px rgba(15,23,42,.22);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
       font-size:13px;overflow:hidden;isolation:isolate;}
     #${SUB2_PANEL_ID}.sub2-hidden{display:none;}
@@ -2474,6 +2736,10 @@
     #${SUB2_PANEL_ID} .sub2-badge.warn{background:#fef9c3;color:#854d0e;}
     #${SUB2_PANEL_ID} .sub2-badge.paused{background:#e2e8f0;color:#475569;}
     #${SUB2_PANEL_ID} .sub2-badge.down{background:#fee2e2;color:#991b1b;}
+    #${SUB2_PANEL_ID} .sub2-hit-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:999px;
+      background:#cffafe;color:#155e75;border:1px solid #67e8f9;font-size:10px;font-weight:750;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-hit-badge::before{content:"";width:6px;height:6px;border-radius:50%;background:#06b6d4;
+      box-shadow:0 0 0 3px rgba(6,182,212,.14);}
     #${SUB2_PANEL_ID} .sub2-platform{font-size:11px;color:#64748b;}
     #${SUB2_PANEL_ID} .sub2-meta{font-size:12px;color:#475569;display:flex;flex-wrap:wrap;gap:6px 9px;}
     #${SUB2_PANEL_ID} .sub2-quota-summary{font-weight:600;color:#0369a1;}
@@ -2481,6 +2747,14 @@
     #${SUB2_PANEL_ID} .sub2-quota-summary.down{color:#b91c1c;}
     #${SUB2_PANEL_ID} .sub2-pool-state{color:#7c3aed;font-weight:600;cursor:help;}
     #${SUB2_PANEL_ID} .sub2-reasons{font-size:11px;color:#64748b;line-height:1.5;}
+    #${SUB2_PANEL_ID} .sub2-routing-note{display:flex;align-items:flex-start;gap:6px;padding:5px 7px;border-radius:7px;
+      background:#f8fafc;border:1px solid #e2e8f0;color:#475569;font-size:10px;line-height:1.45;}
+    #${SUB2_PANEL_ID} .sub2-routing-note.hit{background:#ecfeff;border-color:#a5f3fc;color:#155e75;}
+    #${SUB2_PANEL_ID} .sub2-routing-note.verified{background:#fff7ed;border-color:#fed7aa;color:#9a3412;}
+    #${SUB2_PANEL_ID} .sub2-routing-note.down{background:#fef2f2;border-color:#fecaca;color:#991b1b;}
+    #${SUB2_PANEL_ID} .sub2-routing-note.inferred{background:#f8fafc;border-style:dashed;color:#64748b;}
+    #${SUB2_PANEL_ID} .sub2-routing-evidence{flex:none;padding:1px 5px;border-radius:999px;background:rgba(255,255,255,.72);
+      border:1px solid currentColor;font-size:9px;font-weight:700;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-actions{display:flex;flex-wrap:wrap;gap:6px;}
     #${SUB2_PANEL_ID} .sub2-btn{border:1px solid #cbd5e1;background:#fff;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:12px;color:#0f172a;}
     #${SUB2_PANEL_ID} .sub2-btn:hover{background:#f1f5f9;}
@@ -2520,7 +2794,7 @@
     #${SUB2_PANEL_ID} .sub2-model-meta{display:block;margin-top:3px;color:#64748b;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-model-empty{grid-column:1 / -1;padding:24px 12px;color:#64748b;text-align:center;line-height:1.6;}
     @media (max-width:760px){
-      #${SUB2_PANEL_ID}{width:calc(100vw - 24px);right:12px;bottom:70px;height:min(60vh,520px);}
+      #${SUB2_PANEL_ID}{width:calc(100vw - 24px);right:12px;bottom:70px;height:min(80vh,720px);}
     }
   `;
 
@@ -2546,6 +2820,12 @@
       this.accounts = [];
       this.groupsById = new Map();
       this.statsById = {};
+      this.recentRequest = null;
+      this.latestHit = null;
+      this.recentRoutingErrorByAccountId = new Map();
+      this.routingRequestsAvailable = false;
+      this.routingErrorsAvailable = false;
+      this.routingRequestSequence = 0;
       this.refreshTimer = null;
       this.tickTimer = null;
       this.visibilityHandler = null;
@@ -2810,6 +3090,11 @@
         this.accounts = accounts;
         if (groups !== null) this.groupsById = sub2BuildGroupIndex(groups);
         this.statsById = nextStatsById;
+        this.latestHit = sub2ResolveLatestHit(
+          this.accounts,
+          this.routingRequestsAvailable ? this.recentRequest : null,
+          !this.routingRequestsAvailable,
+        );
         this.lastError = '';
         this.lastUpdatedAt = Date.now();
         shouldRender = true;
@@ -2823,11 +3108,39 @@
       } finally {
         this.loading = false;
         if (shouldRender) this.render();
+        if (shouldRender && requestSequence === this.refreshRequestSequence) {
+          this.refreshRoutingActivity(requestSequence);
+        }
         if (this.pendingRefresh && !this.isQuotaInteractionActive()) {
           this.pendingRefresh = false;
           window.setTimeout(() => this.refresh(), 0);
         }
       }
+    }
+
+    async refreshRoutingActivity(accountRequestSequence) {
+      const routingRequestSequence = ++this.routingRequestSequence;
+      const routingActivity = await sub2FetchRecentRoutingActivity();
+      if (
+        routingRequestSequence !== this.routingRequestSequence
+        || accountRequestSequence !== this.refreshRequestSequence
+        || this.isQuotaInteractionActive()
+      ) {
+        return;
+      }
+
+      this.routingRequestsAvailable = routingActivity.requestsAvailable;
+      this.routingErrorsAvailable = routingActivity.errorsAvailable;
+      this.recentRequest = routingActivity.requestsAvailable ? routingActivity.recentRequest : null;
+      this.recentRoutingErrorByAccountId = routingActivity.errorsAvailable
+        ? routingActivity.errorByAccountId
+        : new Map();
+      this.latestHit = sub2ResolveLatestHit(
+        this.accounts,
+        this.recentRequest,
+        !this.routingRequestsAvailable,
+      );
+      this.renderList();
     }
 
     render() {
@@ -3053,7 +3366,15 @@
       const platform = document.createElement('span');
       platform.className = 'sub2-platform';
       platform.textContent = String(account.platform || '');
-      top.append(name, priority, badge, platform);
+      top.append(name, priority);
+      if (this.latestHit && Number(account.id) === this.latestHit.accountId) {
+        const latestHitBadge = document.createElement('span');
+        latestHitBadge.className = 'sub2-hit-badge';
+        latestHitBadge.textContent = '最近命中';
+        latestHitBadge.title = `最近成功请求：${sub2FormatRelative(this.latestHit.createdAt, now)}`;
+        top.appendChild(latestHitBadge);
+      }
+      top.append(badge, platform);
 
       const meta = document.createElement('div');
       meta.className = 'sub2-meta';
@@ -3113,6 +3434,24 @@
       const reasons = document.createElement('div');
       reasons.className = 'sub2-reasons';
       reasons.textContent = health.reasons.join('；');
+
+      const routingExplanation = sub2BuildRoutingExplanation(account, {
+        latestHit: this.latestHit,
+        recentError: this.recentRoutingErrorByAccountId.get(Number(account.id)) || null,
+        groupsById: this.groupsById,
+        errorsAvailable: this.routingErrorsAvailable,
+      }, now);
+      let routingNote = null;
+      if (routingExplanation) {
+        routingNote = document.createElement('div');
+        routingNote.className = `sub2-routing-note ${routingExplanation.tone}`;
+        const evidence = document.createElement('span');
+        evidence.className = 'sub2-routing-evidence';
+        evidence.textContent = routingExplanation.evidence;
+        const explanationText = document.createElement('span');
+        explanationText.textContent = routingExplanation.text;
+        routingNote.append(evidence, explanationText);
+      }
 
       const actions = document.createElement('div');
       actions.className = 'sub2-actions';
@@ -3216,7 +3555,9 @@
         actions.appendChild(recoverBtn);
       }
 
-      row.append(top, meta, reasons, actions);
+      row.append(top, meta, reasons);
+      if (routingNote) row.appendChild(routingNote);
+      row.appendChild(actions);
       if (quotaEditor) row.appendChild(quotaEditor);
       return row;
     }
@@ -3568,6 +3909,13 @@
     sub2GetUpstreamWebsiteUrl,
     sub2GetPoolModeState,
     sub2BuildDailyQuotaExtra,
+    sub2GetPaginatedItems,
+    sub2NormalizeRecentRequest,
+    sub2ExtractRoutingStatusCode,
+    sub2NormalizeRoutingError,
+    sub2BuildRecentRoutingErrorIndex,
+    sub2ResolveLatestHit,
+    sub2BuildRoutingExplanation,
     start() {
       if (location.hostname === 'aihub.top') {
         new AppRouter().start();
