@@ -2,7 +2,7 @@
 // @name         Sub2 & AIHub Smart Group
 // @name:zh-CN   Sub2 与 AIHub 智能分组
 // @namespace    local.sub2.smart-group
-// @version      1.5.1
+// @version      1.6.0
 // @description  AIHub group recommendation + sub2api account health, routing, and manual upstream model sync (no active health probing).
 // @description:zh-CN 保留 AIHub 智能分组；并为 sub2api 增加账号健康度、路由管理与手动上游模型同步（不主动测活）
 // @license      MIT
@@ -1798,10 +1798,10 @@
   const SUB2_TOGGLE_ID = 'sub2-smart-group-toggle';
   const SUB2_STORAGE_PREFIX = 'sub2-smart-group:';
   const SUB2_API_BASE = '/api/v1';
-  const SUB2_POLL_SECONDS = 30;
+  const SUB2_POLL_SECONDS = 10;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '1.5.1';
+    : '1.6.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -1883,6 +1883,63 @@
     if (hours < 24) return `${hours} 小时前`;
     const days = Math.floor(hours / 24);
     return `${days} 天前`;
+  }
+
+  function sub2GetNumericAccountField(account, fieldName) {
+    const value = account?.[fieldName] ?? account?.extra?.[fieldName];
+    const numericValue = Number(value);
+    return Number.isFinite(numericValue) ? numericValue : 0;
+  }
+
+  function sub2SupportsDailyQuota(account) {
+    const accountType = String(account?.type || '').trim();
+    return accountType === 'apikey' || accountType === 'bedrock';
+  }
+
+  function sub2GetUpstreamBaseUrl(account) {
+    const candidates = [
+      account?.credentials?.base_url,
+      account?.base_url,
+      account?.upstream_base_url,
+    ];
+    for (const candidate of candidates) {
+      const baseUrl = String(candidate || '').trim();
+      if (baseUrl) return baseUrl;
+    }
+    return '';
+  }
+
+  function sub2GetUpstreamWebsiteUrl(account) {
+    const baseUrl = sub2GetUpstreamBaseUrl(account);
+    if (!baseUrl) return '';
+    try {
+      const parsedUrl = new URL(baseUrl);
+      if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') return '';
+      return `${parsedUrl.origin}/`;
+    } catch {
+      return '';
+    }
+  }
+
+  function sub2GetPoolModeState(account) {
+    const accountType = String(account?.type || '').trim();
+    if (accountType !== 'apikey' && accountType !== 'bedrock') return null;
+    const credentials = account?.credentials;
+    return Boolean(credentials && typeof credentials === 'object' && credentials.pool_mode === true);
+  }
+
+  function sub2BuildDailyQuotaExtra(sourceExtra, dailyLimit) {
+    const updatedExtra = sourceExtra && typeof sourceExtra === 'object'
+      ? { ...sourceExtra }
+      : {};
+    if (dailyLimit === null) {
+      delete updatedExtra.quota_daily_limit;
+      delete updatedExtra.quota_daily_used;
+      delete updatedExtra.quota_daily_start;
+    } else {
+      updatedExtra.quota_daily_limit = dailyLimit;
+    }
+    return updatedExtra;
   }
 
   function sub2NormalizeModels(payload) {
@@ -2285,6 +2342,10 @@
     return Array.isArray(data?.items) ? data.items : [];
   }
 
+  async function sub2FetchAccount(accountId) {
+    return sub2ApiRequest('GET', `/admin/accounts/${accountId}`);
+  }
+
   async function sub2FetchGroups() {
     const data = await sub2ApiRequest('GET', '/admin/groups/all?include_inactive=true');
     if (Array.isArray(data)) return data;
@@ -2324,6 +2385,17 @@
     return sub2ApiRequest('PUT', `/admin/accounts/${account.id}`, { priority });
   }
 
+  async function sub2UpdateDailyQuota(account, dailyLimit) {
+    // sub2 更新 extra 时会整体替换 JSON，因此先读取账号最新详情并完整保留其它 extra 字段。
+    const latestAccount = await sub2FetchAccount(account.id);
+    const sourceExtra = latestAccount?.extra && typeof latestAccount.extra === 'object'
+      ? latestAccount.extra
+      : {};
+    const updatedExtra = sub2BuildDailyQuotaExtra(sourceExtra, dailyLimit);
+
+    return sub2ApiRequest('PUT', `/admin/accounts/${account.id}`, { extra: updatedExtra });
+  }
+
   const SUB2_STYLE = `
     #${SUB2_TOGGLE_ID}{position:fixed;right:18px;bottom:18px;z-index:2147483000;width:46px;height:46px;border-radius:50%;
       background:#2563eb;color:#fff;border:none;box-shadow:0 6px 18px rgba(37,99,235,.4);cursor:pointer;font-size:13px;font-weight:700;}
@@ -2344,14 +2416,18 @@
     #${SUB2_PANEL_ID} .sub2-chip.warn{background:#fef9c3;color:#854d0e;}
     #${SUB2_PANEL_ID} .sub2-chip.paused{background:#e2e8f0;color:#475569;}
     #${SUB2_PANEL_ID} .sub2-chip.down{background:#fee2e2;color:#991b1b;}
-    #${SUB2_PANEL_ID} .sub2-controls{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid #f1f5f9;}
-    #${SUB2_PANEL_ID} .sub2-controls input,#${SUB2_PANEL_ID} .sub2-controls select{
-      border:1px solid #cbd5e1;border-radius:6px;padding:4px 6px;font-size:12px;}
-    #${SUB2_PANEL_ID} .sub2-controls input{flex:1 1 130px;min-width:0;}
-    #${SUB2_PANEL_ID} .sub2-controls select{max-width:92px;}
-    #${SUB2_PANEL_ID} .sub2-groupfilter{position:relative;flex:1 1 130px;min-width:0;}
+    #${SUB2_PANEL_ID} .sub2-controls{display:flex;flex-direction:column;gap:7px;padding:8px 12px;border-bottom:1px solid #f1f5f9;background:#f8fafc;}
+    #${SUB2_PANEL_ID} .sub2-search-row{display:flex;align-items:center;gap:7px;}
+    #${SUB2_PANEL_ID} .sub2-account-search{flex:1;min-width:0;border:1px solid #cbd5e1;border-radius:8px;padding:6px 9px;
+      background:#fff;color:#0f172a;font-size:12px;outline:none;}
+    #${SUB2_PANEL_ID} .sub2-account-search:focus,#${SUB2_PANEL_ID} .sub2-controls select:focus,
+    #${SUB2_PANEL_ID} .sub2-groupfilter-btn:focus{border-color:#60a5fa;box-shadow:0 0 0 2px rgba(59,130,246,.12);}
+    #${SUB2_PANEL_ID} .sub2-filter-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;}
+    #${SUB2_PANEL_ID} .sub2-controls select{width:100%;min-width:0;border:1px solid #cbd5e1;border-radius:8px;padding:6px 8px;
+      background:#fff;color:#334155;font-size:12px;outline:none;cursor:pointer;}
+    #${SUB2_PANEL_ID} .sub2-groupfilter{position:relative;min-width:0;grid-column:1 / -1;}
     #${SUB2_PANEL_ID} .sub2-groupfilter-btn{width:100%;display:flex;align-items:center;justify-content:space-between;gap:4px;
-      border:1px solid #cbd5e1;border-radius:6px;padding:4px 6px;font-size:12px;background:#fff;color:#0f172a;cursor:pointer;}
+      border:1px solid #cbd5e1;border-radius:8px;padding:6px 8px;font-size:12px;background:#fff;color:#334155;cursor:pointer;outline:none;}
     #${SUB2_PANEL_ID} .sub2-groupfilter-btn .sub2-gf-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-groupfilter-btn .sub2-gf-caret{color:#94a3b8;font-size:10px;}
     #${SUB2_PANEL_ID} .sub2-groupfilter-pop{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:5;background:#fff;
@@ -2367,7 +2443,9 @@
     #${SUB2_PANEL_ID} .sub2-gf-option .sub2-gf-count{color:#94a3b8;font-size:11px;font-weight:400;}
     #${SUB2_PANEL_ID} .sub2-gf-option.active .sub2-gf-count{color:#60a5fa;}
     #${SUB2_PANEL_ID} .sub2-gf-empty{padding:6px 7px;color:#94a3b8;font-size:11px;}
-    #${SUB2_PANEL_ID} .sub2-refresh{background:#2563eb;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px;}
+    #${SUB2_PANEL_ID} .sub2-refresh{height:30px;background:#2563eb;color:#fff;border:none;border-radius:8px;padding:0 12px;
+      cursor:pointer;font-size:12px;font-weight:650;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-refresh:hover{background:#1d4ed8;}
     #${SUB2_PANEL_ID} .sub2-list{flex:1 1 auto;min-height:0;overflow-y:auto;padding:6px 8px;display:flex;flex-direction:column;gap:6px;}
     #${SUB2_PANEL_ID} .sub2-list.sub2-flat-list{display:flex;flex-direction:column;}
     #${SUB2_PANEL_ID} .sub2-group{border:1px solid #cbd5e1;border-radius:9px;background:#f8fafc;overflow:hidden;}
@@ -2384,14 +2462,24 @@
     #${SUB2_PANEL_ID} .sub2-row.tone-warn{border-color:#fde68a;background:#fffbeb;}
     #${SUB2_PANEL_ID} .sub2-row.tone-paused{background:#f8fafc;}
     #${SUB2_PANEL_ID} .sub2-row-top{display:flex;align-items:center;gap:6px;}
-    #${SUB2_PANEL_ID} .sub2-name{font-weight:700;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-name{font-weight:700;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#0f172a;}
+    #${SUB2_PANEL_ID} .sub2-name-link{text-decoration:none;cursor:pointer;}
+    #${SUB2_PANEL_ID} .sub2-name-link:hover{color:#2563eb;text-decoration:underline;}
+    #${SUB2_PANEL_ID} .sub2-name-link::after{content:" ↗";color:#60a5fa;font-size:10px;text-decoration:none;}
+    #${SUB2_PANEL_ID} .sub2-priority{display:inline-flex;align-items:baseline;gap:2px;padding:2px 7px;border-radius:7px;
+      background:#4f46e5;color:#fff;box-shadow:0 2px 6px rgba(79,70,229,.22);font-size:10px;font-weight:700;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-priority strong{font-size:13px;line-height:1;}
     #${SUB2_PANEL_ID} .sub2-badge{padding:1px 7px;border-radius:999px;font-size:11px;font-weight:700;}
     #${SUB2_PANEL_ID} .sub2-badge.ok{background:#dcfce7;color:#166534;}
     #${SUB2_PANEL_ID} .sub2-badge.warn{background:#fef9c3;color:#854d0e;}
     #${SUB2_PANEL_ID} .sub2-badge.paused{background:#e2e8f0;color:#475569;}
     #${SUB2_PANEL_ID} .sub2-badge.down{background:#fee2e2;color:#991b1b;}
     #${SUB2_PANEL_ID} .sub2-platform{font-size:11px;color:#64748b;}
-    #${SUB2_PANEL_ID} .sub2-meta{font-size:12px;color:#475569;display:flex;flex-wrap:wrap;gap:8px;}
+    #${SUB2_PANEL_ID} .sub2-meta{font-size:12px;color:#475569;display:flex;flex-wrap:wrap;gap:6px 9px;}
+    #${SUB2_PANEL_ID} .sub2-quota-summary{font-weight:600;color:#0369a1;}
+    #${SUB2_PANEL_ID} .sub2-quota-summary.warn{color:#b45309;}
+    #${SUB2_PANEL_ID} .sub2-quota-summary.down{color:#b91c1c;}
+    #${SUB2_PANEL_ID} .sub2-pool-state{color:#7c3aed;font-weight:600;cursor:help;}
     #${SUB2_PANEL_ID} .sub2-reasons{font-size:11px;color:#64748b;line-height:1.5;}
     #${SUB2_PANEL_ID} .sub2-actions{display:flex;flex-wrap:wrap;gap:6px;}
     #${SUB2_PANEL_ID} .sub2-btn{border:1px solid #cbd5e1;background:#fff;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:12px;color:#0f172a;}
@@ -2399,6 +2487,13 @@
     #${SUB2_PANEL_ID} .sub2-btn.danger{border-color:#fecaca;color:#b91c1c;}
     #${SUB2_PANEL_ID} .sub2-btn.primary{border-color:#bfdbfe;color:#1d4ed8;}
     #${SUB2_PANEL_ID} .sub2-btn:disabled{opacity:.5;cursor:not-allowed;}
+    #${SUB2_PANEL_ID} .sub2-quota-editor{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:6px;
+      padding:7px;border:1px solid #bae6fd;border-radius:8px;background:#f0f9ff;}
+    #${SUB2_PANEL_ID} .sub2-quota-editor[hidden]{display:none;}
+    #${SUB2_PANEL_ID} .sub2-quota-input-wrap{display:flex;align-items:center;min-width:0;border:1px solid #7dd3fc;border-radius:6px;background:#fff;overflow:hidden;}
+    #${SUB2_PANEL_ID} .sub2-quota-prefix{padding:0 6px;color:#0369a1;font-weight:700;}
+    #${SUB2_PANEL_ID} .sub2-quota-input{width:100%;min-width:0;border:none;outline:none;padding:5px 6px 5px 0;font-size:12px;color:#0f172a;}
+    #${SUB2_PANEL_ID} .sub2-quota-help{grid-column:1 / -1;color:#64748b;font-size:10px;line-height:1.4;}
     #${SUB2_PANEL_ID} .sub2-status{padding:6px 12px;border-top:1px solid #f1f5f9;font-size:11px;color:#64748b;}
     #${SUB2_PANEL_ID} .sub2-status.error{color:#b91c1c;}
     #${SUB2_PANEL_ID} .sub2-model-overlay{position:absolute;inset:0;z-index:20;display:flex;justify-content:flex-end;
@@ -2453,7 +2548,11 @@
       this.statsById = {};
       this.refreshTimer = null;
       this.tickTimer = null;
+      this.visibilityHandler = null;
       this.loading = false;
+      this.pendingRefresh = false;
+      this.refreshRequestSequence = 0;
+      this.quotaSaving = false;
       this.busyIds = new Set();
       this.filterText = '';
       this.viewMode = String(sub2StorageGet('viewMode', 'group')) === 'flat' ? 'flat' : 'group';
@@ -2483,11 +2582,17 @@
       if (typeof GM_addStyle === 'function') GM_addStyle(SUB2_STYLE);
       this.mount();
       this.refresh();
-      this.refreshTimer = window.setInterval(() => this.refresh(), SUB2_POLL_SECONDS * 1000);
+      this.refreshTimer = window.setInterval(() => {
+        if (!this.minimized && document.visibilityState !== 'hidden' && !this.isQuotaInteractionActive()) this.refresh();
+      }, SUB2_POLL_SECONDS * 1000);
+      this.visibilityHandler = () => {
+        if (!this.minimized && document.visibilityState === 'visible' && !this.isQuotaInteractionActive()) this.refresh();
+      };
+      document.addEventListener('visibilitychange', this.visibilityHandler);
       // 每秒重绘倒计时：仅当存在“冷却中”的账号时才重建列表，
       // 避免无谓的每秒全量重建把滚动位置顶掉（会表现为面板每秒自己往下滚）。
       this.tickTimer = window.setInterval(() => {
-        if (this.minimized || !this.accounts.length) return;
+        if (this.minimized || !this.accounts.length || this.isQuotaInteractionActive()) return;
         const now = Date.now();
         const hasCountdown = this.accounts.some((account) => sub2ComputeHealth(account, now).coolingUntil > now);
         if (hasCountdown) this.renderList();
@@ -2519,36 +2624,40 @@
         </div>
         <div class="sub2-summary"></div>
         <div class="sub2-controls">
-          <input type="text" placeholder="按账号名筛选…" />
-          <div class="sub2-groupfilter">
-            <button type="button" class="sub2-groupfilter-btn" title="按分组筛选">
-              <span class="sub2-gf-label">全部分组</span>
-              <span class="sub2-gf-caret">▼</span>
-            </button>
-            <div class="sub2-groupfilter-pop">
-              <input type="text" class="sub2-gf-search" placeholder="搜索分组…" />
-              <div class="sub2-groupfilter-options"></div>
-            </div>
+          <div class="sub2-search-row">
+            <input type="text" class="sub2-account-search" placeholder="搜索账号 / 平台 / 分组…" />
+            <button class="sub2-refresh">刷新</button>
           </div>
-          <select class="sub2-platform-filter" title="按平台筛选"></select>
-          <select class="sub2-health-filter" title="按健康状态筛选">
-            <option value="all">全部状态</option>
-            <option value="down">仅不可用</option>
-            <option value="warn">仅注意</option>
-            <option value="ok">仅正常</option>
-            <option value="paused">仅停用</option>
-          </select>
-          <select class="sub2-view" title="列表视图">
-            <option value="group">按分组</option>
-            <option value="flat">全部账号</option>
-          </select>
-          <select class="sub2-sort" title="分组内排序">
-            <option value="health">按健康度</option>
-            <option value="priority">按优先级</option>
-            <option value="cost">按今日花费</option>
-            <option value="name">按名称</option>
-          </select>
-          <button class="sub2-refresh">刷新</button>
+          <div class="sub2-filter-grid">
+            <div class="sub2-groupfilter">
+              <button type="button" class="sub2-groupfilter-btn" title="按分组筛选">
+                <span class="sub2-gf-label">全部分组</span>
+                <span class="sub2-gf-caret">▼</span>
+              </button>
+              <div class="sub2-groupfilter-pop">
+                <input type="text" class="sub2-gf-search" placeholder="搜索分组…" />
+                <div class="sub2-groupfilter-options"></div>
+              </div>
+            </div>
+            <select class="sub2-platform-filter" title="按平台筛选"></select>
+            <select class="sub2-health-filter" title="按健康状态筛选">
+              <option value="all">全部状态</option>
+              <option value="down">仅不可用</option>
+              <option value="warn">仅注意</option>
+              <option value="ok">仅正常</option>
+              <option value="paused">仅停用</option>
+            </select>
+            <select class="sub2-sort" title="账号排序">
+              <option value="health">排序：健康度</option>
+              <option value="priority">排序：优先级</option>
+              <option value="cost">排序：今日花费</option>
+              <option value="name">排序：名称</option>
+            </select>
+            <select class="sub2-view" title="列表视图">
+              <option value="group">视图：按分组</option>
+              <option value="flat">视图：全部账号</option>
+            </select>
+          </div>
         </div>
         <div class="sub2-list"></div>
         <div class="sub2-status">加载中…</div>
@@ -2576,7 +2685,7 @@
       this.summaryElement = this.root.querySelector('.sub2-summary');
       this.listElement = this.root.querySelector('.sub2-list');
       this.statusElement = this.root.querySelector('.sub2-status');
-      this.searchElement = this.root.querySelector('.sub2-controls input');
+      this.searchElement = this.root.querySelector('.sub2-account-search');
       this.viewElement = this.root.querySelector('.sub2-view');
       this.sortElement = this.root.querySelector('.sub2-sort');
       this.groupFilterEl = this.root.querySelector('.sub2-groupfilter');
@@ -2652,6 +2761,14 @@
       this.applyMinimized();
     }
 
+    hasOpenQuotaEditor() {
+      return Boolean(this.root?.querySelector('.sub2-quota-editor:not([hidden])'));
+    }
+
+    isQuotaInteractionActive() {
+      return this.quotaSaving || this.hasOpenQuotaEditor();
+    }
+
     setMinimized(minimized) {
       this.minimized = minimized === true;
       sub2StorageSet('minimized', this.minimized);
@@ -2665,30 +2782,51 @@
     }
 
     async refresh() {
-      if (this.loading) return;
+      if (this.loading) {
+        this.pendingRefresh = true;
+        return;
+      }
+      if (this.isQuotaInteractionActive()) return;
+
+      this.pendingRefresh = false;
+      const requestSequence = ++this.refreshRequestSequence;
       this.loading = true;
+      let shouldRender = false;
       try {
         const [accounts, groups] = await Promise.all([
           sub2FetchAccounts(),
           sub2FetchGroups().catch(() => null),
         ]);
+        const ids = accounts.map((account) => account.id).filter((id) => Number.isFinite(Number(id)));
+        let nextStatsById = this.statsById || {};
+        try {
+          nextStatsById = await sub2FetchTodayStats(ids);
+        } catch {
+          nextStatsById = this.statsById || {};
+        }
+
+        if (requestSequence !== this.refreshRequestSequence || this.isQuotaInteractionActive()) return;
+
         this.accounts = accounts;
         if (groups !== null) this.groupsById = sub2BuildGroupIndex(groups);
-        const ids = accounts.map((account) => account.id).filter((id) => Number.isFinite(Number(id)));
-        try {
-          this.statsById = await sub2FetchTodayStats(ids);
-        } catch {
-          this.statsById = this.statsById || {};
-        }
+        this.statsById = nextStatsById;
         this.lastError = '';
         this.lastUpdatedAt = Date.now();
+        shouldRender = true;
       } catch (error) {
-        this.lastError = error?.status === 401
-          ? '登录已失效，请重新登录 sub2 后台后再刷新。'
-          : `读取失败：${error?.message || error}`;
+        if (requestSequence === this.refreshRequestSequence && !this.isQuotaInteractionActive()) {
+          this.lastError = error?.status === 401
+            ? '登录已失效，请重新登录 sub2 后台后再刷新。'
+            : `读取失败：${error?.message || error}`;
+          shouldRender = true;
+        }
       } finally {
         this.loading = false;
-        this.render();
+        if (shouldRender) this.render();
+        if (this.pendingRefresh && !this.isQuotaInteractionActive()) {
+          this.pendingRefresh = false;
+          window.setTimeout(() => this.refresh(), 0);
+        }
       }
     }
 
@@ -2887,27 +3025,73 @@
 
       const top = document.createElement('div');
       top.className = 'sub2-row-top';
-      const name = document.createElement('span');
-      name.className = 'sub2-name';
-      name.textContent = String(account.name || `账号 ${account.id}`).trim() || `账号 ${account.id}`;
-      name.title = name.textContent;
+      const accountName = String(account.name || `账号 ${account.id}`).trim() || `账号 ${account.id}`;
+      const upstreamBaseUrl = sub2GetUpstreamBaseUrl(account);
+      const upstreamWebsiteUrl = sub2GetUpstreamWebsiteUrl(account);
+      const name = document.createElement(upstreamWebsiteUrl ? 'a' : 'span');
+      name.className = upstreamWebsiteUrl ? 'sub2-name sub2-name-link' : 'sub2-name';
+      name.textContent = accountName;
+      name.title = upstreamWebsiteUrl
+        ? `打开上游网站：${upstreamBaseUrl}`
+        : accountName;
+      if (upstreamWebsiteUrl) {
+        name.href = upstreamWebsiteUrl;
+        name.target = '_blank';
+        name.rel = 'noopener noreferrer';
+      }
+      const priority = document.createElement('span');
+      priority.className = 'sub2-priority';
+      priority.title = '账号优先级：数值越小越优先';
+      const priorityLabel = document.createElement('span');
+      priorityLabel.textContent = 'P';
+      const priorityValue = document.createElement('strong');
+      priorityValue.textContent = String(Number(account.priority) || 0);
+      priority.append(priorityLabel, priorityValue);
       const badge = document.createElement('span');
       badge.className = `sub2-badge ${health.tone}`;
       badge.textContent = SUB2_TONE_LABELS[health.tone];
       const platform = document.createElement('span');
       platform.className = 'sub2-platform';
       platform.textContent = String(account.platform || '');
-      top.append(name, badge, platform);
+      top.append(name, priority, badge, platform);
 
       const meta = document.createElement('div');
       meta.className = 'sub2-meta';
       const requests = Number(stats.requests) || 0;
       const cost = sub2FormatCost(stats.cost);
-      meta.innerHTML = `
-        <span>账号优先级 <b>${Number(account.priority) || 0}</b></span>
-        <span>今日 ${requests} 次 / $${cost}</span>
-        <span>最近使用 ${sub2FormatRelative(account.last_used_at, now)}</span>
-      `;
+      const todayUsage = document.createElement('span');
+      todayUsage.textContent = `今日 ${requests} 次 / $${cost}`;
+      const lastUsed = document.createElement('span');
+      lastUsed.textContent = `最近使用 ${sub2FormatRelative(account.last_used_at, now)}`;
+      meta.append(todayUsage, lastUsed);
+
+      const supportsDailyQuota = sub2SupportsDailyQuota(account);
+      const dailyLimit = sub2GetNumericAccountField(account, 'quota_daily_limit');
+      const dailyUsed = sub2GetNumericAccountField(account, 'quota_daily_used');
+      if (supportsDailyQuota) {
+        const quotaSummary = document.createElement('span');
+        const quotaUtilization = dailyLimit > 0 ? dailyUsed / dailyLimit : 0;
+        quotaSummary.className = 'sub2-quota-summary'
+          + (quotaUtilization >= 1 ? ' down' : quotaUtilization >= 0.8 ? ' warn' : '');
+        quotaSummary.textContent = dailyLimit > 0
+          ? `日配额 $${sub2FormatCost(dailyUsed)} / $${sub2FormatCost(dailyLimit)}`
+          : '日配额 未限制';
+        quotaSummary.title = dailyLimit > 0
+          ? '达到日限额后账号暂停调度；默认从首次使用起滚动 24 小时重置'
+          : '当前未设置每日费用上限';
+        meta.appendChild(quotaSummary);
+      }
+
+      const poolModeState = sub2GetPoolModeState(account);
+      if (poolModeState !== null) {
+        const poolMode = document.createElement('span');
+        poolMode.className = 'sub2-pool-state';
+        poolMode.textContent = `池模式 ${poolModeState ? '开' : '关'}`;
+        poolMode.title = poolModeState
+          ? '适用于上游自身是账号池的场景；401/403/429 会同账号重试且不标记本地账号错误'
+          : '普通单 Key 上游通常应保持关闭';
+        meta.appendChild(poolMode);
+      }
       const groupDescription = document.createElement('span');
       groupDescription.className = 'sub2-group-membership';
       if (groupMembership) {
@@ -2933,6 +3117,89 @@
       const actions = document.createElement('div');
       actions.className = 'sub2-actions';
 
+      const modelsBtn = document.createElement('button');
+      modelsBtn.className = 'sub2-btn primary';
+      modelsBtn.textContent = '模型';
+      modelsBtn.title = '先查看 sub2 已保存的模型；需要时可在抽屉中手动拉取上游';
+      modelsBtn.disabled = busy;
+      modelsBtn.addEventListener('click', () => this.openModelDrawer(account));
+      actions.appendChild(modelsBtn);
+
+      let quotaEditor = null;
+      let quotaInput = null;
+      if (supportsDailyQuota) {
+        const quotaBtn = document.createElement('button');
+        quotaBtn.className = 'sub2-btn primary';
+        quotaBtn.textContent = '日配额';
+        quotaBtn.title = '设置每日费用上限（美元）';
+        quotaBtn.disabled = busy;
+        actions.appendChild(quotaBtn);
+
+        quotaEditor = document.createElement('div');
+        quotaEditor.className = 'sub2-quota-editor';
+        quotaEditor.hidden = true;
+        const inputWrap = document.createElement('label');
+        inputWrap.className = 'sub2-quota-input-wrap';
+        const prefix = document.createElement('span');
+        prefix.className = 'sub2-quota-prefix';
+        prefix.textContent = '$';
+        quotaInput = document.createElement('input');
+        quotaInput.className = 'sub2-quota-input';
+        quotaInput.type = 'number';
+        quotaInput.min = '0.01';
+        quotaInput.step = '0.01';
+        quotaInput.placeholder = '每日上限';
+        quotaInput.value = dailyLimit > 0 ? String(dailyLimit) : '';
+        inputWrap.append(prefix, quotaInput);
+
+        const saveQuotaBtn = document.createElement('button');
+        saveQuotaBtn.className = 'sub2-btn primary';
+        saveQuotaBtn.textContent = '保存';
+        saveQuotaBtn.disabled = busy;
+        saveQuotaBtn.addEventListener('click', () => this.handleDailyQuota(account, quotaInput.value));
+
+        const clearQuotaBtn = document.createElement('button');
+        clearQuotaBtn.className = 'sub2-btn danger';
+        clearQuotaBtn.textContent = '取消限制';
+        clearQuotaBtn.disabled = busy || dailyLimit <= 0;
+        clearQuotaBtn.addEventListener('click', () => this.handleDailyQuota(account, null));
+
+        const quotaHelp = document.createElement('div');
+        quotaHelp.className = 'sub2-quota-help';
+        quotaHelp.textContent = '单位：美元；达到限额后暂停调度，默认滚动 24 小时重置。';
+        quotaEditor.append(inputWrap, saveQuotaBtn, clearQuotaBtn, quotaHelp);
+        quotaBtn.addEventListener('click', () => {
+          const editorWillOpen = quotaEditor.hidden;
+          quotaEditor.hidden = !editorWillOpen;
+          if (editorWillOpen) {
+            // 使已经发出的自动刷新失效，避免响应回来后重建列表并清空正在输入的金额。
+            this.refreshRequestSequence += 1;
+            quotaInput.focus();
+          } else {
+            this.refresh();
+          }
+        });
+        quotaInput.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter') this.handleDailyQuota(account, quotaInput.value);
+        });
+      }
+
+      const upBtn = document.createElement('button');
+      upBtn.className = 'sub2-btn';
+      upBtn.textContent = '优先级升';
+      upBtn.title = '数值 -1（更优先被调度）';
+      upBtn.disabled = busy;
+      upBtn.addEventListener('click', () => this.handlePriority(account, -1));
+      actions.appendChild(upBtn);
+
+      const downBtn = document.createElement('button');
+      downBtn.className = 'sub2-btn';
+      downBtn.textContent = '优先级降';
+      downBtn.title = '数值 +1（更靠后被调度）';
+      downBtn.disabled = busy;
+      downBtn.addEventListener('click', () => this.handlePriority(account, 1));
+      actions.appendChild(downBtn);
+
       const toggleBtn = document.createElement('button');
       toggleBtn.className = health.schedulable ? 'sub2-btn danger' : 'sub2-btn primary';
       toggleBtn.textContent = health.schedulable ? '摘出调度' : '挂回调度';
@@ -2949,31 +3216,8 @@
         actions.appendChild(recoverBtn);
       }
 
-      const upBtn = document.createElement('button');
-      upBtn.className = 'sub2-btn';
-      upBtn.textContent = '账号优先级 ↑';
-      upBtn.title = '数值 -1（更优先被调度）';
-      upBtn.disabled = busy;
-      upBtn.addEventListener('click', () => this.handlePriority(account, -1));
-      actions.appendChild(upBtn);
-
-      const downBtn = document.createElement('button');
-      downBtn.className = 'sub2-btn';
-      downBtn.textContent = '账号优先级 ↓';
-      downBtn.title = '数值 +1（更靠后被调度）';
-      downBtn.disabled = busy;
-      downBtn.addEventListener('click', () => this.handlePriority(account, 1));
-      actions.appendChild(downBtn);
-
-      const modelsBtn = document.createElement('button');
-      modelsBtn.className = 'sub2-btn primary';
-      modelsBtn.textContent = '模型';
-      modelsBtn.title = '先查看 sub2 已保存的模型；需要时可在抽屉中手动拉取上游';
-      modelsBtn.disabled = busy;
-      modelsBtn.addEventListener('click', () => this.openModelDrawer(account));
-      actions.appendChild(modelsBtn);
-
       row.append(top, meta, reasons, actions);
+      if (quotaEditor) row.appendChild(quotaEditor);
       return row;
     }
 
@@ -3129,7 +3373,7 @@
       }
       const when = this.lastUpdatedAt ? sub2FormatRelative(this.lastUpdatedAt, Date.now()) : '刚刚';
       const groupCount = sub2CountDistinctGroups(this.accounts, this.groupsById);
-      this.statusElement.textContent = `v${SUB2_SCRIPT_VERSION} · ${groupCount} 个分组 / ${this.accounts.length} 个账号 · 更新于 ${when} · 每 ${SUB2_POLL_SECONDS}s 自动刷新（只读，不测活）`;
+      this.statusElement.textContent = `v${SUB2_SCRIPT_VERSION} · ${groupCount} 个分组 / ${this.accounts.length} 个账号 · 更新于 ${when} · 每 ${SUB2_POLL_SECONDS}s 刷新（后台/最小化/配额编辑暂停，不测活）`;
     }
 
     setBusy(accountId, busy) {
@@ -3178,6 +3422,48 @@
         this.renderStatus();
       } finally {
         this.setBusy(account.id, false);
+      }
+    }
+
+    async handleDailyQuota(account, rawDailyLimit) {
+      let dailyLimit = null;
+      if (rawDailyLimit !== null) {
+        const normalizedValue = String(rawDailyLimit || '').trim();
+        const numericValue = Number(normalizedValue);
+        if (!normalizedValue || !Number.isFinite(numericValue) || numericValue <= 0) {
+          this.lastError = '日配额必须是大于 0 的美元金额；如需关闭请点击“取消限制”。';
+          this.renderStatus();
+          return;
+        }
+        dailyLimit = Math.round(numericValue * 100) / 100;
+        if (!Number.isFinite(dailyLimit)) {
+          this.lastError = '日配额金额过大，请输入较小的美元金额。';
+          this.renderStatus();
+          return;
+        }
+        if (dailyLimit < 0.01) {
+          this.lastError = '日配额最小为 $0.01。';
+          this.renderStatus();
+          return;
+        }
+      }
+
+      let updateSucceeded = false;
+      this.quotaSaving = true;
+      this.refreshRequestSequence += 1;
+      this.pendingRefresh = false;
+      this.setBusy(account.id, true);
+      try {
+        await sub2UpdateDailyQuota(account, dailyLimit);
+        this.lastError = '';
+        updateSucceeded = true;
+      } catch (error) {
+        this.lastError = `设置日配额失败：${error?.message || error}`;
+        this.renderStatus();
+      } finally {
+        this.quotaSaving = false;
+        this.setBusy(account.id, false);
+        if (updateSucceeded) await this.refresh();
       }
     }
   }
@@ -3276,6 +3562,12 @@
     appendLogEntries,
     formatLogLine,
     sub2NormalizeModels,
+    sub2GetNumericAccountField,
+    sub2SupportsDailyQuota,
+    sub2GetUpstreamBaseUrl,
+    sub2GetUpstreamWebsiteUrl,
+    sub2GetPoolModeState,
+    sub2BuildDailyQuotaExtra,
     start() {
       if (location.hostname === 'aihub.top') {
         new AppRouter().start();
