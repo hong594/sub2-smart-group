@@ -2,9 +2,9 @@
 // @name         Sub2 Smart Group
 // @name:zh-CN   Sub2 智能分组
 // @namespace    local.sub2.smart-group
-// @version      2.0.0
-// @description  Sub2 account health, routing, quota controls, and manual upstream model sync (no active health probing).
-// @description:zh-CN 为 sub2api 提供账号健康度、路由管理、配额控制与手动上游模型同步（不主动测活）
+// @version      2.1.0
+// @description  Sub2 account health, capacity, route diagnostics, quota controls, and manual upstream model sync (no active health probing).
+// @description:zh-CN 为 sub2api 提供账号健康度、容量、路由诊断、配额控制与手动上游模型同步（不主动测活）
 // @license      MIT
 // @homepageURL   https://github.com/hong594/sub2-smart-group
 // @supportURL    https://github.com/hong594/sub2-smart-group/issues
@@ -46,6 +46,10 @@
   //   GET  /api/v1/admin/accounts                     账号列表（含健康/冷却字段）
   //   POST /api/v1/admin/accounts/today-stats/batch   今日真实用量（请求数 / 花费）
   //   GET  /api/v1/admin/groups/all                    完整分组列表
+  //   GET  /api/v1/admin/ops/concurrency               当前容量 / 并发 / 排队快照
+  //   GET  /api/v1/admin/ops/requests                  最近成功请求
+  //   GET  /api/v1/admin/ops/upstream-errors           真实上游故障摘要
+  //   GET  /api/v1/admin/ops/upstream-errors/:id       故障转移事件详情
   // 手动操作（不读取或提交 API Key）：
   //   POST /api/v1/admin/accounts/:id/schedulable      摘出 / 挂回调度池
   //   POST /api/v1/admin/accounts/:id/recover-state    清除冷却 / 恢复
@@ -65,13 +69,20 @@
   const SUB2_ROUTING_LOOKBACK_MS = 30 * 60 * 1000;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '2.0.0';
+    : '2.1.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
   const SUB2_SORT_RANK = Object.freeze({ down: 3, warn: 2, ok: 1, paused: 0 });
   const SUB2_TONE_LABELS = Object.freeze({ ok: '正常', warn: '注意', paused: '已停用', down: '不可用' });
   const SUB2_SORT_LABELS = Object.freeze({ health: '健康度', priority: '优先级', cost: '今日花费', name: '名称' });
+  const SUB2_DAY_MS = 24 * 60 * 60 * 1000;
+  const SUB2_WEEK_MS = 7 * SUB2_DAY_MS;
+  const SUB2_OPENAI_OAUTH_FOREIGN_MODEL_PREFIXES = Object.freeze([
+    'deepseek-', 'glm-', 'kimi-', 'moonshot-', 'qwen-', 'qwen2-', 'qwen3-', 'qwen4-', 'qwq-',
+    'minimax-', 'gemini-', 'gemma-', 'grok-', 'doubao-', 'hunyuan-', 'llama-', 'llama2-',
+    'llama3-', 'meta-llama', 'mistral-', 'mixtral-', 'baichuan-', 'ernie-', 'step-', 'seed-', 'yi-',
+  ]);
 
   function sub2StorageGet(key, fallback) {
     try {
@@ -152,6 +163,263 @@
     const value = account?.[fieldName] ?? account?.extra?.[fieldName];
     const numericValue = Number(value);
     return Number.isFinite(numericValue) ? numericValue : 0;
+  }
+
+  function sub2HasOwnProperty(source, propertyName) {
+    return Boolean(source) && Object.prototype.hasOwnProperty.call(source, propertyName);
+  }
+
+  function sub2ParseTimestamp(value) {
+    if (value === null || value === undefined || value === '') return Number.NaN;
+    const numericValue = typeof value === 'number'
+      ? value
+      : /^-?\d+(?:\.\d+)?$/.test(String(value).trim())
+        ? Number(value)
+        : Number.NaN;
+    if (Number.isFinite(numericValue)) {
+      return Math.abs(numericValue) < 100000000000 ? numericValue * 1000 : numericValue;
+    }
+    return Date.parse(value);
+  }
+
+  function sub2ResolveTimeZone(timeZoneName) {
+    const candidateTimeZone = String(timeZoneName || 'UTC').trim() || 'UTC';
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: candidateTimeZone }).format(0);
+      return candidateTimeZone;
+    } catch {
+      return 'UTC';
+    }
+  }
+
+  function sub2GetZonedCalendarParts(timestamp, timeZoneName) {
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timeZoneName,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    });
+    const partsByType = {};
+    for (const part of formatter.formatToParts(new Date(timestamp))) {
+      if (part.type !== 'literal') partsByType[part.type] = Number(part.value);
+    }
+    return {
+      year: partsByType.year,
+      month: partsByType.month,
+      day: partsByType.day,
+      hour: partsByType.hour,
+      minute: partsByType.minute,
+      second: partsByType.second,
+    };
+  }
+
+  function sub2ShiftCalendarDate(calendarParts, dayOffset) {
+    const shiftedDate = new Date(Date.UTC(
+      calendarParts.year,
+      calendarParts.month - 1,
+      calendarParts.day + dayOffset,
+    ));
+    return {
+      year: shiftedDate.getUTCFullYear(),
+      month: shiftedDate.getUTCMonth() + 1,
+      day: shiftedDate.getUTCDate(),
+    };
+  }
+
+  function sub2ZonedDateTimeToTimestamp(calendarParts, timeZoneName) {
+    const targetAsUtc = Date.UTC(
+      calendarParts.year,
+      calendarParts.month - 1,
+      calendarParts.day,
+      calendarParts.hour || 0,
+      calendarParts.minute || 0,
+      calendarParts.second || 0,
+    );
+    let timestamp = targetAsUtc;
+    // Intl 没有直接把 IANA 墙上时间转为 UTC 的 API。迭代修正时区偏移，
+    // 可以同时覆盖整点重置和绝大多数 DST 切换边界。
+    for (let iteration = 0; iteration < 3; iteration += 1) {
+      const actualParts = sub2GetZonedCalendarParts(timestamp, timeZoneName);
+      const actualAsUtc = Date.UTC(
+        actualParts.year,
+        actualParts.month - 1,
+        actualParts.day,
+        actualParts.hour,
+        actualParts.minute,
+        actualParts.second,
+      );
+      const correction = targetAsUtc - actualAsUtc;
+      timestamp += correction;
+      if (correction === 0) break;
+    }
+    return timestamp;
+  }
+
+  function sub2GetLastFixedQuotaReset(account, dimension, now = Date.now()) {
+    const timeZoneName = sub2ResolveTimeZone(
+      account?.quota_reset_timezone ?? account?.extra?.quota_reset_timezone,
+    );
+    const nowParts = sub2GetZonedCalendarParts(now, timeZoneName);
+    const resetHourField = dimension === 'weekly' ? 'quota_weekly_reset_hour' : 'quota_daily_reset_hour';
+    const rawResetHour = sub2GetNumericAccountField(account, resetHourField);
+    const resetHour = Number.isInteger(rawResetHour) && rawResetHour >= 0 && rawResetHour <= 23
+      ? rawResetHour
+      : 0;
+    const todayReset = sub2ZonedDateTimeToTimestamp({
+      year: nowParts.year,
+      month: nowParts.month,
+      day: nowParts.day,
+      hour: resetHour,
+    }, timeZoneName);
+
+    if (dimension === 'daily') {
+      const resetDate = now < todayReset ? sub2ShiftCalendarDate(nowParts, -1) : nowParts;
+      return sub2ZonedDateTimeToTimestamp({ ...resetDate, hour: resetHour }, timeZoneName);
+    }
+
+    const rawResetDay = account?.quota_weekly_reset_day ?? account?.extra?.quota_weekly_reset_day;
+    const numericResetDay = Number(rawResetDay);
+    const resetDay = Number.isInteger(numericResetDay) && numericResetDay >= 0 && numericResetDay <= 6
+      ? numericResetDay
+      : 1;
+    const localDateAsUtc = new Date(Date.UTC(nowParts.year, nowParts.month - 1, nowParts.day));
+    const currentDay = localDateAsUtc.getUTCDay();
+    let daysBack = (currentDay - resetDay + 7) % 7;
+    if (daysBack === 0 && now < todayReset) daysBack = 7;
+    const resetDate = sub2ShiftCalendarDate(nowParts, -daysBack);
+    return sub2ZonedDateTimeToTimestamp({ ...resetDate, hour: resetHour }, timeZoneName);
+  }
+
+  function sub2IsQuotaPeriodExpired(account, dimension, now = Date.now()) {
+    const startField = dimension === 'weekly' ? 'quota_weekly_start' : 'quota_daily_start';
+    const periodStart = sub2ParseTimestamp(account?.[startField] ?? account?.extra?.[startField]);
+    if (!Number.isFinite(periodStart)) return true;
+    const modeField = dimension === 'weekly' ? 'quota_weekly_reset_mode' : 'quota_daily_reset_mode';
+    const resetMode = String((account?.[modeField] ?? account?.extra?.[modeField]) || 'rolling').trim();
+    if (resetMode === 'fixed') {
+      return periodStart < sub2GetLastFixedQuotaReset(account, dimension, now);
+    }
+    const duration = dimension === 'weekly' ? SUB2_WEEK_MS : SUB2_DAY_MS;
+    return now - periodStart >= duration;
+  }
+
+  function sub2GetQuotaUsageSnapshot(account, dimension, now = Date.now()) {
+    const fieldPrefix = dimension === 'total' ? 'quota' : `quota_${dimension}`;
+    const limitField = `${fieldPrefix}_limit`;
+    const usedField = `${fieldPrefix}_used`;
+    const limit = sub2GetNumericAccountField(account, limitField);
+    let used = sub2GetNumericAccountField(account, usedField);
+    let periodExpired = false;
+
+    if (dimension !== 'total') {
+      const backendProvidedNormalizedUsage = sub2HasOwnProperty(account, usedField)
+        && account?.[usedField] !== null
+        && account?.[usedField] !== undefined;
+      if (!backendProvidedNormalizedUsage) {
+        periodExpired = sub2IsQuotaPeriodExpired(account, dimension, now);
+        if (periodExpired) used = 0;
+      }
+    }
+
+    return { dimension, limit, used, periodExpired, exceeded: limit > 0 && used >= limit };
+  }
+
+  function sub2GetOptionalNumericValue(source, fieldName) {
+    const rawValue = source?.[fieldName];
+    if (rawValue === null || rawValue === undefined || rawValue === '') return null;
+    const numericValue = Number(rawValue);
+    return Number.isFinite(numericValue) ? numericValue : null;
+  }
+
+  function sub2NormalizeConcurrencySnapshot(payload) {
+    const concurrencyByAccountId = new Map();
+    const concurrencyRecordsByAccountId = new Map();
+    const accountRecords = payload?.account;
+    const accountEntries = Array.isArray(accountRecords)
+      ? accountRecords.map((accountRecord) => [accountRecord?.account_id, accountRecord])
+      : accountRecords && typeof accountRecords === 'object'
+        ? Object.entries(accountRecords)
+        : [];
+
+    for (const [recordKey, accountRecord] of accountEntries) {
+      if (!accountRecord || typeof accountRecord !== 'object') continue;
+      const accountId = Number(accountRecord.account_id ?? recordKey);
+      if (!Number.isInteger(accountId) || accountId <= 0) continue;
+
+      const normalizedRecord = {
+        accountId,
+        groupId: Number.isInteger(Number(accountRecord.group_id)) && Number(accountRecord.group_id) > 0
+          ? Number(accountRecord.group_id)
+          : null,
+        currentInUse: sub2GetOptionalNumericValue(accountRecord, 'current_in_use'),
+        maxCapacity: sub2GetOptionalNumericValue(accountRecord, 'max_capacity'),
+        loadPercentage: sub2GetOptionalNumericValue(accountRecord, 'load_percentage'),
+        waitingInQueue: sub2GetOptionalNumericValue(accountRecord, 'waiting_in_queue'),
+      };
+      const accountRecordsForGroups = concurrencyRecordsByAccountId.get(accountId) || [];
+      accountRecordsForGroups.push(normalizedRecord);
+      concurrencyRecordsByAccountId.set(accountId, accountRecordsForGroups);
+
+      // 卡片只能展示一个账号级摘要。选取真实存在且负载最高的分组记录，
+      // 不能把不同分组的字段分别取最大值后拼成一个不存在的容量状态。
+      const previousRecord = concurrencyByAccountId.get(accountId);
+      const recordLoad = (record) => {
+        if (Number.isFinite(record?.loadPercentage)) return record.loadPercentage;
+        if (Number.isFinite(record?.currentInUse) && Number.isFinite(record?.maxCapacity) && record.maxCapacity > 0) {
+          return record.currentInUse / record.maxCapacity * 100;
+        }
+        return 0;
+      };
+      const shouldReplacePrevious = !previousRecord
+        || recordLoad(normalizedRecord) > recordLoad(previousRecord)
+        || (recordLoad(normalizedRecord) === recordLoad(previousRecord)
+          && (normalizedRecord.waitingInQueue ?? 0) > (previousRecord.waitingInQueue ?? 0));
+      if (shouldReplacePrevious) concurrencyByAccountId.set(accountId, normalizedRecord);
+    }
+
+    const parsedTimestamp = Date.parse(payload?.timestamp);
+    return {
+      enabled: payload?.enabled === true,
+      timestamp: Number.isFinite(parsedTimestamp) ? parsedTimestamp : 0,
+      byAccountId: concurrencyByAccountId,
+      recordsByAccountId: concurrencyRecordsByAccountId,
+    };
+  }
+
+  function sub2ResolveAccountConcurrency(
+    accountId,
+    requestGroupId,
+    concurrencyByAccountId,
+    concurrencyRecordsByAccountId,
+    fallbackToAccountSummary = true,
+  ) {
+    const numericAccountId = Number(accountId);
+    const numericRequestGroupId = Number(requestGroupId);
+    const accountRecords = concurrencyRecordsByAccountId?.get?.(numericAccountId) || [];
+    if (Number.isInteger(numericRequestGroupId) && numericRequestGroupId > 0) {
+      const matchingGroupRecord = accountRecords.find(
+        (concurrencyRecord) => concurrencyRecord.groupId === numericRequestGroupId,
+      );
+      if (matchingGroupRecord) return matchingGroupRecord;
+      if (!fallbackToAccountSummary) return null;
+    }
+    return concurrencyByAccountId?.get?.(numericAccountId) || null;
+  }
+
+  function sub2SummarizeConcurrency(concurrencyByAccountId) {
+    const summary = { currentInUse: 0, maxCapacity: 0, waitingInQueue: 0, accountCount: 0 };
+    if (!concurrencyByAccountId || typeof concurrencyByAccountId.values !== 'function') return summary;
+    for (const concurrency of concurrencyByAccountId.values()) {
+      summary.currentInUse += Math.max(0, concurrency?.currentInUse ?? 0);
+      summary.maxCapacity += Math.max(0, concurrency?.maxCapacity ?? 0);
+      summary.waitingInQueue += Math.max(0, concurrency?.waitingInQueue ?? 0);
+      summary.accountCount += 1;
+    }
+    return summary;
   }
 
   function sub2SupportsDailyQuota(account) {
@@ -251,7 +519,7 @@
   }
 
   function sub2NormalizeCorrelationId(value) {
-    return String(value || '').trim().replace(/^client:/i, '');
+    return String(value || '').trim().replace(/^(?:(?:client|local):)+/i, '');
   }
 
   function sub2NormalizeRoutingError(errorItem) {
@@ -269,7 +537,11 @@
       .trim();
 
     return {
+      id: Number.isInteger(Number(errorItem?.id)) && Number(errorItem.id) > 0
+        ? Number(errorItem.id)
+        : null,
       accountId,
+      accountName: String(errorItem?.account_name || '').trim(),
       createdAt,
       statusCode,
       recovered,
@@ -281,25 +553,234 @@
     };
   }
 
+  function sub2RoutingErrorMatchesRequest(routingError, recentRequest) {
+    const recentCorrelationId = sub2NormalizeCorrelationId(recentRequest?.requestId);
+    if (!recentCorrelationId || !routingError) return false;
+    return [routingError.requestId, routingError.clientRequestId]
+      .map(sub2NormalizeCorrelationId)
+      .filter(Boolean)
+      .includes(recentCorrelationId);
+  }
+
+  function sub2GetCorrelatedRoutingErrors(payload, recentRequest) {
+    const correlatedErrors = [];
+    for (const errorItem of sub2GetPaginatedItems(payload)) {
+      const routingError = sub2NormalizeRoutingError(errorItem);
+      if (!routingError || !sub2RoutingErrorMatchesRequest(routingError, recentRequest)) continue;
+      routingError.correlated = true;
+      correlatedErrors.push(routingError);
+    }
+    return correlatedErrors.sort((leftError, rightError) => leftError.createdAt - rightError.createdAt);
+  }
+
+  function sub2ParseUpstreamErrorEvents(detailPayload) {
+    const rawEvents = detailPayload?.upstream_errors;
+    if (Array.isArray(rawEvents)) return rawEvents;
+    if (typeof rawEvents !== 'string' || !rawEvents.trim()) return [];
+    try {
+      const parsedEvents = JSON.parse(rawEvents);
+      return Array.isArray(parsedEvents) ? parsedEvents : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function sub2NormalizeRouteEvent(rawEvent, fallback = {}, sequence = 0) {
+    if (!rawEvent || typeof rawEvent !== 'object') return null;
+    const accountId = Number(rawEvent.account_id ?? fallback.accountId);
+    if (!Number.isInteger(accountId) || accountId <= 0) return null;
+
+    let occurredAt = Number(rawEvent.at_unix_ms);
+    if (Number.isFinite(occurredAt) && occurredAt > 0 && occurredAt < 100000000000) {
+      occurredAt *= 1000;
+    }
+    if (!Number.isFinite(occurredAt) || occurredAt <= 0) {
+      occurredAt = Number(fallback.createdAt) || 0;
+    }
+
+    const statusCode = sub2ExtractRoutingStatusCode(rawEvent) ?? fallback.statusCode ?? null;
+    const kind = String(rawEvent.kind || fallback.kind || 'upstream_error').trim().toLocaleLowerCase();
+    const reason = String(rawEvent.reason || rawEvent.message || rawEvent.detail || fallback.detail || '').trim();
+    return {
+      type: 'failure',
+      accountId,
+      accountName: String(rawEvent.account_name || fallback.accountName || '').trim(),
+      occurredAt,
+      statusCode,
+      platform: String(rawEvent.platform || fallback.platform || '').trim(),
+      kind,
+      stage: String(rawEvent.stage || '').trim(),
+      scope: String(rawEvent.scope || '').trim(),
+      reason,
+      sequence,
+      source: 'detail',
+    };
+  }
+
+  function sub2BuildRouteChain(
+    recentRequest,
+    correlatedErrors = [],
+    detailPayloads = [],
+    detailsComplete = true,
+  ) {
+    const detailedEvents = [];
+    const detailErrorIdsWithEvents = new Set();
+    let sequence = 0;
+    for (const detailPayload of Array.isArray(detailPayloads) ? detailPayloads : []) {
+      const parsedEvents = sub2ParseUpstreamErrorEvents(detailPayload);
+      const detailErrorId = Number(detailPayload?.id);
+      let normalizedEventCount = 0;
+      for (const rawEvent of parsedEvents) {
+        const normalizedEvent = sub2NormalizeRouteEvent(rawEvent, {
+          accountId: detailPayload?.account_id,
+          accountName: detailPayload?.account_name,
+          createdAt: Date.parse(detailPayload?.created_at),
+          statusCode: sub2ExtractRoutingStatusCode(detailPayload),
+          platform: detailPayload?.platform,
+        }, sequence++);
+        if (normalizedEvent) {
+          detailedEvents.push(normalizedEvent);
+          normalizedEventCount += 1;
+        }
+      }
+      if (normalizedEventCount > 0 && Number.isInteger(detailErrorId) && detailErrorId > 0) {
+        detailErrorIdsWithEvents.add(detailErrorId);
+      }
+    }
+
+    const uniqueEvents = [];
+    const seenEventKeys = new Set();
+    for (const routeEvent of detailedEvents) {
+      const eventKey = [
+        routeEvent.accountId,
+        routeEvent.occurredAt,
+        routeEvent.statusCode || '',
+        routeEvent.kind,
+        routeEvent.reason,
+      ].join('|');
+      if (seenEventKeys.has(eventKey)) continue;
+      seenEventKeys.add(eventKey);
+      uniqueEvents.push(routeEvent);
+    }
+
+    // 为详情未覆盖的关联账号保留列表摘要。部分详情超时或被截断时，不能因为
+    // 另一条详情成功就把已知失败账号从链路中删除。
+    let summaryFallbackCount = 0;
+    let unresolvedRecoveredSummaryCount = 0;
+    for (const routingError of Array.isArray(correlatedErrors) ? correlatedErrors : []) {
+      const errorCoveredByDetails = routingError.id && detailErrorIdsWithEvents.has(routingError.id);
+      if (routingError.recovered) {
+        // recovered 行是在最终请求成功后写入的，account_id 可能是最终成功账号；
+        // 真实失败账号只存在 upstream_errors 详情中，不能用摘要账号伪造失败跳点。
+        if (!errorCoveredByDetails) unresolvedRecoveredSummaryCount += 1;
+        continue;
+      }
+      const accountCoveredByDetails = uniqueEvents.some(
+        (routeEvent) => routeEvent.accountId === routingError.accountId,
+      );
+      if (!errorCoveredByDetails && !accountCoveredByDetails) {
+        uniqueEvents.push({
+          type: 'failure',
+          accountId: routingError.accountId,
+          accountName: routingError.accountName,
+          occurredAt: routingError.createdAt,
+          statusCode: routingError.statusCode,
+          platform: '',
+          kind: routingError.recovered ? 'recovered_error' : 'upstream_error',
+          stage: '',
+          scope: '',
+          reason: routingError.detail,
+          sequence: sequence++,
+          source: 'summary',
+        });
+        summaryFallbackCount += 1;
+      }
+    }
+
+    if (recentRequest) {
+      uniqueEvents.push({
+        type: 'success',
+        accountId: recentRequest.accountId,
+        accountName: '',
+        occurredAt: recentRequest.createdAt,
+        statusCode: null,
+        platform: recentRequest.platform,
+        kind: 'success',
+        stage: '',
+        scope: '',
+        reason: recentRequest.model ? `成功响应 · ${recentRequest.model}` : '成功响应',
+        sequence: sequence++,
+        source: 'request',
+      });
+    }
+
+    uniqueEvents.sort((leftEvent, rightEvent) => {
+      if (leftEvent.type !== rightEvent.type) return leftEvent.type === 'success' ? 1 : -1;
+      const leftTimestamp = Number(leftEvent.occurredAt) || 0;
+      const rightTimestamp = Number(rightEvent.occurredAt) || 0;
+      return leftTimestamp - rightTimestamp || leftEvent.sequence - rightEvent.sequence;
+    });
+
+    return {
+      events: uniqueEvents,
+      detailLevel: detailedEvents.length
+        ? detailsComplete && summaryFallbackCount === 0 && unresolvedRecoveredSummaryCount === 0
+          ? 'detailed'
+          : 'partial'
+        : correlatedErrors.length ? 'summary' : 'success-only',
+      unresolvedRecoveredSummaryCount,
+    };
+  }
+
   function sub2BuildRecentRoutingErrorIndex(payload, recentRequest = null) {
     const errorByAccountId = new Map();
     const recentCorrelationId = sub2NormalizeCorrelationId(recentRequest?.requestId);
     for (const errorItem of sub2GetPaginatedItems(payload)) {
       const normalizedError = sub2NormalizeRoutingError(errorItem);
       if (!normalizedError) continue;
-      const errorCorrelationIds = [normalizedError.requestId, normalizedError.clientRequestId]
-        .map(sub2NormalizeCorrelationId)
-        .filter(Boolean);
-      normalizedError.correlated = Boolean(recentCorrelationId && errorCorrelationIds.includes(recentCorrelationId));
+      // recovered 摘要行的 account_id 可能是最终成功账号，不能直接归因为该账号失败。
+      // 真实失败账号会在随后读取的 routeChain.upstream_errors 详情中回填。
+      if (normalizedError.recovered) continue;
+      normalizedError.correlated = Boolean(recentCorrelationId
+        && sub2RoutingErrorMatchesRequest(normalizedError, recentRequest));
       const previousError = errorByAccountId.get(normalizedError.accountId);
       const replacesPrevious = !previousError
-        || (normalizedError.correlated && !previousError.correlated)
-        || (normalizedError.correlated === previousError.correlated && normalizedError.createdAt > previousError.createdAt);
+        || normalizedError.createdAt > previousError.createdAt
+        || (normalizedError.createdAt === previousError.createdAt
+          && normalizedError.correlated
+          && !previousError.correlated);
       if (replacesPrevious) {
         errorByAccountId.set(normalizedError.accountId, normalizedError);
       }
     }
     return errorByAccountId;
+  }
+
+  function sub2MergeRouteFailuresIntoErrorIndex(errorByAccountId, routeChain, recentRequest = null) {
+    const mergedIndex = errorByAccountId instanceof Map ? errorByAccountId : new Map();
+    for (const routeEvent of Array.isArray(routeChain?.events) ? routeChain.events : []) {
+      if (routeEvent.type !== 'failure') continue;
+      const accountId = Number(routeEvent.accountId);
+      if (!Number.isInteger(accountId) || accountId <= 0) continue;
+      const routingError = {
+        id: null,
+        accountId,
+        accountName: String(routeEvent.accountName || '').trim(),
+        createdAt: Number(routeEvent.occurredAt) || Number(recentRequest?.createdAt) || 0,
+        statusCode: routeEvent.statusCode || null,
+        recovered: true,
+        detail: String(routeEvent.reason || '').trim(),
+        model: String(recentRequest?.model || '').trim(),
+        requestId: String(recentRequest?.requestId || '').trim(),
+        clientRequestId: '',
+        correlated: true,
+      };
+      const previousError = mergedIndex.get(accountId);
+      if (!previousError || routingError.createdAt >= previousError.createdAt) {
+        mergedIndex.set(accountId, routingError);
+      }
+    }
+    return mergedIndex;
   }
 
   function sub2ResolveLatestHit(accounts, recentRequest, allowLastUsedFallback = true) {
@@ -378,55 +859,37 @@
       };
     }
 
-    if (!latestHit || (Number(account?.priority) || 0) >= latestHit.priority) return null;
+    if (!latestHit) return null;
+    const candidatePriority = sub2GetEffectivePriority(account, latestHit.groupId, context.groupsById);
+    const hitPriority = Number.isFinite(context.latestHitEffectivePriority)
+      ? context.latestHitEffectivePriority
+      : latestHit.priority;
+    if (candidatePriority >= hitPriority) return null;
 
-    const health = sub2ComputeHealth(account, now);
-    if (health.tone !== 'ok') {
+    const eligibility = sub2EvaluateCandidateEligibility(account, {
+      recentRequest: latestHit,
+      groupsById: context.groupsById,
+      routeChain: context.routeChain,
+      concurrency: context.concurrency,
+      concurrencyAvailable: context.concurrencyAvailable,
+      concurrencyEnabled: context.concurrencyEnabled,
+      savedModelState: context.savedModelState,
+    }, now);
+    const eligibilityText = eligibility.reasons.join('；');
+    if (eligibility.status === 'attempted') {
+      return { tone: 'verified', evidence: '已证实', text: eligibilityText };
+    }
+    if (eligibility.status === 'eligible' && context.errorsAvailable === false) {
       return {
         tone: 'inferred',
-        evidence: '当前状态',
-        text: `当前不可正常调度：${health.reasons.join('；')}；可能是未命中原因，但 sub2 未保存当时的候选状态`,
-      };
-    }
-
-    if (latestHit.platform && String(account?.platform || '').trim() !== latestHit.platform) {
-      return {
-        tone: 'inferred',
-        evidence: '配置判断',
-        text: `账号当前平台与最近请求平台 ${latestHit.platform} 不同，通常不会进入该请求候选`,
-      };
-    }
-
-    if (latestHit.groupId) {
-      const memberships = sub2GetGroupMemberships(account, context.groupsById);
-      const belongsToRequestGroup = memberships.some((membership) => membership.groupId === latestHit.groupId);
-      if (!belongsToRequestGroup) {
-        const requestGroup = sub2GetIndexedGroup(context.groupsById, latestHit.groupId);
-        const requestGroupName = String(requestGroup?.name || `分组 ${latestHit.groupId}`).trim();
-        return {
-          tone: 'inferred',
-          evidence: '配置判断',
-          text: `账号当前不在最近请求分组「${requestGroupName}」，通常不会进入该请求候选`,
-        };
-      }
-    }
-
-    const accountLastUsedAt = Date.parse(account?.last_used_at);
-    const hasRecentAccountActivity = Number.isFinite(accountLastUsedAt)
-      && Math.abs(latestHit.createdAt - accountLastUsedAt) <= SUB2_ROUTING_LOOKBACK_MS;
-    if (context.errorsAvailable === false) {
-      return {
-        tone: 'inferred',
-        evidence: '推测',
-        text: '较高优先级状态正常；运维故障明细不可用，可能因会话粘连、分组/模型匹配或调度权重未选中',
+        evidence: '信息不足',
+        text: `${eligibilityText}；运维故障明细不可用`,
       };
     }
     return {
       tone: 'inferred',
-      evidence: '推测',
-      text: hasRecentAccountActivity
-        ? '较高优先级状态正常且近期用过；可能因会话粘连、模型匹配或高级调度权重未选中'
-        : '较高优先级未发现近期请求/失败；可能未进入候选，或被会话粘连、模型匹配、调度权重跳过',
+      evidence: eligibility.evidence,
+      text: eligibilityText,
     };
   }
 
@@ -459,6 +922,180 @@
     }
 
     return normalizedModels.sort((leftModel, rightModel) => leftModel.id.localeCompare(rightModel.id));
+  }
+
+  function sub2ModelPatternMatches(pattern, requestedModel) {
+    const normalizedPattern = String(pattern || '');
+    const normalizedRequestedModel = String(requestedModel || '');
+    if (normalizedPattern.endsWith('*')) {
+      return normalizedRequestedModel.startsWith(normalizedPattern.slice(0, -1));
+    }
+    return normalizedPattern === normalizedRequestedModel;
+  }
+
+  function sub2NormalizeRequestedModelForLookup(platform, requestedModel) {
+    const trimmedModel = String(requestedModel || '').trim();
+    if ((platform === 'gemini' || platform === 'antigravity')
+      && trimmedModel === 'gemini-3.1-pro-preview-customtools') {
+      return 'gemini-3.1-pro-preview';
+    }
+    return trimmedModel;
+  }
+
+  function sub2GetModelLookupCandidates(platform, requestedModel) {
+    const rawModel = String(requestedModel || '');
+    const normalizedModel = sub2NormalizeRequestedModelForLookup(platform, rawModel);
+    return rawModel === normalizedModel ? [rawModel] : [rawModel, normalizedModel];
+  }
+
+  function sub2GetAccountModelMappingState(account) {
+    const credentials = account?.credentials;
+    if (!credentials || typeof credentials !== 'object' || Array.isArray(credentials)) {
+      return { known: false, patterns: [] };
+    }
+
+    const rawMapping = credentials.model_mapping;
+    if (!rawMapping || typeof rawMapping !== 'object' || Array.isArray(rawMapping)) {
+      return { known: true, patterns: [] };
+    }
+
+    const patterns = Object.entries(rawMapping)
+      .filter(([, targetModel]) => typeof targetModel === 'string')
+      .map(([sourceModel]) => sourceModel);
+    return { known: true, patterns };
+  }
+
+  function sub2IsOpenAIOAuthForeignModel(account, requestedModel) {
+    const platform = String(account?.platform || '').trim();
+    const accountType = String(account?.type || '').trim();
+    const currentPassthroughValue = account?.extra?.openai_passthrough;
+    const legacyPassthroughValue = account?.extra?.openai_oauth_passthrough;
+    const passthroughEnabled = typeof currentPassthroughValue === 'boolean'
+      ? currentPassthroughValue
+      : legacyPassthroughValue === true;
+    if (platform !== 'openai' || accountType !== 'oauth' || passthroughEnabled) return false;
+
+    const finalModelSegment = String(requestedModel || '').trim().split('/').pop().toLocaleLowerCase();
+    return SUB2_OPENAI_OAUTH_FOREIGN_MODEL_PREFIXES.some(
+      (modelPrefix) => finalModelSegment.startsWith(modelPrefix),
+    );
+  }
+
+  function sub2EvaluateSavedModelEvidence(savedModelState, lookupCandidates, requestedModel) {
+    if (savedModelState?.status === 'loaded') {
+      const savedModels = Array.isArray(savedModelState.models) ? savedModelState.models : [];
+      const matchingSavedModel = savedModels.find((savedModel) => {
+        const savedModelId = String(savedModel?.id ?? savedModel ?? '');
+        return lookupCandidates.some(
+          (lookupModel) => sub2ModelPatternMatches(savedModelId, lookupModel),
+        );
+      });
+      if (matchingSavedModel) {
+        const savedModelId = String(matchingSavedModel?.id ?? matchingSavedModel);
+        return {
+          status: 'supported',
+          evidence: '配置判断',
+          reason: `sub2 保存模型 ${savedModelId} 支持 ${requestedModel}`,
+          checkNeeded: false,
+        };
+      }
+      return {
+        status: 'unknown',
+        evidence: '信息不足',
+        reason: savedModels.length
+          ? `sub2 保存的 ${savedModels.length} 个模型中未找到 ${requestedModel}；保存列表缺失不能替代调度器的模型映射判断`
+          : 'sub2 保存模型为空，无法判断模型资格',
+        checkNeeded: false,
+      };
+    }
+
+    if (savedModelState?.status === 'error') {
+      return {
+        status: 'unknown',
+        evidence: '信息不足',
+        reason: '读取 sub2 保存模型失败，模型资格未知',
+        checkNeeded: true,
+      };
+    }
+    if (savedModelState?.status === 'loading') {
+      return {
+        status: 'unknown',
+        evidence: '信息不足',
+        reason: '正在读取 sub2 保存模型',
+        checkNeeded: true,
+      };
+    }
+    return null;
+  }
+
+  function sub2EvaluateModelSupport(account, requestedModel, savedModelState = null) {
+    const platform = String(account?.platform || '').trim();
+    const lookupCandidates = sub2GetModelLookupCandidates(platform, requestedModel);
+    const mappingState = sub2GetAccountModelMappingState(account);
+
+    if (mappingState.known && mappingState.patterns.length) {
+      const matchingPattern = mappingState.patterns.find(
+        (modelPattern) => lookupCandidates.some(
+          (lookupModel) => sub2ModelPatternMatches(modelPattern, lookupModel),
+        ),
+      );
+      if (matchingPattern) {
+        return {
+          status: 'supported',
+          evidence: '配置判断',
+          reason: matchingPattern === requestedModel
+            ? `账号模型映射包含 ${requestedModel}`
+            : `账号模型映射 ${matchingPattern} 支持 ${requestedModel}`,
+          checkNeeded: false,
+        };
+      }
+      if (platform === 'antigravity') {
+        return sub2EvaluateSavedModelEvidence(savedModelState, lookupCandidates, requestedModel) || {
+          status: 'unknown',
+          evidence: '信息不足',
+          reason: 'Antigravity 会在原始配置上补充默认透传和模型别名，需核对 sub2 有效模型列表',
+          checkNeeded: true,
+        };
+      }
+      return {
+        status: 'unsupported',
+        evidence: '配置判断',
+        reason: `账号模型映射不支持 ${requestedModel}`,
+        checkNeeded: false,
+      };
+    }
+
+    if (mappingState.known) {
+      if (platform === 'grok' || platform === 'antigravity') {
+        return sub2EvaluateSavedModelEvidence(savedModelState, lookupCandidates, requestedModel) || {
+          status: 'unknown',
+          evidence: '信息不足',
+          reason: `${platform === 'grok' ? 'Grok' : 'Antigravity'} 空映射会由 sub2 注入平台默认模型，需核对 sub2 有效模型列表`,
+          checkNeeded: true,
+        };
+      }
+      if (sub2IsOpenAIOAuthForeignModel(account, requestedModel)) {
+        return {
+          status: 'unsupported',
+          evidence: '配置判断',
+          reason: `空模型映射的 OpenAI OAuth 账号会排除其他厂商模型 ${requestedModel}`,
+          checkNeeded: false,
+        };
+      }
+      return {
+        status: 'supported',
+        evidence: '配置判断',
+        reason: '账号未配置模型映射，sub2 按官方规则允许该模型',
+        checkNeeded: false,
+      };
+    }
+
+    return sub2EvaluateSavedModelEvidence(savedModelState, lookupCandidates, requestedModel) || {
+      status: 'unknown',
+      evidence: '信息不足',
+      reason: `账号响应未暴露模型映射，尚未核对 sub2 保存模型是否包含 ${requestedModel}`,
+      checkNeeded: true,
+    };
   }
 
   // 纯函数：根据账号的真实状态字段（非测活）推断健康度。
@@ -626,6 +1263,201 @@
     }
 
     return memberships;
+  }
+
+  function sub2GetEffectivePriority(account, requestGroupId = null, groupsById = null) {
+    const accountPriority = Number(account?.priority);
+    const normalizedAccountPriority = Number.isFinite(accountPriority) ? accountPriority : 0;
+    if (!requestGroupId) return normalizedAccountPriority;
+    const matchingMembership = sub2GetGroupMemberships(account, groupsById)
+      .find((membership) => membership.groupId === requestGroupId);
+    return matchingMembership?.priority === null || matchingMembership?.priority === undefined
+      ? normalizedAccountPriority
+      : matchingMembership.priority;
+  }
+
+  function sub2FindAccountRouteFailure(accountId, routeChain) {
+    const routeEvents = Array.isArray(routeChain?.events) ? routeChain.events : [];
+    return routeEvents.find((routeEvent) => routeEvent.type === 'failure'
+      && Number(routeEvent.accountId) === Number(accountId)) || null;
+  }
+
+  function sub2DescribeRouteEvent(routeEvent) {
+    if (!routeEvent) return '';
+    if (routeEvent.type === 'success') return routeEvent.reason || '成功响应';
+    const statusLabel = routeEvent.statusCode ? String(routeEvent.statusCode) : '状态码未知';
+    const rawReason = String(routeEvent.reason || '').trim();
+    const shortReason = rawReason.length > 140 ? `${rawReason.slice(0, 137)}...` : rawReason;
+    return `${statusLabel}${shortReason ? ` · ${shortReason}` : ''}`;
+  }
+
+  function sub2EvaluateCandidateEligibility(account, context = {}, now = Date.now()) {
+    const recentRequest = context.recentRequest || context.latestHit || null;
+    const accountId = Number(account?.id);
+    const effectivePriority = sub2GetEffectivePriority(account, recentRequest?.groupId, context.groupsById);
+    const result = {
+      status: 'unknown',
+      tone: 'unknown',
+      evidence: '信息不足',
+      effectivePriority,
+      reasons: [],
+      modelCheckNeeded: false,
+    };
+    let modelCheckUnknown = false;
+
+    if (!recentRequest) {
+      result.reasons.push('最近 30 分钟没有可分析的成功请求');
+      return result;
+    }
+
+    if (accountId === Number(recentRequest.accountId)) {
+      result.status = 'hit';
+      result.tone = 'hit';
+      result.evidence = '已证实';
+      result.reasons.push('最近请求最终由该账号成功响应');
+      return result;
+    }
+
+    const actualRouteFailure = sub2FindAccountRouteFailure(accountId, context.routeChain);
+    if (actualRouteFailure) {
+      result.status = 'attempted';
+      result.tone = 'attempted';
+      result.evidence = '已证实';
+      result.reasons.push(`最近请求实际尝试后失败：${sub2DescribeRouteEvent(actualRouteFailure)}`);
+      return result;
+    }
+
+    const accountPlatform = String(account?.platform || '').trim();
+    if (recentRequest.platform && accountPlatform !== recentRequest.platform) {
+      result.status = 'excluded';
+      result.tone = 'excluded';
+      result.evidence = '配置判断';
+      result.reasons.push(`平台 ${accountPlatform || '未知'} 与请求平台 ${recentRequest.platform} 不同`);
+      return result;
+    }
+
+    let matchingMembership = null;
+    if (recentRequest.groupId) {
+      matchingMembership = sub2GetGroupMemberships(account, context.groupsById)
+        .find((membership) => membership.groupId === recentRequest.groupId) || null;
+      if (!matchingMembership) {
+        const requestGroup = sub2GetIndexedGroup(context.groupsById, recentRequest.groupId);
+        const requestGroupName = String(requestGroup?.name || `分组 ${recentRequest.groupId}`).trim();
+        result.status = 'excluded';
+        result.tone = 'excluded';
+        result.evidence = '配置判断';
+        result.reasons.push(`当前不属于请求分组「${requestGroupName}」`);
+        return result;
+      }
+      if (matchingMembership.status && matchingMembership.status !== 'active') {
+        result.status = 'excluded';
+        result.tone = 'excluded';
+        result.evidence = '当前快照';
+        result.reasons.push(`请求分组当前状态为 ${matchingMembership.status}`);
+        return result;
+      }
+    }
+
+    const expiresAt = sub2ParseTimestamp(account?.expires_at);
+    if (account?.auto_pause_on_expired === true && Number.isFinite(expiresAt) && now >= expiresAt) {
+      result.status = 'constrained';
+      result.tone = 'constrained';
+      result.evidence = '当前快照';
+      result.reasons.push('账号已过期，且启用了到期自动暂停');
+      return result;
+    }
+
+    const health = sub2ComputeHealth(account, now);
+    if (health.tone === 'down' || health.tone === 'paused') {
+      result.status = 'constrained';
+      result.tone = 'constrained';
+      result.evidence = '当前快照';
+      result.reasons.push(`账号当前不可正常调度：${health.reasons.join('；')}`);
+      result.reasons.push('这是当前状态，不等于请求发生时的历史状态');
+      return result;
+    }
+    if (health.tone === 'warn') {
+      result.reasons.push(`账号当前有警告但仍可能可调度：${health.reasons.join('；')}`);
+    }
+
+    if (sub2SupportsDailyQuota(account)) {
+      const quotaSnapshots = [
+        sub2GetQuotaUsageSnapshot(account, 'total', now),
+        sub2GetQuotaUsageSnapshot(account, 'daily', now),
+        sub2GetQuotaUsageSnapshot(account, 'weekly', now),
+      ];
+      const quotaLabels = { total: '总配额', daily: '日配额', weekly: '周配额' };
+      const exceededQuota = quotaSnapshots.find((quotaSnapshot) => quotaSnapshot.exceeded);
+      if (exceededQuota) {
+        result.status = 'constrained';
+        result.tone = 'constrained';
+        result.evidence = '当前快照';
+        result.reasons.push(
+          `当前${quotaLabels[exceededQuota.dimension]}已用尽（$${sub2FormatCost(exceededQuota.used)} / $${sub2FormatCost(exceededQuota.limit)}）`,
+        );
+        return result;
+      }
+    }
+
+    const savedModelState = context.savedModelState || null;
+    if (recentRequest.model) {
+      const modelSupport = sub2EvaluateModelSupport(account, recentRequest.model, savedModelState);
+      result.modelCheckNeeded = modelSupport.checkNeeded;
+      result.reasons.push(modelSupport.reason);
+      if (modelSupport.status === 'unsupported') {
+        result.status = 'excluded';
+        result.tone = 'excluded';
+        result.evidence = modelSupport.evidence;
+        return result;
+      }
+      if (modelSupport.status === 'unknown') {
+        modelCheckUnknown = true;
+        result.evidence = '信息不足';
+      }
+    }
+
+    const concurrency = context.concurrency || null;
+    let capacityCheckUnknown = false;
+    const currentInUse = concurrency?.currentInUse;
+    const maxCapacity = concurrency?.maxCapacity;
+    const waitingInQueue = concurrency?.waitingInQueue;
+    if (context.concurrencyAvailable === false) {
+      capacityCheckUnknown = true;
+      result.reasons.push('容量接口不可用，无法核对请求发生时的负载');
+    } else if (context.concurrencyEnabled === false) {
+      capacityCheckUnknown = true;
+      result.reasons.push('容量统计当前未启用，无法核对账号负载');
+    } else if (Number.isFinite(maxCapacity) && maxCapacity > 0 && Number.isFinite(currentInUse)) {
+      result.reasons.push(`当前容量 ${currentInUse} / ${maxCapacity}${waitingInQueue > 0 ? `，排队 ${waitingInQueue}` : ''}`);
+      if (currentInUse >= maxCapacity) {
+        result.status = 'constrained';
+        result.tone = 'constrained';
+        result.evidence = '当前快照';
+        result.reasons.push('当前容量已满，调度器可能排队或选择其他账号');
+        return result;
+      }
+    } else if (!concurrency) {
+      capacityCheckUnknown = true;
+      result.reasons.push('容量接口未返回该账号记录，当前负载未知');
+    } else {
+      capacityCheckUnknown = true;
+      result.reasons.push('账号容量记录缺少有效上限或占用值，当前负载未知');
+    }
+
+    if (modelCheckUnknown || result.modelCheckNeeded || capacityCheckUnknown) {
+      result.status = 'unknown';
+      result.tone = 'unknown';
+      result.evidence = '信息不足';
+      result.reasons.push('其余当前配置允许进入候选，但会话粘连和调度权重仍可能跳过');
+      return result;
+    }
+
+    result.status = 'eligible';
+    result.tone = 'eligible';
+    result.evidence = '当前快照';
+    result.reasons.push('当前平台、分组、状态、配额、模型和容量未发现排除条件');
+    result.reasons.push('仍不能证明历史请求一定进入候选；会话粘连和调度权重可能跳过');
+    return result;
   }
 
   function sub2AccountMatchesFilter(account, memberships, filterText) {
@@ -861,7 +1693,7 @@
   }
 
   async function sub2FetchRecentRoutingActivity() {
-    const [requestResult, errorResult] = await Promise.allSettled([
+    const [requestResult, errorResult, concurrencyResult] = await Promise.allSettled([
       sub2ApiRequestWithTimeout(
         'GET',
         '/admin/ops/requests?time_range=30m&kind=success&sort=created_at_desc&page=1&page_size=1',
@@ -870,18 +1702,56 @@
         'GET',
         '/admin/ops/upstream-errors?time_range=30m&page=1&page_size=200',
       ),
+      sub2ApiRequestWithTimeout('GET', '/admin/ops/concurrency'),
     ]);
 
     const recentRequest = requestResult.status === 'fulfilled'
       ? sub2NormalizeRecentRequest(requestResult.value)
       : null;
+    const correlatedErrors = errorResult.status === 'fulfilled'
+      ? sub2GetCorrelatedRoutingErrors(errorResult.value, recentRequest)
+      : [];
+    const correlatedErrorIds = correlatedErrors
+      .map((routingError) => routingError.id)
+      .filter((errorId, index, errorIds) => errorId && errorIds.indexOf(errorId) === index);
+    const fetchedErrorIds = correlatedErrorIds.slice(0, 8);
+    const detailRequests = fetchedErrorIds
+      .map((errorId) => sub2ApiRequestWithTimeout(
+        'GET',
+        `/admin/ops/upstream-errors/${errorId}`,
+        undefined,
+        3500,
+      ));
+    const detailResults = detailRequests.length ? await Promise.allSettled(detailRequests) : [];
+    const detailPayloads = detailResults
+      .filter((detailResult) => detailResult.status === 'fulfilled')
+      .map((detailResult) => detailResult.value);
+    const routeDetailsComplete = correlatedErrorIds.length === fetchedErrorIds.length
+      && detailResults.every((detailResult) => detailResult.status === 'fulfilled');
+    const concurrencySnapshot = concurrencyResult.status === 'fulfilled'
+      ? sub2NormalizeConcurrencySnapshot(concurrencyResult.value)
+      : null;
+    const routeChain = sub2BuildRouteChain(
+      recentRequest,
+      correlatedErrors,
+      detailPayloads,
+      routeDetailsComplete,
+    );
+    const errorByAccountId = errorResult.status === 'fulfilled'
+      ? sub2BuildRecentRoutingErrorIndex(errorResult.value, recentRequest)
+      : new Map();
+    sub2MergeRouteFailuresIntoErrorIndex(errorByAccountId, routeChain, recentRequest);
+
     return {
       requestsAvailable: requestResult.status === 'fulfilled',
       errorsAvailable: errorResult.status === 'fulfilled',
+      concurrencyAvailable: concurrencyResult.status === 'fulfilled',
       recentRequest,
-      errorByAccountId: errorResult.status === 'fulfilled'
-        ? sub2BuildRecentRoutingErrorIndex(errorResult.value, recentRequest)
-        : new Map(),
+      errorByAccountId,
+      routeChain,
+      routeDetailsAvailable: errorResult.status === 'fulfilled'
+        && (!correlatedErrorIds.length || routeDetailsComplete),
+      concurrencySnapshot,
     };
   }
 
@@ -934,12 +1804,18 @@
     #${SUB2_PANEL_ID} .sub2-head b{font-size:14px;}
     #${SUB2_PANEL_ID} .sub2-version{margin-left:5px;color:#93c5fd;font-size:11px;font-weight:600;}
     #${SUB2_PANEL_ID} .sub2-head .sub2-min{background:transparent;border:none;color:#cbd5e1;cursor:pointer;font-size:16px;line-height:1;}
-    #${SUB2_PANEL_ID} .sub2-summary{display:flex;gap:6px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid #f1f5f9;}
+    #${SUB2_PANEL_ID} .sub2-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid #f1f5f9;}
     #${SUB2_PANEL_ID} .sub2-chip{padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;}
     #${SUB2_PANEL_ID} .sub2-chip.ok{background:#dcfce7;color:#166534;}
     #${SUB2_PANEL_ID} .sub2-chip.warn{background:#fef9c3;color:#854d0e;}
     #${SUB2_PANEL_ID} .sub2-chip.paused{background:#e2e8f0;color:#475569;}
     #${SUB2_PANEL_ID} .sub2-chip.down{background:#fee2e2;color:#991b1b;}
+    #${SUB2_PANEL_ID} .sub2-chip.info{background:#dbeafe;color:#1d4ed8;}
+    #${SUB2_PANEL_ID} .sub2-chip.muted{background:#f1f5f9;color:#64748b;}
+    #${SUB2_PANEL_ID} .sub2-head-actions{display:flex;align-items:center;gap:7px;}
+    #${SUB2_PANEL_ID} .sub2-diagnostics-open{border:1px solid #60a5fa;border-radius:999px;padding:3px 9px;
+      background:#eff6ff;color:#1d4ed8;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-diagnostics-open:hover{background:#dbeafe;}
     #${SUB2_PANEL_ID} .sub2-controls{display:flex;flex-direction:column;gap:7px;padding:8px 12px;border-bottom:1px solid #f1f5f9;background:#f8fafc;}
     #${SUB2_PANEL_ID} .sub2-search-row{display:flex;align-items:center;gap:7px;}
     #${SUB2_PANEL_ID} .sub2-account-search{flex:1;min-width:0;border:1px solid #cbd5e1;border-radius:8px;padding:6px 9px;
@@ -1000,7 +1876,7 @@
     #${SUB2_PANEL_ID} .sub2-badge.warn{background:#fef9c3;color:#854d0e;}
     #${SUB2_PANEL_ID} .sub2-badge.paused{background:#e2e8f0;color:#475569;}
     #${SUB2_PANEL_ID} .sub2-badge.down{background:#fee2e2;color:#991b1b;}
-    #${SUB2_PANEL_ID} .sub2-hit-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:999px;
+    #${SUB2_PANEL_ID} .sub2-hit-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:999px;cursor:pointer;
       background:#cffafe;color:#155e75;border:1px solid #67e8f9;font-size:10px;font-weight:750;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-hit-badge::before{content:"";width:6px;height:6px;border-radius:50%;background:#06b6d4;
       box-shadow:0 0 0 3px rgba(6,182,212,.14);}
@@ -1009,6 +1885,9 @@
     #${SUB2_PANEL_ID} .sub2-quota-summary{font-weight:600;color:#0369a1;}
     #${SUB2_PANEL_ID} .sub2-quota-summary.warn{color:#b45309;}
     #${SUB2_PANEL_ID} .sub2-quota-summary.down{color:#b91c1c;}
+    #${SUB2_PANEL_ID} .sub2-capacity-state{font-weight:600;color:#0369a1;cursor:help;}
+    #${SUB2_PANEL_ID} .sub2-capacity-state.warn{color:#b45309;}
+    #${SUB2_PANEL_ID} .sub2-capacity-state.down{color:#b91c1c;}
     #${SUB2_PANEL_ID} .sub2-pool-state{color:#7c3aed;font-weight:600;cursor:help;}
     #${SUB2_PANEL_ID} .sub2-reasons{font-size:11px;color:#64748b;line-height:1.5;}
     #${SUB2_PANEL_ID} .sub2-routing-note{display:flex;align-items:flex-start;gap:6px;padding:5px 7px;border-radius:7px;
@@ -1057,6 +1936,45 @@
     #${SUB2_PANEL_ID} .sub2-model-id{display:block;color:#0f172a;font-size:11px;font-weight:650;overflow-wrap:anywhere;}
     #${SUB2_PANEL_ID} .sub2-model-meta{display:block;margin-top:3px;color:#64748b;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-model-empty{grid-column:1 / -1;padding:24px 12px;color:#64748b;text-align:center;line-height:1.6;}
+    #${SUB2_PANEL_ID} .sub2-diagnostics-overlay{position:absolute;inset:0;z-index:21;display:flex;justify-content:flex-end;
+      background:rgba(15,23,42,.36);backdrop-filter:blur(1px);}
+    #${SUB2_PANEL_ID} .sub2-diagnostics-overlay[hidden]{display:none;}
+    #${SUB2_PANEL_ID} .sub2-diagnostics-drawer{width:100%;height:100%;display:flex;flex-direction:column;background:#fff;
+      border-left:1px solid #cbd5e1;box-shadow:-10px 0 28px rgba(15,23,42,.16);}
+    #${SUB2_PANEL_ID} .sub2-diagnostics-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:12px 14px;
+      border-bottom:1px solid #e2e8f0;background:#f8fafc;}
+    #${SUB2_PANEL_ID} .sub2-diagnostics-title{display:block;font-size:14px;}
+    #${SUB2_PANEL_ID} .sub2-diagnostics-subtitle{margin-top:3px;color:#64748b;font-size:11px;line-height:1.4;}
+    #${SUB2_PANEL_ID} .sub2-diagnostics-close{border:none;background:transparent;color:#64748b;cursor:pointer;font-size:20px;line-height:1;padding:0 2px;}
+    #${SUB2_PANEL_ID} .sub2-diagnostics-body{flex:1;min-height:0;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:10px;}
+    #${SUB2_PANEL_ID} .sub2-diagnostics-card{border:1px solid #e2e8f0;border-radius:9px;background:#fff;padding:9px;}
+    #${SUB2_PANEL_ID} .sub2-diagnostics-card h3{margin:0 0 6px;font-size:12px;color:#0f172a;}
+    #${SUB2_PANEL_ID} .sub2-request-facts{display:flex;flex-wrap:wrap;gap:5px 9px;color:#475569;font-size:11px;line-height:1.5;}
+    #${SUB2_PANEL_ID} .sub2-diagnostics-note{padding:7px 9px;border-radius:7px;background:#f8fafc;color:#64748b;font-size:10px;line-height:1.5;}
+    #${SUB2_PANEL_ID} .sub2-route-chain{display:flex;flex-direction:column;gap:0;}
+    #${SUB2_PANEL_ID} .sub2-route-event{position:relative;margin-left:7px;padding:0 0 10px 18px;border-left:2px solid #cbd5e1;}
+    #${SUB2_PANEL_ID} .sub2-route-event:last-child{padding-bottom:0;border-left-color:transparent;}
+    #${SUB2_PANEL_ID} .sub2-route-event::before{content:"";position:absolute;left:-6px;top:2px;width:9px;height:9px;border-radius:50%;
+      background:#ef4444;border:1px solid #fff;box-shadow:0 0 0 1px #fca5a5;}
+    #${SUB2_PANEL_ID} .sub2-route-event.success::before{background:#22c55e;box-shadow:0 0 0 1px #86efac;}
+    #${SUB2_PANEL_ID} .sub2-route-event-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;font-weight:700;}
+    #${SUB2_PANEL_ID} .sub2-route-event-time{color:#94a3b8;font-size:10px;font-weight:500;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-route-event-reason{margin-top:3px;color:#64748b;font-size:10px;line-height:1.45;overflow-wrap:anywhere;}
+    #${SUB2_PANEL_ID} .sub2-candidate-list{display:flex;flex-direction:column;gap:7px;}
+    #${SUB2_PANEL_ID} .sub2-candidate{padding:8px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;}
+    #${SUB2_PANEL_ID} .sub2-candidate-head{display:flex;align-items:center;gap:6px;}
+    #${SUB2_PANEL_ID} .sub2-candidate-name{flex:1;min-width:0;font-size:11px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-candidate-priority{color:#4f46e5;font-size:10px;font-weight:700;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-candidate-badge{padding:1px 6px;border-radius:999px;font-size:9px;font-weight:700;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-candidate-badge.attempted{background:#ffedd5;color:#9a3412;}
+    #${SUB2_PANEL_ID} .sub2-candidate-badge.excluded{background:#fee2e2;color:#991b1b;}
+    #${SUB2_PANEL_ID} .sub2-candidate-badge.constrained{background:#fef3c7;color:#92400e;}
+    #${SUB2_PANEL_ID} .sub2-candidate-badge.eligible{background:#dcfce7;color:#166534;}
+    #${SUB2_PANEL_ID} .sub2-candidate-badge.unknown{background:#e2e8f0;color:#475569;}
+    #${SUB2_PANEL_ID} .sub2-candidate-reasons{margin-top:5px;color:#64748b;font-size:10px;line-height:1.5;}
+    #${SUB2_PANEL_ID} .sub2-candidate-model-button{margin-top:6px;border:1px solid #bfdbfe;border-radius:6px;padding:3px 7px;
+      background:#fff;color:#1d4ed8;font-size:10px;cursor:pointer;}
+    #${SUB2_PANEL_ID} .sub2-candidate-model-button:disabled{opacity:.55;cursor:not-allowed;}
     @media (max-width:760px){
       #${SUB2_PANEL_ID}{width:calc(100vw - 24px);right:12px;bottom:70px;height:min(80vh,720px);}
     }
@@ -1081,14 +1999,23 @@
       this.modelSyncButtonElement = null;
       this.modelStateElement = null;
       this.modelListElement = null;
+      this.diagnosticsOverlayElement = null;
+      this.diagnosticsBodyElement = null;
       this.accounts = [];
       this.groupsById = new Map();
       this.statsById = {};
       this.recentRequest = null;
       this.latestHit = null;
       this.recentRoutingErrorByAccountId = new Map();
+      this.routeChain = { events: [], detailLevel: 'success-only' };
+      this.routeDetailsAvailable = false;
       this.routingRequestsAvailable = false;
       this.routingErrorsAvailable = false;
+      this.concurrencyAvailable = false;
+      this.concurrencyEnabled = false;
+      this.concurrencyTimestamp = 0;
+      this.concurrencyByAccountId = new Map();
+      this.concurrencyRecordsByAccountId = new Map();
       this.routingRequestSequence = 0;
       this.refreshTimer = null;
       this.tickTimer = null;
@@ -1120,6 +2047,8 @@
       this.modelMessage = '';
       this.modelError = '';
       this.modelRequestSequence = 0;
+      this.savedModelsByAccountId = new Map();
+      this.diagnosticsOpen = false;
     }
 
     start() {
@@ -1164,7 +2093,10 @@
       this.root.innerHTML = `
         <div class="sub2-head">
           <b>Sub2 账号健康 / 路由 <span class="sub2-version">v${SUB2_SCRIPT_VERSION}</span></b>
-          <button class="sub2-min" title="最小化">—</button>
+          <div class="sub2-head-actions">
+            <button type="button" class="sub2-diagnostics-open">路由诊断</button>
+            <button class="sub2-min" title="最小化">—</button>
+          </div>
         </div>
         <div class="sub2-summary"></div>
         <div class="sub2-controls">
@@ -1223,6 +2155,18 @@
             <div class="sub2-model-list"></div>
           </section>
         </div>
+        <div class="sub2-diagnostics-overlay" hidden>
+          <section class="sub2-diagnostics-drawer" role="dialog" aria-modal="true" aria-labelledby="sub2-diagnostics-title">
+            <div class="sub2-diagnostics-head">
+              <div>
+                <strong id="sub2-diagnostics-title" class="sub2-diagnostics-title">最近路由诊断</strong>
+                <div class="sub2-diagnostics-subtitle">只读分析真实流量与当前配置；不测活、不自动改路由。</div>
+              </div>
+              <button type="button" class="sub2-diagnostics-close" title="关闭" aria-label="关闭路由诊断">×</button>
+            </div>
+            <div class="sub2-diagnostics-body"></div>
+          </section>
+        </div>
       `;
       document.body.appendChild(this.root);
 
@@ -1245,10 +2189,13 @@
       this.modelSyncButtonElement = this.root.querySelector('.sub2-model-sync');
       this.modelStateElement = this.root.querySelector('.sub2-model-state');
       this.modelListElement = this.root.querySelector('.sub2-model-list');
+      this.diagnosticsOverlayElement = this.root.querySelector('.sub2-diagnostics-overlay');
+      this.diagnosticsBodyElement = this.root.querySelector('.sub2-diagnostics-body');
 
       this.viewElement.value = this.viewMode;
       this.sortElement.value = this.sortMode;
       this.root.querySelector('.sub2-min').addEventListener('click', () => this.setMinimized(true));
+      this.root.querySelector('.sub2-diagnostics-open')?.addEventListener('click', () => this.openDiagnosticsDrawer());
       this.root.querySelector('.sub2-refresh').addEventListener('click', () => this.refresh());
       this.searchElement.addEventListener('input', () => {
         this.filterText = this.searchElement.value.trim().toLocaleLowerCase();
@@ -1301,6 +2248,10 @@
         this.renderModelDrawer();
       });
       this.modelSyncButtonElement?.addEventListener('click', () => this.handleSyncModels());
+      this.root.querySelector('.sub2-diagnostics-close')?.addEventListener('click', () => this.closeDiagnosticsDrawer());
+      this.diagnosticsOverlayElement?.addEventListener('click', (event) => {
+        if (event.target === this.diagnosticsOverlayElement) this.closeDiagnosticsDrawer();
+      });
 
       this.applyMinimized();
     }
@@ -1399,12 +2350,27 @@
       this.recentRoutingErrorByAccountId = routingActivity.errorsAvailable
         ? routingActivity.errorByAccountId
         : new Map();
+      this.routeChain = routingActivity.routeChain || { events: [], detailLevel: 'success-only' };
+      this.routeDetailsAvailable = routingActivity.routeDetailsAvailable;
+      this.concurrencyAvailable = routingActivity.concurrencyAvailable;
+      if (routingActivity.concurrencySnapshot) {
+        this.concurrencyEnabled = routingActivity.concurrencySnapshot.enabled;
+        this.concurrencyTimestamp = routingActivity.concurrencySnapshot.timestamp || Date.now();
+        this.concurrencyByAccountId = routingActivity.concurrencySnapshot.byAccountId;
+        this.concurrencyRecordsByAccountId = routingActivity.concurrencySnapshot.recordsByAccountId;
+      } else if (!routingActivity.concurrencyAvailable) {
+        this.concurrencyEnabled = false;
+        this.concurrencyByAccountId = new Map();
+        this.concurrencyRecordsByAccountId = new Map();
+      }
       this.latestHit = sub2ResolveLatestHit(
         this.accounts,
         this.recentRequest,
         !this.routingRequestsAvailable,
       );
+      this.renderSummary();
       this.renderList();
+      if (this.diagnosticsOpen) this.renderDiagnosticsDrawer();
     }
 
     render() {
@@ -1412,6 +2378,7 @@
       this.renderFilters();
       this.renderList();
       this.renderStatus();
+      if (this.diagnosticsOpen) this.renderDiagnosticsDrawer();
     }
 
     renderFilters() {
@@ -1496,11 +2463,19 @@
       for (const account of this.accounts) {
         counts[sub2ComputeHealth(account, now).tone] += 1;
       }
+      const concurrencySummary = sub2SummarizeConcurrency(this.concurrencyByAccountId);
+      const concurrencyLabel = this.concurrencyAvailable && this.concurrencyEnabled
+        ? `并发 ${concurrencySummary.currentInUse} / ${concurrencySummary.maxCapacity}${concurrencySummary.waitingInQueue > 0 ? ` · 排队 ${concurrencySummary.waitingInQueue}` : ''}`
+        : this.concurrencyAvailable
+          ? '并发统计未启用'
+          : '并发统计不可用';
+      const concurrencyTone = this.concurrencyAvailable && this.concurrencyEnabled ? 'info' : 'muted';
       this.summaryElement.innerHTML = `
         <span class="sub2-chip ok">正常 ${counts.ok}</span>
         <span class="sub2-chip warn">注意 ${counts.warn}</span>
         <span class="sub2-chip down">不可用 ${counts.down}</span>
         <span class="sub2-chip paused">已停用 ${counts.paused}</span>
+        <span class="sub2-chip ${concurrencyTone}">${concurrencyLabel}</span>
       `;
     }
 
@@ -1636,10 +2611,12 @@
       platform.textContent = String(account.platform || '');
       top.append(nameSlot, priority);
       if (this.latestHit && Number(account.id) === this.latestHit.accountId) {
-        const latestHitBadge = document.createElement('span');
+        const latestHitBadge = document.createElement('button');
+        latestHitBadge.type = 'button';
         latestHitBadge.className = 'sub2-hit-badge';
         latestHitBadge.textContent = '最近命中';
-        latestHitBadge.title = `最近成功请求：${sub2FormatRelative(this.latestHit.createdAt, now)}`;
+        latestHitBadge.title = `最近成功请求：${sub2FormatRelative(this.latestHit.createdAt, now)}；点击查看路由诊断`;
+        latestHitBadge.addEventListener('click', () => this.openDiagnosticsDrawer());
         top.appendChild(latestHitBadge);
       }
       top.append(badge, platform);
@@ -1653,6 +2630,32 @@
       const lastUsed = document.createElement('span');
       lastUsed.textContent = `最近使用 ${sub2FormatRelative(account.last_used_at, now)}`;
       meta.append(todayUsage, lastUsed);
+
+      const displayConcurrency = sub2ResolveAccountConcurrency(
+        account.id,
+        groupMembership?.groupId ?? this.latestHit?.groupId,
+        this.concurrencyByAccountId,
+        this.concurrencyRecordsByAccountId,
+      );
+      if (this.concurrencyAvailable && this.concurrencyEnabled && displayConcurrency) {
+        const currentInUse = displayConcurrency.currentInUse ?? 0;
+        const maxCapacity = displayConcurrency.maxCapacity ?? 0;
+        const waitingInQueue = displayConcurrency.waitingInQueue ?? 0;
+        const loadPercentage = displayConcurrency.loadPercentage;
+        const utilization = maxCapacity > 0 ? currentInUse / maxCapacity : 0;
+        const loadLabel = Number.isFinite(loadPercentage) ? ` · ${Math.round(loadPercentage)}%` : '';
+        const capacityState = document.createElement('span');
+        capacityState.className = 'sub2-capacity-state'
+          + (utilization >= 1 ? ' down' : utilization >= 0.8 || waitingInQueue > 0 ? ' warn' : '');
+        capacityState.textContent = maxCapacity > 0
+          ? `容量 ${currentInUse} / ${maxCapacity}${loadLabel}${waitingInQueue > 0 ? ` · 排队 ${waitingInQueue}` : ''}`
+          : `并发 ${currentInUse}${loadLabel}${waitingInQueue > 0 ? ` · 排队 ${waitingInQueue}` : ''}`;
+        const snapshotAge = this.concurrencyTimestamp
+          ? sub2FormatRelative(this.concurrencyTimestamp, now)
+          : '时间未知';
+        capacityState.title = `sub2 当前并发快照（${snapshotAge}），不是历史请求发生时的并发`;
+        meta.appendChild(capacityState);
+      }
 
       const supportsDailyQuota = sub2SupportsDailyQuota(account);
       const dailyLimit = sub2GetNumericAccountField(account, 'quota_daily_limit');
@@ -1703,11 +2706,29 @@
       reasons.className = 'sub2-reasons';
       reasons.textContent = health.reasons.join('；');
 
+      const requestConcurrency = sub2ResolveAccountConcurrency(
+        account.id,
+        this.latestHit?.groupId,
+        this.concurrencyByAccountId,
+        this.concurrencyRecordsByAccountId,
+      );
       const routingExplanation = sub2BuildRoutingExplanation(account, {
         latestHit: this.latestHit,
+        latestHitEffectivePriority: this.latestHit
+          ? sub2GetEffectivePriority(
+            this.accounts.find((candidateAccount) => Number(candidateAccount.id) === this.latestHit.accountId),
+            this.latestHit.groupId,
+            this.groupsById,
+          )
+          : null,
         recentError: this.recentRoutingErrorByAccountId.get(Number(account.id)) || null,
         groupsById: this.groupsById,
         errorsAvailable: this.routingErrorsAvailable,
+        routeChain: this.routeChain,
+        concurrency: requestConcurrency,
+        concurrencyAvailable: this.concurrencyAvailable,
+        concurrencyEnabled: this.concurrencyEnabled,
+        savedModelState: this.savedModelsByAccountId.get(Number(account.id)) || null,
       }, now);
       let routingNote = null;
       if (routingExplanation) {
@@ -1830,6 +2851,258 @@
       return row;
     }
 
+    openDiagnosticsDrawer() {
+      this.diagnosticsOpen = true;
+      if (this.diagnosticsOverlayElement) this.diagnosticsOverlayElement.hidden = false;
+      if (this.diagnosticsBodyElement) this.diagnosticsBodyElement.scrollTop = 0;
+      this.renderDiagnosticsDrawer();
+    }
+
+    closeDiagnosticsDrawer() {
+      this.diagnosticsOpen = false;
+      if (this.diagnosticsOverlayElement) this.diagnosticsOverlayElement.hidden = true;
+    }
+
+    getAccountDisplayName(accountId, fallbackName = '') {
+      const account = this.accounts.find((candidateAccount) => Number(candidateAccount?.id) === Number(accountId));
+      return String(account?.name || fallbackName || `账号 ${accountId}`).trim() || `账号 ${accountId}`;
+    }
+
+    renderDiagnosticsDrawer() {
+      if (!this.diagnosticsOpen || !this.diagnosticsOverlayElement || !this.diagnosticsBodyElement) return;
+      this.diagnosticsOverlayElement.hidden = false;
+      const savedScrollTop = this.diagnosticsBodyElement.scrollTop;
+      const now = Date.now();
+      this.diagnosticsBodyElement.textContent = '';
+
+      if (!this.recentRequest) {
+        const emptyCard = document.createElement('section');
+        emptyCard.className = 'sub2-diagnostics-card';
+        const emptyTitle = document.createElement('h3');
+        emptyTitle.textContent = '暂无可分析请求';
+        const emptyMessage = document.createElement('div');
+        emptyMessage.className = 'sub2-diagnostics-note';
+        emptyMessage.textContent = this.routingRequestsAvailable
+          ? '最近 30 分钟没有成功请求。脚本不会为了生成诊断而主动发送模型请求。'
+          : 'sub2 运维请求接口当前不可用，无法建立请求级诊断。账号健康与容量仍按可用接口显示。';
+        emptyCard.append(emptyTitle, emptyMessage);
+        this.diagnosticsBodyElement.appendChild(emptyCard);
+        return;
+      }
+
+      const requestCard = document.createElement('section');
+      requestCard.className = 'sub2-diagnostics-card';
+      const requestTitle = document.createElement('h3');
+      requestTitle.textContent = '最近成功请求';
+      const requestFacts = document.createElement('div');
+      requestFacts.className = 'sub2-request-facts';
+      const requestGroup = this.recentRequest.groupId
+        ? sub2GetIndexedGroup(this.groupsById, this.recentRequest.groupId)
+        : null;
+      const factValues = [
+        `命中 ${this.getAccountDisplayName(this.recentRequest.accountId)}`,
+        this.recentRequest.model ? `模型 ${this.recentRequest.model}` : '',
+        this.recentRequest.platform ? `平台 ${this.recentRequest.platform}` : '',
+        this.recentRequest.groupId
+          ? `分组 ${String(requestGroup?.name || this.recentRequest.groupId).trim()}`
+          : '',
+        `时间 ${sub2FormatRelative(this.recentRequest.createdAt, now)}`,
+      ].filter(Boolean);
+      for (const factValue of factValues) {
+        const fact = document.createElement('span');
+        fact.textContent = factValue;
+        requestFacts.appendChild(fact);
+      }
+      if (this.recentRequest.requestId) {
+        const requestId = document.createElement('span');
+        requestId.textContent = `请求 ${this.recentRequest.requestId.length > 22
+          ? `${this.recentRequest.requestId.slice(0, 19)}...`
+          : this.recentRequest.requestId}`;
+        requestId.title = this.recentRequest.requestId;
+        requestFacts.appendChild(requestId);
+      }
+      requestCard.append(requestTitle, requestFacts);
+      this.diagnosticsBodyElement.appendChild(requestCard);
+
+      const routeCard = document.createElement('section');
+      routeCard.className = 'sub2-diagnostics-card';
+      const routeTitle = document.createElement('h3');
+      routeTitle.textContent = '故障转移链';
+      const routeNote = document.createElement('div');
+      routeNote.className = 'sub2-diagnostics-note';
+      if (!this.routingErrorsAvailable) {
+        routeNote.textContent = '上游错误接口本次不可用，无法判断该成功请求之前是否发生过失败或降级。';
+      } else if (this.routeChain.detailLevel === 'detailed') {
+        routeNote.textContent = '详情链：来自该请求关联错误详情中的 upstream_errors，并追加最终成功账号。';
+      } else if (this.routeChain.detailLevel === 'partial') {
+        routeNote.textContent = '部分详情链：已合并成功读取的详情事件和其余关联摘要，可能仍缺少中间尝试，不能视为完整轨迹。';
+      } else if (this.routeChain.detailLevel === 'summary') {
+        routeNote.textContent = '摘要链：当前只拿到关联错误列表摘要，可能缺少中间尝试账号，不能视为完整轨迹。';
+      } else {
+        routeNote.textContent = '未发现与该成功请求关联的上游失败，当前链路只包含最终成功账号。';
+      }
+      if (
+        this.routingErrorsAvailable
+        && !this.routeDetailsAvailable
+        && (this.routeChain.detailLevel === 'summary' || this.routeChain.detailLevel === 'partial')
+      ) {
+        routeNote.textContent += ' 部分错误详情本次读取失败或超过读取上限。';
+      }
+      if (this.routeChain.unresolvedRecoveredSummaryCount > 0) {
+        routeNote.textContent += ' 已确认发生过恢复型故障，但摘要行只记录最终请求账号；失败账号需以详情事件为准。';
+      }
+      const routeChainElement = document.createElement('div');
+      routeChainElement.className = 'sub2-route-chain';
+      const routeEvents = Array.isArray(this.routeChain?.events) ? this.routeChain.events : [];
+      for (const routeEvent of routeEvents) {
+        const routeEventElement = document.createElement('div');
+        routeEventElement.className = `sub2-route-event${routeEvent.type === 'success' ? ' success' : ''}`;
+        const eventHead = document.createElement('div');
+        eventHead.className = 'sub2-route-event-head';
+        const eventAccount = document.createElement('span');
+        eventAccount.textContent = `${routeEvent.type === 'success' ? '成功' : '失败'} · ${this.getAccountDisplayName(routeEvent.accountId, routeEvent.accountName)}`;
+        const eventTime = document.createElement('span');
+        eventTime.className = 'sub2-route-event-time';
+        eventTime.textContent = routeEvent.occurredAt
+          ? sub2FormatRelative(routeEvent.occurredAt, now)
+          : '时间未知';
+        eventHead.append(eventAccount, eventTime);
+        const eventReason = document.createElement('div');
+        eventReason.className = 'sub2-route-event-reason';
+        eventReason.textContent = sub2DescribeRouteEvent(routeEvent);
+        routeEventElement.append(eventHead, eventReason);
+        routeChainElement.appendChild(routeEventElement);
+      }
+      routeCard.append(routeTitle, routeNote, routeChainElement);
+      this.diagnosticsBodyElement.appendChild(routeCard);
+
+      const candidatesCard = document.createElement('section');
+      candidatesCard.className = 'sub2-diagnostics-card';
+      const candidatesTitle = document.createElement('h3');
+      candidatesTitle.textContent = '更高优先级账号资格';
+      const candidatesList = document.createElement('div');
+      candidatesList.className = 'sub2-candidate-list';
+      const hitAccount = this.accounts.find(
+        (account) => Number(account?.id) === Number(this.recentRequest.accountId),
+      );
+      const hitEffectivePriority = hitAccount
+        ? sub2GetEffectivePriority(hitAccount, this.recentRequest.groupId, this.groupsById)
+        : null;
+      const candidateAccounts = hitAccount
+        ? this.accounts
+          .filter((account) => Number(account?.id) !== Number(this.recentRequest.accountId))
+          .map((account) => ({
+            account,
+            effectivePriority: sub2GetEffectivePriority(account, this.recentRequest.groupId, this.groupsById),
+          }))
+          .filter((candidate) => candidate.effectivePriority < hitEffectivePriority)
+          .sort((leftCandidate, rightCandidate) => leftCandidate.effectivePriority - rightCandidate.effectivePriority
+            || String(leftCandidate.account?.name || '').localeCompare(String(rightCandidate.account?.name || '')))
+        : [];
+
+      const statusLabels = {
+        attempted: '已尝试失败',
+        excluded: '当前排除',
+        constrained: '当前受限',
+        eligible: '当前可候选',
+        unknown: '仍需判断',
+      };
+      if (!hitAccount) {
+        const unavailableComparison = document.createElement('div');
+        unavailableComparison.className = 'sub2-diagnostics-note';
+        unavailableComparison.textContent = '最终成功账号不在当前账号列表中，仍可查看请求和故障转移链，但无法比较请求内有效优先级。';
+        candidatesList.appendChild(unavailableComparison);
+      } else if (!candidateAccounts.length) {
+        const noCandidates = document.createElement('div');
+        noCandidates.className = 'sub2-diagnostics-note';
+        noCandidates.textContent = `最终命中账号的请求内有效优先级为 ${hitEffectivePriority}，没有更高优先级账号可比较。`;
+        candidatesList.appendChild(noCandidates);
+      }
+
+      for (const candidate of candidateAccounts) {
+        const accountId = Number(candidate.account.id);
+        const savedModelState = this.savedModelsByAccountId.get(accountId) || null;
+        const eligibility = sub2EvaluateCandidateEligibility(candidate.account, {
+          recentRequest: this.recentRequest,
+          groupsById: this.groupsById,
+          routeChain: this.routeChain,
+          concurrency: sub2ResolveAccountConcurrency(
+            accountId,
+            this.recentRequest.groupId,
+            this.concurrencyByAccountId,
+            this.concurrencyRecordsByAccountId,
+          ),
+          concurrencyAvailable: this.concurrencyAvailable,
+          concurrencyEnabled: this.concurrencyEnabled,
+          savedModelState,
+        }, now);
+        const candidateElement = document.createElement('div');
+        candidateElement.className = 'sub2-candidate';
+        const candidateHead = document.createElement('div');
+        candidateHead.className = 'sub2-candidate-head';
+        const candidateName = document.createElement('span');
+        candidateName.className = 'sub2-candidate-name';
+        candidateName.textContent = this.getAccountDisplayName(accountId);
+        candidateName.title = candidateName.textContent;
+        const candidatePriority = document.createElement('span');
+        candidatePriority.className = 'sub2-candidate-priority';
+        candidatePriority.textContent = `有效 P${eligibility.effectivePriority}`;
+        const candidateBadge = document.createElement('span');
+        candidateBadge.className = `sub2-candidate-badge ${eligibility.tone}`;
+        candidateBadge.textContent = statusLabels[eligibility.status] || '信息不足';
+        candidateBadge.title = eligibility.evidence;
+        candidateHead.append(candidateName, candidatePriority, candidateBadge);
+        const candidateReasons = document.createElement('div');
+        candidateReasons.className = 'sub2-candidate-reasons';
+        candidateReasons.textContent = `${eligibility.evidence}：${eligibility.reasons.join('；')}`;
+        candidateElement.append(candidateHead, candidateReasons);
+
+        if (eligibility.modelCheckNeeded && this.recentRequest.model) {
+          const modelButton = document.createElement('button');
+          modelButton.type = 'button';
+          modelButton.className = 'sub2-candidate-model-button';
+          modelButton.disabled = savedModelState?.status === 'loading';
+          modelButton.textContent = savedModelState?.status === 'loading'
+            ? '正在读取保存模型…'
+            : savedModelState?.status === 'error'
+              ? '重试读取保存模型'
+              : '核对保存模型';
+          modelButton.title = '只读取 sub2 已保存模型，不访问上游';
+          modelButton.addEventListener('click', () => this.handleLoadCandidateModels(accountId));
+          candidateElement.appendChild(modelButton);
+        }
+        candidatesList.appendChild(candidateElement);
+      }
+      candidatesCard.append(candidatesTitle, candidatesList);
+      this.diagnosticsBodyElement.appendChild(candidatesCard);
+
+      const boundaryNote = document.createElement('div');
+      boundaryNote.className = 'sub2-diagnostics-note';
+      boundaryNote.textContent = '证据边界：故障事件和最终命中可作为历史证据；健康、配额、容量及分组状态是当前快照。sub2 未持久化完整候选评分时，只能对未尝试账号做资格判断，不能断言调度器当时一定看过它。';
+      this.diagnosticsBodyElement.appendChild(boundaryNote);
+      this.diagnosticsBodyElement.scrollTop = savedScrollTop;
+    }
+
+    async handleLoadCandidateModels(accountId) {
+      const numericAccountId = Number(accountId);
+      if (!Number.isInteger(numericAccountId) || numericAccountId <= 0) return;
+      this.savedModelsByAccountId.set(numericAccountId, { status: 'loading', models: [] });
+      this.renderDiagnosticsDrawer();
+      if (!this.isQuotaInteractionActive()) this.renderList();
+      try {
+        const models = await sub2FetchAccountModels(numericAccountId);
+        this.savedModelsByAccountId.set(numericAccountId, { status: 'loaded', models });
+      } catch (error) {
+        this.savedModelsByAccountId.set(numericAccountId, {
+          status: 'error',
+          models: [],
+          error: String(error?.message || error),
+        });
+      }
+      this.renderDiagnosticsDrawer();
+      if (!this.isQuotaInteractionActive()) this.renderList();
+    }
+
     async openModelDrawer(account) {
       const requestSequence = ++this.modelRequestSequence;
       this.modelAccount = account;
@@ -1847,9 +3120,15 @@
         const models = await sub2FetchAccountModels(account.id);
         if (requestSequence !== this.modelRequestSequence) return;
         this.models = models;
+        this.savedModelsByAccountId.set(Number(account.id), { status: 'loaded', models });
         this.modelMessage = `已读取 sub2 保存的 ${models.length} 个模型，未访问上游。`;
       } catch (error) {
         if (requestSequence !== this.modelRequestSequence) return;
+        this.savedModelsByAccountId.set(Number(account.id), {
+          status: 'error',
+          models: [],
+          error: String(error?.message || error),
+        });
         this.modelError = `读取已保存模型失败：${error?.message || error}`;
       } finally {
         if (requestSequence === this.modelRequestSequence) {
@@ -1961,6 +3240,7 @@
         const models = await sub2SyncAccountModels(account.id);
         if (requestSequence !== this.modelRequestSequence || this.modelAccount?.id !== account.id) return;
         this.models = models;
+        this.savedModelsByAccountId.set(Number(account.id), { status: 'loaded', models });
         this.modelMessage = `已从上游拉取并同步 ${models.length} 个模型。`;
       } catch (error) {
         if (requestSequence !== this.modelRequestSequence || this.modelAccount?.id !== account.id) return;
@@ -2035,6 +3315,7 @@
     }
 
     async handleDailyQuota(account, rawDailyLimit) {
+      if (this.quotaSaving) return;
       let dailyLimit = null;
       if (rawDailyLimit !== null) {
         const normalizedValue = String(rawDailyLimit || '').trim();
@@ -2061,7 +3342,6 @@
       this.quotaSaving = true;
       this.refreshRequestSequence += 1;
       this.pendingRefresh = false;
-      this.setBusy(account.id, true);
       try {
         await sub2UpdateDailyQuota(account, dailyLimit);
         this.lastError = '';
@@ -2071,16 +3351,26 @@
         this.renderStatus();
       } finally {
         this.quotaSaving = false;
-        this.setBusy(account.id, false);
-        if (updateSucceeded) await this.refresh();
+        if (updateSucceeded) {
+          // 成功后才关闭编辑器并刷新；失败时保留原输入，便于直接修正或重试。
+          this.renderList();
+          await this.refresh();
+        }
       }
     }
   }
 
 
   return {
+    Sub2Controller,
     sub2NormalizeModels,
     sub2GetNumericAccountField,
+    sub2ParseTimestamp,
+    sub2IsQuotaPeriodExpired,
+    sub2GetQuotaUsageSnapshot,
+    sub2NormalizeConcurrencySnapshot,
+    sub2ResolveAccountConcurrency,
+    sub2SummarizeConcurrency,
     sub2SupportsDailyQuota,
     sub2GetUpstreamBaseUrl,
     sub2GetUpstreamWebsiteUrl,
@@ -2090,9 +3380,17 @@
     sub2NormalizeRecentRequest,
     sub2ExtractRoutingStatusCode,
     sub2NormalizeRoutingError,
+    sub2GetCorrelatedRoutingErrors,
+    sub2BuildRouteChain,
     sub2BuildRecentRoutingErrorIndex,
+    sub2MergeRouteFailuresIntoErrorIndex,
     sub2ResolveLatestHit,
     sub2BuildRoutingExplanation,
+    sub2GetEffectivePriority,
+    sub2ModelPatternMatches,
+    sub2NormalizeRequestedModelForLookup,
+    sub2EvaluateModelSupport,
+    sub2EvaluateCandidateEligibility,
     start() {
       if (isSub2Host()) {
         new Sub2Controller().start();
