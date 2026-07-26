@@ -2,7 +2,7 @@
 // @name         Sub2 Smart Group
 // @name:zh-CN   Sub2 智能分组
 // @namespace    local.sub2.smart-group
-// @version      2.3.0
+// @version      2.4.0
 // @description  Sub2 account health, route history, reliability events, protected controls, and manual model sync (no active probing).
 // @description:zh-CN 为 sub2api 提供账号健康度、路由历史、可靠性事件、受保护控制与手动模型同步（不主动测活）
 // @license      MIT
@@ -74,9 +74,16 @@
   const SUB2_LOCAL_EVENT_LIMIT = 500;
   const SUB2_RELIABILITY_REFRESH_MS = 60 * 1000;
   const SUB2_CAPACITY_MAX = 10000;
+  const SUB2_AUDIT_SEVERITY_RANK = Object.freeze({ critical: 2, warning: 1, info: 0 });
+  const SUB2_AUDIT_SEVERITY_LABELS = Object.freeze({ critical: '严重', warning: '注意', info: '提示' });
+  const SUB2_CAPACITY_ADVICE_WINDOW_HOURS = 24;
+  // 近 24 小时 429 占比超过该比例才建议下调容量，避免偶发限流触发误建议。
+  const SUB2_CAPACITY_RATE_LIMIT_RATIO = 0.05;
+  // 当前占用达到配置容量的该比例才建议上调容量。
+  const SUB2_CAPACITY_HIGH_LOAD_RATIO = 0.8;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '2.3.0';
+    : '2.4.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -967,6 +974,412 @@
       trackedStatusCounts,
       requestHistory: annotatedRequests,
       routingErrors,
+    };
+  }
+
+  // 审计条目统一形状，避免每条规则各自拼字段。severity 只有 critical / warning / info。
+  function sub2CreateAuditFinding({
+    id,
+    severity,
+    category,
+    title,
+    detail,
+    evidence,
+    accountIds = [],
+    groupKey = '',
+  }) {
+    return {
+      id: String(id || '').trim(),
+      severity: SUB2_AUDIT_SEVERITY_RANK[severity] === undefined ? 'info' : severity,
+      category: String(category || '').trim(),
+      title: String(title || '').trim(),
+      detail: String(detail || '').trim(),
+      evidence: String(evidence || '当前快照').trim(),
+      accountIds: accountIds.filter((accountId) => Number.isInteger(Number(accountId)) && Number(accountId) > 0)
+        .map((accountId) => Number(accountId)),
+      groupKey: String(groupKey || '').trim(),
+    };
+  }
+
+  function sub2SortAuditFindings(findings) {
+    return (Array.isArray(findings) ? findings.slice() : []).sort(
+      (leftFinding, rightFinding) => SUB2_AUDIT_SEVERITY_RANK[rightFinding.severity]
+        - SUB2_AUDIT_SEVERITY_RANK[leftFinding.severity]
+        || leftFinding.category.localeCompare(rightFinding.category)
+        || leftFinding.title.localeCompare(rightFinding.title),
+    );
+  }
+
+  // 判断账号当前是否受限（冷却 / 摘出 / 停用 / 配额用尽），用于分组单点和主力受限检查。
+  function sub2GetAccountRestrictionState(account, now = Date.now()) {
+    const health = sub2ComputeHealth(account, now);
+    const restrictionReasons = [];
+    if (health.tone === 'down' || health.tone === 'paused') restrictionReasons.push(...health.reasons);
+
+    if (sub2SupportsDailyQuota(account)) {
+      const exceededQuota = ['total', 'daily', 'weekly']
+        .map((dimension) => sub2GetQuotaUsageSnapshot(account, dimension, now))
+        .find((quotaSnapshot) => quotaSnapshot.exceeded);
+      if (exceededQuota) {
+        const quotaLabels = { total: '总配额', daily: '日配额', weekly: '周配额' };
+        restrictionReasons.push(
+          `${quotaLabels[exceededQuota.dimension]}已用尽（${sub2FormatCost(exceededQuota.used)} / ${sub2FormatCost(exceededQuota.limit)}）`,
+        );
+      }
+    }
+
+    return {
+      restricted: restrictionReasons.length > 0,
+      tone: health.tone,
+      reasons: restrictionReasons,
+    };
+  }
+
+  function sub2GetAccountAuditLabel(account) {
+    const accountId = Number(account?.id);
+    const accountName = String(account?.name || '').trim();
+    return accountName || (Number.isInteger(accountId) ? `账号 ${accountId}` : '未知账号');
+  }
+
+  // 分组单点故障：可调度成员过少，或全部成员当前受限。
+  function sub2AuditGroupSinglePointRisks(accounts, groupsById = null, now = Date.now()) {
+    const membersByGroupKey = new Map();
+    for (const account of Array.isArray(accounts) ? accounts : []) {
+      for (const membership of sub2GetGroupMemberships(account, groupsById)) {
+        if (!membersByGroupKey.has(membership.groupKey)) {
+          membersByGroupKey.set(membership.groupKey, { membership, accounts: [] });
+        }
+        membersByGroupKey.get(membership.groupKey).accounts.push(account);
+      }
+    }
+
+    const findings = [];
+    for (const [groupKey, groupEntry] of membersByGroupKey) {
+      const groupName = groupEntry.membership.name;
+      const memberAccounts = groupEntry.accounts;
+      const availableAccounts = memberAccounts.filter(
+        (account) => !sub2GetAccountRestrictionState(account, now).restricted,
+      );
+
+      if (!availableAccounts.length) {
+        findings.push(sub2CreateAuditFinding({
+          id: `group-all-restricted:${groupKey}`,
+          severity: 'critical',
+          category: '分组单点故障',
+          title: `分组「${groupName}」当前没有可用账号`,
+          detail: `${memberAccounts.length} 个成员账号全部处于冷却、停用或配额用尽状态，该分组的请求当前只能失败或跨组降级。`,
+          accountIds: memberAccounts.map((account) => account.id),
+          groupKey,
+        }));
+        continue;
+      }
+
+      if (memberAccounts.length === 1) {
+        findings.push(sub2CreateAuditFinding({
+          id: `group-single-member:${groupKey}`,
+          severity: 'warning',
+          category: '分组单点故障',
+          title: `分组「${groupName}」只有 1 个账号`,
+          detail: `唯一成员为 ${sub2GetAccountAuditLabel(memberAccounts[0])}；该账号受限时分组内没有故障转移目标。`,
+          evidence: '配置判断',
+          accountIds: memberAccounts.map((account) => account.id),
+          groupKey,
+        }));
+        continue;
+      }
+
+      if (availableAccounts.length === 1) {
+        findings.push(sub2CreateAuditFinding({
+          id: `group-single-available:${groupKey}`,
+          severity: 'warning',
+          category: '分组单点故障',
+          title: `分组「${groupName}」仅剩 1 个可用账号`,
+          detail: `${memberAccounts.length} 个成员中只有 ${sub2GetAccountAuditLabel(availableAccounts[0])} 当前可调度，其余账号受限。`,
+          accountIds: memberAccounts.map((account) => account.id),
+          groupKey,
+        }));
+      }
+    }
+    return findings;
+  }
+
+  // 平台 / 模型配置异常：只报能从账号响应直接读出的确定性问题。
+  function sub2AuditPlatformAndModelConfig(accounts, groupsById = null, now = Date.now()) {
+    const findings = [];
+    for (const account of Array.isArray(accounts) ? accounts : []) {
+      const accountId = Number(account?.id);
+      const accountLabel = sub2GetAccountAuditLabel(account);
+      const accountPlatform = String(account?.platform || '').trim();
+
+      if (!accountPlatform) {
+        findings.push(sub2CreateAuditFinding({
+          id: `account-missing-platform:${accountId}`,
+          severity: 'warning',
+          category: '平台或模型配置',
+          title: `${accountLabel} 未标注平台`,
+          detail: '账号响应里没有 platform 字段，路由资格判断无法核对平台是否匹配请求。',
+          evidence: '配置判断',
+          accountIds: [accountId],
+        }));
+      }
+
+      const memberships = sub2GetGroupMemberships(account, groupsById);
+      const conflictingMembership = memberships.find(
+        (membership) => membership.platform && accountPlatform && membership.platform !== accountPlatform,
+      );
+      if (conflictingMembership) {
+        findings.push(sub2CreateAuditFinding({
+          id: `account-platform-mismatch:${accountId}:${conflictingMembership.groupKey}`,
+          severity: 'warning',
+          category: '平台或模型配置',
+          title: `${accountLabel} 与分组「${conflictingMembership.name}」平台不一致`,
+          detail: `账号平台 ${accountPlatform}，分组平台 ${conflictingMembership.platform}；该分组的请求通常不会选中这个账号。`,
+          evidence: '配置判断',
+          accountIds: [accountId],
+          groupKey: conflictingMembership.groupKey,
+        }));
+      }
+
+      if (!memberships.length) {
+        findings.push(sub2CreateAuditFinding({
+          id: `account-ungrouped:${accountId}`,
+          severity: 'info',
+          category: '平台或模型配置',
+          title: `${accountLabel} 未加入任何分组`,
+          detail: '未分组账号只能被不限定分组的请求使用，不参与分组内的故障转移。',
+          evidence: '配置判断',
+          accountIds: [accountId],
+        }));
+      }
+
+      const mappingState = sub2GetAccountModelMappingState(account);
+      if (mappingState.known && !mappingState.patterns.length
+        && (accountPlatform === 'grok' || accountPlatform === 'antigravity')) {
+        findings.push(sub2CreateAuditFinding({
+          id: `account-empty-model-mapping:${accountId}`,
+          severity: 'info',
+          category: '平台或模型配置',
+          title: `${accountLabel} 模型映射为空`,
+          detail: `${accountPlatform} 空映射由 sub2 注入平台默认模型，实际可用模型需要在模型抽屉里核对。`,
+          evidence: '信息不足',
+          accountIds: [accountId],
+        }));
+      }
+
+      const expiresAt = sub2ParseTimestamp(account?.expires_at);
+      if (Number.isFinite(expiresAt) && now >= expiresAt) {
+        findings.push(sub2CreateAuditFinding({
+          id: `account-expired:${accountId}`,
+          severity: account?.auto_pause_on_expired === true ? 'critical' : 'warning',
+          category: '平台或模型配置',
+          title: `${accountLabel} 凭据已过期`,
+          detail: account?.auto_pause_on_expired === true
+            ? '账号已过期且启用了到期自动暂停，当前不会参与调度。'
+            : '账号已过期但未启用自动暂停，仍可能被调度并直接失败。',
+          accountIds: [accountId],
+        }));
+      }
+    }
+    return findings;
+  }
+
+  // 主力账号（有效优先级最小的一档）是否全部受限。按分组分别判断，未分组账号单独成一组。
+  function sub2AuditPrimaryAccountAvailability(accounts, groupsById = null, now = Date.now()) {
+    const scopes = new Map();
+    const registerScopeAccount = (scopeKey, scopeName, account, priority) => {
+      if (!scopes.has(scopeKey)) scopes.set(scopeKey, { scopeKey, scopeName, entries: [] });
+      scopes.get(scopeKey).entries.push({ account, priority });
+    };
+
+    for (const account of Array.isArray(accounts) ? accounts : []) {
+      const memberships = sub2GetGroupMemberships(account, groupsById);
+      if (!memberships.length) {
+        registerScopeAccount('ungrouped', '未分组账号', account, Number(account?.priority) || 0);
+        continue;
+      }
+      for (const membership of memberships) {
+        registerScopeAccount(
+          membership.groupKey,
+          `分组「${membership.name}」`,
+          account,
+          membership.priority === null ? Number(account?.priority) || 0 : membership.priority,
+        );
+      }
+    }
+
+    const findings = [];
+    for (const scope of scopes.values()) {
+      if (scope.entries.length < 2) continue;
+      const bestPriority = Math.min(...scope.entries.map((entry) => entry.priority));
+      const primaryEntries = scope.entries.filter((entry) => entry.priority === bestPriority);
+      if (primaryEntries.length === scope.entries.length) continue;
+
+      const restrictedPrimaryEntries = primaryEntries.filter(
+        (entry) => sub2GetAccountRestrictionState(entry.account, now).restricted,
+      );
+      if (restrictedPrimaryEntries.length !== primaryEntries.length) continue;
+
+      const fallbackEntries = scope.entries.filter(
+        (entry) => entry.priority > bestPriority
+          && !sub2GetAccountRestrictionState(entry.account, now).restricted,
+      );
+      findings.push(sub2CreateAuditFinding({
+        id: `primary-accounts-restricted:${scope.scopeKey}`,
+        severity: fallbackEntries.length ? 'warning' : 'critical',
+        category: '主力账号受限',
+        title: `${scope.scopeName} 优先级 ${bestPriority} 的主力账号全部受限`,
+        detail: `${primaryEntries.map((entry) => sub2GetAccountAuditLabel(entry.account)).join('、')} 当前都不可调度；`
+          + (fallbackEntries.length
+            ? `流量会降级到 ${fallbackEntries.length} 个较低优先级账号。`
+            : '该范围内没有可用的较低优先级账号承接流量。'),
+        accountIds: primaryEntries.map((entry) => entry.account?.id),
+        groupKey: scope.scopeKey === 'ungrouped' ? '' : scope.scopeKey,
+      }));
+    }
+    return findings;
+  }
+
+  function sub2BuildConfigAudit(context = {}, now = Date.now()) {
+    const accounts = Array.isArray(context.accounts) ? context.accounts : [];
+    const groupsById = context.groupsById || null;
+    const findings = sub2SortAuditFindings([
+      ...sub2AuditGroupSinglePointRisks(accounts, groupsById, now),
+      ...sub2AuditPlatformAndModelConfig(accounts, groupsById, now),
+      ...sub2AuditPrimaryAccountAvailability(accounts, groupsById, now),
+    ]);
+    const severityCounts = { critical: 0, warning: 0, info: 0 };
+    for (const finding of findings) severityCounts[finding.severity] += 1;
+    return {
+      generatedAt: now,
+      accountCount: accounts.length,
+      findings,
+      severityCounts,
+    };
+  }
+
+  // 只读容量建议：结合已配置容量、当前占用和近 24 小时真实请求里的 429 比例。
+  // 不自动写入任何配置，仅给出方向和理由，实际调整仍由“容量”按钮人工完成。
+  function sub2BuildCapacityAdvice(context = {}, now = Date.now()) {
+    const accounts = Array.isArray(context.accounts) ? context.accounts : [];
+    const concurrencyByAccountId = context.concurrencyByAccountId || null;
+    const concurrencyRecordsByAccountId = context.concurrencyRecordsByAccountId || null;
+    const reliabilitySnapshot = context.reliabilitySnapshot || null;
+    const requestHistory = Array.isArray(reliabilitySnapshot?.requestHistory)
+      ? reliabilitySnapshot.requestHistory
+      : [];
+
+    const trafficByAccountId = new Map();
+    for (const requestItem of requestHistory) {
+      const accountId = Number(requestItem?.accountId);
+      if (!Number.isInteger(accountId) || accountId <= 0) continue;
+      if (!trafficByAccountId.has(accountId)) {
+        trafficByAccountId.set(accountId, { requestCount: 0, rateLimitedCount: 0, failureCount: 0 });
+      }
+      const traffic = trafficByAccountId.get(accountId);
+      traffic.requestCount += 1;
+      if (requestItem.statusCode === 429) traffic.rateLimitedCount += 1;
+      if (requestItem.kind === 'error') traffic.failureCount += 1;
+    }
+
+    const historyAvailable = Boolean(reliabilitySnapshot);
+    const historyComplete = reliabilitySnapshot?.requestCoverageComplete === true;
+    const suggestions = [];
+    for (const account of accounts) {
+      const accountId = Number(account?.id);
+      if (!Number.isInteger(accountId) || accountId <= 0) continue;
+      const configuredCapacity = Number(account?.concurrency);
+      const normalizedCapacity = Number.isFinite(configuredCapacity) ? configuredCapacity : 0;
+      const concurrency = sub2ResolveAccountConcurrency(
+        accountId,
+        null,
+        concurrencyByAccountId,
+        concurrencyRecordsByAccountId,
+      );
+      const traffic = trafficByAccountId.get(accountId) || { requestCount: 0, rateLimitedCount: 0, failureCount: 0 };
+      const rateLimitRatio = traffic.requestCount > 0 ? traffic.rateLimitedCount / traffic.requestCount : 0;
+      const currentInUse = Number.isFinite(concurrency?.currentInUse) ? concurrency.currentInUse : null;
+      const waitingInQueue = Number.isFinite(concurrency?.waitingInQueue) ? concurrency.waitingInQueue : 0;
+      const utilization = normalizedCapacity > 0 && currentInUse !== null
+        ? currentInUse / normalizedCapacity
+        : null;
+
+      const reasons = [];
+      let direction = 'keep';
+      let confidence = historyAvailable && historyComplete ? '当前快照' : '信息不足';
+
+      if (!historyAvailable) {
+        reasons.push(`未读取近 ${SUB2_CAPACITY_ADVICE_WINDOW_HOURS} 小时请求，建议仅基于当前容量快照。`);
+      } else if (!traffic.requestCount) {
+        reasons.push(`近 ${SUB2_CAPACITY_ADVICE_WINDOW_HOURS} 小时没有读取到该账号的请求记录。`);
+        confidence = '信息不足';
+      } else {
+        reasons.push(
+          `近 ${SUB2_CAPACITY_ADVICE_WINDOW_HOURS} 小时读取到 ${traffic.requestCount} 条请求，`
+          + `其中 429 限流 ${traffic.rateLimitedCount} 条（${(rateLimitRatio * 100).toFixed(1)}%）。`,
+        );
+      }
+
+      if (traffic.requestCount > 0 && rateLimitRatio >= SUB2_CAPACITY_RATE_LIMIT_RATIO) {
+        direction = 'decrease';
+        reasons.push('限流占比偏高，先下调容量或降低优先级通常比继续加压更快恢复。');
+      } else if (utilization !== null && utilization >= SUB2_CAPACITY_HIGH_LOAD_RATIO) {
+        direction = 'increase';
+        reasons.push(`当前占用 ${currentInUse} / ${normalizedCapacity}，已接近配置上限。`);
+        if (waitingInQueue > 0) reasons.push(`同时有 ${waitingInQueue} 个请求在排队。`);
+      } else if (waitingInQueue > 0) {
+        direction = 'increase';
+        reasons.push(`存在 ${waitingInQueue} 个排队请求，说明容量在高峰期不足。`);
+      } else if (normalizedCapacity <= 0) {
+        direction = 'review';
+        reasons.push('账号没有有效的并发容量配置，调度行为取决于 sub2 默认值。');
+        confidence = '配置判断';
+      } else {
+        reasons.push('当前占用和限流都没有触及阈值，维持现有容量即可。');
+      }
+
+      if (context.concurrencyAvailable === false) {
+        reasons.push('容量接口不可用，占用数据缺失。');
+        confidence = '信息不足';
+      } else if (context.concurrencyEnabled === false) {
+        reasons.push('sub2 并发统计未启用，占用数据缺失。');
+        confidence = '信息不足';
+      } else if (!concurrency) {
+        reasons.push('容量接口未返回该账号记录，当前占用未知。');
+        confidence = '信息不足';
+      }
+
+      if (historyAvailable && !historyComplete) {
+        reasons.push('请求记录超过单次读取上限，比例只代表已读取样本。');
+        confidence = '信息不足';
+      }
+
+      suggestions.push({
+        accountId,
+        accountName: sub2GetAccountAuditLabel(account),
+        configuredCapacity: normalizedCapacity,
+        currentInUse,
+        waitingInQueue,
+        requestCount: traffic.requestCount,
+        rateLimitedCount: traffic.rateLimitedCount,
+        rateLimitRatio,
+        direction,
+        confidence,
+        reasons,
+      });
+    }
+
+    const directionRank = { decrease: 0, increase: 1, review: 2, keep: 3 };
+    suggestions.sort((leftSuggestion, rightSuggestion) => directionRank[leftSuggestion.direction]
+      - directionRank[rightSuggestion.direction]
+      || rightSuggestion.rateLimitRatio - leftSuggestion.rateLimitRatio
+      || leftSuggestion.accountName.localeCompare(rightSuggestion.accountName));
+
+    return {
+      generatedAt: now,
+      historyAvailable,
+      historyComplete,
+      windowHours: SUB2_CAPACITY_ADVICE_WINDOW_HOURS,
+      suggestions,
     };
   }
 
@@ -2539,6 +2952,34 @@
     #${SUB2_PANEL_ID} .sub2-event-time{color:#94a3b8;font-size:9px;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-event-detail{margin-top:3px;color:#64748b;font-size:9px;line-height:1.45;overflow-wrap:anywhere;}
     #${SUB2_PANEL_ID} .sub2-event-meta{margin-top:3px;color:#64748b;font-size:8px;line-height:1.4;}
+    #${SUB2_PANEL_ID} .sub2-audit-overlay{position:absolute;inset:0;z-index:23;display:flex;justify-content:flex-end;
+      background:rgba(15,23,42,.36);backdrop-filter:blur(1px);}
+    #${SUB2_PANEL_ID} .sub2-audit-overlay[hidden]{display:none;}
+    #${SUB2_PANEL_ID} .sub2-audit-drawer{width:100%;height:100%;display:flex;flex-direction:column;background:#fff;
+      border-left:1px solid #cbd5e1;box-shadow:-10px 0 28px rgba(15,23,42,.16);}
+    #${SUB2_PANEL_ID} .sub2-audit-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:12px 14px;
+      border-bottom:1px solid #e2e8f0;background:#f8fafc;}
+    #${SUB2_PANEL_ID} .sub2-audit-title{display:block;font-size:14px;}
+    #${SUB2_PANEL_ID} .sub2-audit-subtitle{margin-top:3px;color:#64748b;font-size:11px;line-height:1.4;}
+    #${SUB2_PANEL_ID} .sub2-audit-close{border:none;background:transparent;color:#64748b;cursor:pointer;font-size:20px;line-height:1;padding:0 2px;}
+    #${SUB2_PANEL_ID} .sub2-audit-body{flex:1;min-height:0;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:10px;}
+    #${SUB2_PANEL_ID} .sub2-audit-card{border:1px solid #e2e8f0;border-radius:9px;background:#fff;padding:9px;}
+    #${SUB2_PANEL_ID} .sub2-audit-card h3{margin:0 0 7px;font-size:12px;color:#0f172a;}
+    #${SUB2_PANEL_ID} .sub2-audit-item{padding:7px 8px;border:1px solid #e2e8f0;border-left-width:3px;border-radius:7px;background:#f8fafc;margin-bottom:6px;}
+    #${SUB2_PANEL_ID} .sub2-audit-item:last-child{margin-bottom:0;}
+    #${SUB2_PANEL_ID} .sub2-audit-item.critical{border-left-color:#ef4444;background:#fef2f2;}
+    #${SUB2_PANEL_ID} .sub2-audit-item.warning{border-left-color:#f59e0b;background:#fffbeb;}
+    #${SUB2_PANEL_ID} .sub2-audit-item.info{border-left-color:#3b82f6;background:#eff6ff;}
+    #${SUB2_PANEL_ID} .sub2-audit-item-head{display:flex;align-items:center;gap:6px;}
+    #${SUB2_PANEL_ID} .sub2-audit-severity{padding:2px 5px;border-radius:4px;font-size:8px;font-weight:700;text-transform:uppercase;}
+    #${SUB2_PANEL_ID} .sub2-audit-severity.critical{background:#ef4444;color:#fff;}
+    #${SUB2_PANEL_ID} .sub2-audit-severity.warning{background:#f59e0b;color:#fff;}
+    #${SUB2_PANEL_ID} .sub2-audit-severity.info{background:#3b82f6;color:#fff;}
+    #${SUB2_PANEL_ID} .sub2-audit-message{flex:1;min-width:0;color:#0f172a;font-size:10px;font-weight:700;}
+    #${SUB2_PANEL_ID} .sub2-audit-detail{margin-top:3px;color:#64748b;font-size:9px;line-height:1.45;overflow-wrap:anywhere;}
+    #${SUB2_PANEL_ID} .sub2-audit-action{margin-top:5px;padding:4px 7px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;
+      color:#334155;font-size:9px;cursor:pointer;display:inline-block;}
+    #${SUB2_PANEL_ID} .sub2-audit-action:hover{background:#f1f5f9;}
     @media (max-width:760px){
       #${SUB2_PANEL_ID}{width:calc(100vw - 24px);right:12px;bottom:70px;height:min(80vh,720px);}
     }
@@ -2629,6 +3070,7 @@
       this.savedModelsByAccountId = new Map();
       this.diagnosticsOpen = false;
       this.eventsOpen = false;
+      this.auditOpen = false;
       this.eventTypeFilter = '';
       this.eventRetentionDays = sub2NormalizeEventRetentionDays(
         sub2StorageGet('eventRetentionDays', SUB2_DEFAULT_EVENT_RETENTION_DAYS),
@@ -2690,6 +3132,7 @@
         <div class="sub2-head">
           <b>Sub2 账号健康 / 路由 <span class="sub2-version">v${SUB2_SCRIPT_VERSION}</span></b>
           <div class="sub2-head-actions">
+            <button type="button" class="sub2-audit-open">配置审计</button>
             <button type="button" class="sub2-events-open">事件中心</button>
             <button type="button" class="sub2-diagnostics-open">路由历史</button>
             <button class="sub2-min" title="最小化">—</button>
@@ -2776,6 +3219,18 @@
             <div class="sub2-events-body"></div>
           </section>
         </div>
+        <div class="sub2-audit-overlay" hidden>
+          <section class="sub2-audit-drawer" role="dialog" aria-modal="true" aria-labelledby="sub2-audit-title">
+            <div class="sub2-audit-head">
+              <div>
+                <strong id="sub2-audit-title" class="sub2-audit-title">配置风险审计</strong>
+                <div class="sub2-audit-subtitle">检测单点故障、配置异常、主力账号全部受限与容量建议。</div>
+              </div>
+              <button type="button" class="sub2-audit-close" title="关闭" aria-label="关闭配置审计">×</button>
+            </div>
+            <div class="sub2-audit-body"></div>
+          </section>
+        </div>
       `;
       document.body.appendChild(this.root);
 
@@ -2802,10 +3257,13 @@
       this.diagnosticsBodyElement = this.root.querySelector('.sub2-diagnostics-body');
       this.eventsOverlayElement = this.root.querySelector('.sub2-events-overlay');
       this.eventsBodyElement = this.root.querySelector('.sub2-events-body');
+      this.auditOverlayElement = this.root.querySelector('.sub2-audit-overlay');
+      this.auditBodyElement = this.root.querySelector('.sub2-audit-body');
 
       this.viewElement.value = this.viewMode;
       this.sortElement.value = this.sortMode;
       this.root.querySelector('.sub2-min').addEventListener('click', () => this.setMinimized(true));
+      this.root.querySelector('.sub2-audit-open')?.addEventListener('click', () => this.openAuditDrawer());
       this.root.querySelector('.sub2-events-open')?.addEventListener('click', () => this.openEventsDrawer());
       this.root.querySelector('.sub2-diagnostics-open')?.addEventListener('click', () => this.openDiagnosticsDrawer());
       this.root.querySelector('.sub2-refresh').addEventListener('click', () => this.refresh());
@@ -2867,6 +3325,10 @@
       this.root.querySelector('.sub2-events-close')?.addEventListener('click', () => this.closeEventsDrawer());
       this.eventsOverlayElement?.addEventListener('click', (event) => {
         if (event.target === this.eventsOverlayElement) this.closeEventsDrawer();
+      });
+      this.root.querySelector('.sub2-audit-close')?.addEventListener('click', () => this.closeAuditDrawer());
+      this.auditOverlayElement?.addEventListener('click', (event) => {
+        if (event.target === this.auditOverlayElement) this.closeAuditDrawer();
       });
 
       this.applyMinimized();
@@ -3666,6 +4128,21 @@
       if (this.eventsOverlayElement) this.eventsOverlayElement.hidden = true;
     }
 
+    openAuditDrawer() {
+      this.closeDiagnosticsDrawer();
+      this.closeEventsDrawer();
+      this.closeModelDrawer();
+      this.auditOpen = true;
+      if (this.auditOverlayElement) this.auditOverlayElement.hidden = false;
+      if (this.auditBodyElement) this.auditBodyElement.scrollTop = 0;
+      this.renderAuditDrawer();
+    }
+
+    closeAuditDrawer() {
+      this.auditOpen = false;
+      if (this.auditOverlayElement) this.auditOverlayElement.hidden = true;
+    }
+
     setEventRetentionDays(rawRetentionDays) {
       this.eventRetentionDays = sub2NormalizeEventRetentionDays(rawRetentionDays);
       this.localEvents = sub2PruneLocalEvents(this.localEvents, this.eventRetentionDays);
@@ -3859,6 +4336,172 @@
       eventsCard.appendChild(eventList);
       this.eventsBodyElement.appendChild(eventsCard);
       this.eventsBodyElement.scrollTop = savedScrollTop;
+    }
+
+    renderAuditDrawer() {
+      if (!this.auditOpen || !this.auditOverlayElement || !this.auditBodyElement) return;
+      this.auditOverlayElement.hidden = false;
+      const savedScrollTop = this.auditBodyElement.scrollTop;
+      const now = Date.now();
+      this.auditBodyElement.textContent = '';
+
+      const auditFindings = [];
+
+      const schedulableAccounts = this.accounts.filter((account) => account.schedulable !== false);
+      const accountsByGroupId = new Map();
+      for (const account of schedulableAccounts) {
+        const groupIds = Array.isArray(account.groups) ? account.groups : [];
+        for (const groupId of groupIds) {
+          if (!accountsByGroupId.has(groupId)) accountsByGroupId.set(groupId, []);
+          accountsByGroupId.get(groupId).push(account);
+        }
+      }
+
+      for (const [groupId, groupAccounts] of accountsByGroupId) {
+        if (groupAccounts.length === 1) {
+          const group = sub2GetIndexedGroup(this.groupsById, groupId);
+          auditFindings.push({
+            severity: 'critical',
+            category: 'single-point',
+            message: `分组"${group?.name || groupId}"只有 1 个可调度账号`,
+            detail: `分组"${group?.name || groupId}"仅包含账号 ${this.getAccountDisplayName(groupAccounts[0].id)}。如果该账号受限或失败，分组将完全不可用。`,
+            accountId: groupAccounts[0].id,
+          });
+        }
+      }
+
+      const accountsByPlatform = new Map();
+      for (const account of schedulableAccounts) {
+        const platform = account.platform || 'unknown';
+        if (!accountsByPlatform.has(platform)) accountsByPlatform.set(platform, []);
+        accountsByPlatform.get(platform).push(account);
+      }
+
+      for (const account of this.accounts) {
+        const health = sub2ComputeHealth(account, now);
+        if (health.tone === 'down' && account.schedulable !== false) {
+          auditFindings.push({
+            severity: 'warning',
+            category: 'account-down',
+            message: `账号 ${this.getAccountDisplayName(account.id)} 当前不可用`,
+            detail: health.reason || '账号当前处于不可用状态，已从调度池排除。',
+            accountId: account.id,
+          });
+        }
+
+        const configuredCapacity = sub2GetNumericAccountField(account, 'concurrency_capacity');
+        if (configuredCapacity > 0) {
+          const currentOccupied = account.concurrency_occupied || 0;
+          const currentQueued = account.concurrency_queued || 0;
+          const reliabilityStats = this.reliabilitySnapshot?.accountStats?.[account.id];
+          const status429Count = reliabilityStats?.status429 || 0;
+          const totalRequests = reliabilityStats?.requests || 0;
+          const rateLimitRatio = totalRequests > 0 ? status429Count / totalRequests : 0;
+
+          if (rateLimitRatio > SUB2_CAPACITY_RATE_LIMIT_RATIO) {
+            auditFindings.push({
+              severity: 'warning',
+              category: 'capacity-high',
+              message: `账号 ${this.getAccountDisplayName(account.id)} 近 24 小时 429 占比 ${(rateLimitRatio * 100).toFixed(1)}%`,
+              detail: `当前容量配置 ${configuredCapacity}，近 24 小时触发 ${status429Count} 次 429，占 ${totalRequests} 次请求的 ${(rateLimitRatio * 100).toFixed(1)}%。建议降低容量至 ${Math.max(1, Math.floor(configuredCapacity * 0.7))} 左右。`,
+              accountId: account.id,
+              suggestedCapacity: Math.max(1, Math.floor(configuredCapacity * 0.7)),
+            });
+          } else if (currentOccupied >= configuredCapacity * SUB2_CAPACITY_HIGH_LOAD_RATIO && currentQueued > 0) {
+            auditFindings.push({
+              severity: 'info',
+              category: 'capacity-low',
+              message: `账号 ${this.getAccountDisplayName(account.id)} 当前高负载 ${currentOccupied}/${configuredCapacity}`,
+              detail: `当前占用 ${currentOccupied}，排队 ${currentQueued}，达到容量配置 ${configuredCapacity} 的 ${((currentOccupied / configuredCapacity) * 100).toFixed(0)}%。如果未触发 429，可考虑提升容量至 ${configuredCapacity + Math.ceil(configuredCapacity * 0.3)}。`,
+              accountId: account.id,
+              suggestedCapacity: configuredCapacity + Math.ceil(configuredCapacity * 0.3),
+            });
+          }
+        }
+
+        if (account.platform === 'openai-oauth' && account.models && Array.isArray(account.models)) {
+          const foreignModels = account.models.filter((modelName) =>
+            SUB2_OPENAI_OAUTH_FOREIGN_MODEL_PREFIXES.some((prefix) => modelName.startsWith(prefix)),
+          );
+          if (foreignModels.length > 0) {
+            auditFindings.push({
+              severity: 'warning',
+              category: 'platform-config',
+              message: `账号 ${this.getAccountDisplayName(account.id)} 包含非 OpenAI 模型`,
+              detail: `平台 openai-oauth 下检测到 ${foreignModels.length} 个非 OpenAI 模型（${foreignModels.slice(0, 3).join(', ')}${foreignModels.length > 3 ? '...' : ''}），可能导致路由异常。`,
+              accountId: account.id,
+            });
+          }
+        }
+      }
+
+      auditFindings.sort((left, right) => {
+        const severityDiff = SUB2_AUDIT_SEVERITY_RANK[right.severity] - SUB2_AUDIT_SEVERITY_RANK[left.severity];
+        if (severityDiff !== 0) return severityDiff;
+        return (left.message || '').localeCompare(right.message || '');
+      });
+
+      const summaryCard = document.createElement('section');
+      summaryCard.className = 'sub2-audit-card';
+      const summaryTitle = document.createElement('h3');
+      summaryTitle.textContent = '审计摘要';
+      const summaryDetail = document.createElement('div');
+      summaryDetail.className = 'sub2-diagnostics-note';
+      const criticalCount = auditFindings.filter((finding) => finding.severity === 'critical').length;
+      const warningCount = auditFindings.filter((finding) => finding.severity === 'warning').length;
+      const infoCount = auditFindings.filter((finding) => finding.severity === 'info').length;
+      summaryDetail.textContent = auditFindings.length
+        ? `共发现 ${auditFindings.length} 项：${criticalCount} 严重、${warningCount} 注意、${infoCount} 提示。`
+        : '当前配置未发现明显风险。持续关注单点故障、平台配置异常和容量建议。';
+      summaryCard.append(summaryTitle, summaryDetail);
+      this.auditBodyElement.appendChild(summaryCard);
+
+      if (auditFindings.length > 0) {
+        const findingsCard = document.createElement('section');
+        findingsCard.className = 'sub2-audit-card';
+        const findingsTitle = document.createElement('h3');
+        findingsTitle.textContent = '发现项';
+        findingsCard.appendChild(findingsTitle);
+
+        for (const finding of auditFindings) {
+          const findingItem = document.createElement('div');
+          findingItem.className = `sub2-audit-item ${finding.severity}`;
+          const findingHead = document.createElement('div');
+          findingHead.className = 'sub2-audit-item-head';
+          const severityBadge = document.createElement('span');
+          severityBadge.className = `sub2-audit-severity ${finding.severity}`;
+          severityBadge.textContent = SUB2_AUDIT_SEVERITY_LABELS[finding.severity] || finding.severity;
+          const findingMessage = document.createElement('span');
+          findingMessage.className = 'sub2-audit-message';
+          findingMessage.textContent = finding.message;
+          findingHead.append(severityBadge, findingMessage);
+          const findingDetail = document.createElement('div');
+          findingDetail.className = 'sub2-audit-detail';
+          findingDetail.textContent = finding.detail;
+          findingItem.append(findingHead, findingDetail);
+
+          if (finding.suggestedCapacity && finding.accountId) {
+            const actionButton = document.createElement('button');
+            actionButton.type = 'button';
+            actionButton.className = 'sub2-audit-action';
+            actionButton.textContent = `调整容量至 ${finding.suggestedCapacity}`;
+            actionButton.addEventListener('click', () => {
+              const targetAccount = this.accounts.find((account) => account.id === finding.accountId);
+              if (targetAccount) {
+                this.openCapacityEditor(targetAccount, finding.suggestedCapacity);
+                this.closeAuditDrawer();
+              }
+            });
+            findingItem.appendChild(actionButton);
+          }
+
+          findingsCard.appendChild(findingItem);
+        }
+
+        this.auditBodyElement.appendChild(findingsCard);
+      }
+
+      this.auditBodyElement.scrollTop = savedScrollTop;
     }
 
     getDiagnosticsRequest() {
@@ -4705,6 +5348,12 @@
     sub2BuildObservationSnapshot,
     sub2BuildObservationTransitionEvents,
     sub2BuildReliabilitySnapshot,
+    sub2GetAccountRestrictionState,
+    sub2AuditGroupSinglePointRisks,
+    sub2AuditPlatformAndModelConfig,
+    sub2AuditPrimaryAccountAvailability,
+    sub2BuildConfigAudit,
+    sub2BuildCapacityAdvice,
     sub2BuildRouteChain,
     sub2BuildRecentRoutingErrorIndex,
     sub2MergeRouteFailuresIntoErrorIndex,
