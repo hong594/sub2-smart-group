@@ -2,9 +2,9 @@
 // @name         Sub2 Smart Group
 // @name:zh-CN   Sub2 智能分组
 // @namespace    local.sub2.smart-group
-// @version      2.2.0
-// @description  Sub2 account health, route history, protected capacity controls, quota controls, and manual model sync (no active probing).
-// @description:zh-CN 为 sub2api 提供账号健康度、路由历史、受保护的容量与配额控制、手动模型同步（不主动测活）
+// @version      2.3.0
+// @description  Sub2 account health, route history, reliability events, protected controls, and manual model sync (no active probing).
+// @description:zh-CN 为 sub2api 提供账号健康度、路由历史、可靠性事件、受保护控制与手动模型同步（不主动测活）
 // @license      MIT
 // @homepageURL   https://github.com/hong594/sub2-smart-group
 // @supportURL    https://github.com/hong594/sub2-smart-group/issues
@@ -68,10 +68,15 @@
   const SUB2_POLL_SECONDS = 10;
   const SUB2_ROUTING_LOOKBACK_MS = 30 * 60 * 1000;
   const SUB2_REQUEST_HISTORY_LIMIT = 30;
+  const SUB2_RELIABILITY_HISTORY_LIMIT = 1000;
+  const SUB2_EVENT_RETENTION_OPTIONS = Object.freeze([1, 7, 30]);
+  const SUB2_DEFAULT_EVENT_RETENTION_DAYS = 7;
+  const SUB2_LOCAL_EVENT_LIMIT = 500;
+  const SUB2_RELIABILITY_REFRESH_MS = 60 * 1000;
   const SUB2_CAPACITY_MAX = 10000;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '2.2.0';
+    : '2.3.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -656,6 +661,313 @@
       correlatedErrors.push(routingError);
     }
     return correlatedErrors.sort((leftError, rightError) => leftError.createdAt - rightError.createdAt);
+  }
+
+  function sub2NormalizeRoutingErrors(payload) {
+    return sub2GetPaginatedItems(payload)
+      .map((errorItem) => sub2NormalizeRoutingError(errorItem))
+      .filter(Boolean)
+      .sort((leftError, rightError) => rightError.createdAt - leftError.createdAt);
+  }
+
+  function sub2IsTrackedReliabilityStatus(statusCode) {
+    const numericStatusCode = Number(statusCode);
+    return numericStatusCode === 403 || numericStatusCode === 429
+      || (numericStatusCode >= 500 && numericStatusCode <= 599);
+  }
+
+  function sub2GetReliabilityEventType(statusCode) {
+    const numericStatusCode = Number(statusCode);
+    if (numericStatusCode === 403) return 'status-403';
+    if (numericStatusCode === 429) return 'status-429';
+    if (numericStatusCode >= 500 && numericStatusCode <= 599) return 'status-5xx';
+    return '';
+  }
+
+  function sub2NormalizeLocalEvent(rawEvent) {
+    if (!rawEvent || typeof rawEvent !== 'object') return null;
+    const eventId = String(rawEvent.id || '').trim();
+    const occurredAt = Number(rawEvent.occurredAt);
+    if (!eventId || !Number.isFinite(occurredAt) || occurredAt <= 0) return null;
+    const numericAccountId = Number(rawEvent.accountId);
+    const numericGroupId = Number(rawEvent.groupId);
+    const numericStatusCode = Number(rawEvent.statusCode);
+    return {
+      id: eventId,
+      type: String(rawEvent.type || 'unknown').trim() || 'unknown',
+      tone: String(rawEvent.tone || 'info').trim() || 'info',
+      occurredAt,
+      accountId: Number.isInteger(numericAccountId) && numericAccountId > 0 ? numericAccountId : null,
+      accountName: String(rawEvent.accountName || '').trim(),
+      groupId: Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null,
+      model: String(rawEvent.model || '').trim(),
+      requestId: String(rawEvent.requestId || '').trim(),
+      statusCode: Number.isInteger(numericStatusCode) ? numericStatusCode : null,
+      title: String(rawEvent.title || '').trim(),
+      detail: String(rawEvent.detail || '').trim(),
+      source: String(rawEvent.source || 'local').trim() || 'local',
+    };
+  }
+
+  function sub2NormalizeEventRetentionDays(rawRetentionDays) {
+    const numericRetentionDays = Number(rawRetentionDays);
+    return SUB2_EVENT_RETENTION_OPTIONS.includes(numericRetentionDays)
+      ? numericRetentionDays
+      : SUB2_DEFAULT_EVENT_RETENTION_DAYS;
+  }
+
+  function sub2PruneLocalEvents(
+    rawEvents,
+    retentionDays = SUB2_DEFAULT_EVENT_RETENTION_DAYS,
+    now = Date.now(),
+    maximumEvents = SUB2_LOCAL_EVENT_LIMIT,
+  ) {
+    const normalizedRetentionDays = sub2NormalizeEventRetentionDays(retentionDays);
+    const oldestAllowedTimestamp = now - normalizedRetentionDays * SUB2_DAY_MS;
+    const eventsById = new Map();
+    for (const rawEvent of Array.isArray(rawEvents) ? rawEvents : []) {
+      const normalizedEvent = sub2NormalizeLocalEvent(rawEvent);
+      if (!normalizedEvent || normalizedEvent.occurredAt < oldestAllowedTimestamp) continue;
+      const previousEvent = eventsById.get(normalizedEvent.id);
+      if (!previousEvent || normalizedEvent.occurredAt >= previousEvent.occurredAt) {
+        eventsById.set(normalizedEvent.id, normalizedEvent);
+      }
+    }
+    const normalizedMaximumEvents = Number.isInteger(Number(maximumEvents)) && Number(maximumEvents) > 0
+      ? Number(maximumEvents)
+      : SUB2_LOCAL_EVENT_LIMIT;
+    return [...eventsById.values()]
+      .sort((leftEvent, rightEvent) => rightEvent.occurredAt - leftEvent.occurredAt)
+      .slice(0, normalizedMaximumEvents);
+  }
+
+  function sub2MergeLocalEvents(
+    existingEvents,
+    incomingEvents,
+    retentionDays = SUB2_DEFAULT_EVENT_RETENTION_DAYS,
+    now = Date.now(),
+  ) {
+    return sub2PruneLocalEvents(
+      (Array.isArray(incomingEvents) ? incomingEvents : []).concat(
+        Array.isArray(existingEvents) ? existingEvents : [],
+      ),
+      retentionDays,
+      now,
+    );
+  }
+
+  function sub2BuildRequestStatusEvents(requestHistory, routingErrors) {
+    const statusEvents = [];
+    for (const requestItem of Array.isArray(requestHistory) ? requestHistory : []) {
+      if (!sub2IsTrackedReliabilityStatus(requestItem?.statusCode)) continue;
+      const eventType = sub2GetReliabilityEventType(requestItem.statusCode);
+      const requestKey = sub2GetRequestHistoryKey(requestItem);
+      statusEvents.push({
+        id: `request-status:${requestKey}:${requestItem.statusCode}`,
+        type: eventType,
+        tone: requestItem.statusCode === 429 ? 'warn' : 'down',
+        occurredAt: requestItem.createdAt,
+        accountId: requestItem.accountId,
+        groupId: requestItem.groupId,
+        model: requestItem.model,
+        requestId: requestItem.requestId,
+        statusCode: requestItem.statusCode,
+        title: `${requestItem.statusCode} 请求失败`,
+        detail: requestItem.message || requestItem.phase || '最终请求返回受关注的错误状态。',
+        source: 'request',
+      });
+    }
+    for (const routingError of Array.isArray(routingErrors) ? routingErrors : []) {
+      if (!sub2IsTrackedReliabilityStatus(routingError?.statusCode)) continue;
+      const eventType = sub2GetReliabilityEventType(routingError.statusCode);
+      const errorIdentity = routingError.id || [
+        routingError.accountId,
+        routingError.createdAt,
+        routingError.requestId || routingError.clientRequestId || '',
+      ].join(':');
+      statusEvents.push({
+        id: `upstream-status:${errorIdentity}:${routingError.statusCode}`,
+        type: eventType,
+        tone: routingError.statusCode === 429 ? 'warn' : 'down',
+        occurredAt: routingError.createdAt,
+        accountId: routingError.accountId,
+        accountName: routingError.accountName,
+        model: routingError.model,
+        requestId: routingError.requestId || routingError.clientRequestId,
+        statusCode: routingError.statusCode,
+        title: `${routingError.statusCode} 上游${routingError.recovered ? '故障转移' : '错误'}`,
+        detail: routingError.detail || '上游尝试返回受关注的错误状态。',
+        source: 'upstream-error',
+      });
+    }
+    return statusEvents;
+  }
+
+  function sub2NormalizeObservationSnapshot(rawSnapshot) {
+    if (!rawSnapshot || typeof rawSnapshot !== 'object') return null;
+    const capturedAt = Number(rawSnapshot.capturedAt);
+    const normalizedAccounts = {};
+    const rawAccounts = rawSnapshot.accounts && typeof rawSnapshot.accounts === 'object'
+      ? rawSnapshot.accounts
+      : {};
+    for (const [rawAccountId, rawAccountState] of Object.entries(rawAccounts)) {
+      const accountId = Number(rawAccountState?.accountId ?? rawAccountId);
+      if (!Number.isInteger(accountId) || accountId <= 0) continue;
+      const coolingUntil = Number(rawAccountState?.coolingUntil);
+      normalizedAccounts[accountId] = {
+        accountId,
+        accountName: String(rawAccountState?.accountName || '').trim(),
+        coolingUntil: Number.isFinite(coolingUntil) && coolingUntil > 0 ? coolingUntil : 0,
+        coolingKind: String(rawAccountState?.coolingKind || '').trim(),
+      };
+    }
+    const latestHitAccountId = Number(rawSnapshot.latestHit?.accountId);
+    return {
+      capturedAt: Number.isFinite(capturedAt) && capturedAt > 0 ? capturedAt : 0,
+      accounts: normalizedAccounts,
+      latestHit: rawSnapshot.latestHit && typeof rawSnapshot.latestHit === 'object'
+        ? {
+          accountId: Number.isInteger(latestHitAccountId) && latestHitAccountId > 0
+            ? latestHitAccountId
+            : null,
+          requestKey: String(rawSnapshot.latestHit.requestKey || '').trim(),
+          createdAt: Number(rawSnapshot.latestHit.createdAt) || 0,
+        }
+        : null,
+    };
+  }
+
+  function sub2BuildObservationSnapshot(accounts, recentRequest, now = Date.now()) {
+    const accountStates = {};
+    for (const account of Array.isArray(accounts) ? accounts : []) {
+      const accountId = Number(account?.id);
+      if (!Number.isInteger(accountId) || accountId <= 0) continue;
+      const coolingCandidates = [
+        { kind: '限流冷却', until: Date.parse(account?.rate_limit_reset_at) },
+        { kind: '过载退避', until: Date.parse(account?.overload_until) },
+        { kind: '临时熔断', until: Date.parse(account?.temp_unschedulable_until) },
+      ].filter((candidate) => Number.isFinite(candidate.until) && candidate.until > now)
+        .sort((leftCandidate, rightCandidate) => rightCandidate.until - leftCandidate.until);
+      accountStates[accountId] = {
+        accountId,
+        accountName: String(account?.name || `账号 ${accountId}`).trim() || `账号 ${accountId}`,
+        coolingUntil: coolingCandidates[0]?.until || 0,
+        coolingKind: coolingCandidates[0]?.kind || '',
+      };
+    }
+    return {
+      capturedAt: now,
+      accounts: accountStates,
+      latestHit: recentRequest?.accountId
+        ? {
+          accountId: Number(recentRequest.accountId),
+          requestKey: sub2GetRequestHistoryKey(recentRequest),
+          createdAt: Number(recentRequest.createdAt) || now,
+        }
+        : null,
+    };
+  }
+
+  function sub2BuildObservationTransitionEvents(previousSnapshot, currentSnapshot, now = Date.now()) {
+    const previousState = sub2NormalizeObservationSnapshot(previousSnapshot);
+    const currentState = sub2NormalizeObservationSnapshot(currentSnapshot);
+    if (!previousState || !previousState.capturedAt || !currentState) return [];
+
+    const transitionEvents = [];
+    for (const [accountId, currentAccountState] of Object.entries(currentState.accounts)) {
+      const previousAccountState = previousState.accounts[accountId] || null;
+      if (!previousAccountState) continue;
+      const coolingStarted = currentAccountState.coolingUntil > 0 && previousAccountState.coolingUntil <= 0;
+      const coolingChanged = currentAccountState.coolingUntil > 0
+        && previousAccountState.coolingUntil > 0
+        && (currentAccountState.coolingUntil !== previousAccountState.coolingUntil
+          || currentAccountState.coolingKind !== previousAccountState.coolingKind);
+      const coolingEnded = currentAccountState.coolingUntil <= 0 && previousAccountState.coolingUntil > 0;
+      if (coolingStarted || coolingChanged) {
+        transitionEvents.push({
+          id: `cooldown-start:${accountId}:${currentAccountState.coolingKind}:${currentAccountState.coolingUntil}`,
+          type: 'cooldown',
+          tone: 'warn',
+          occurredAt: now,
+          accountId: Number(accountId),
+          accountName: currentAccountState.accountName,
+          title: coolingChanged ? '冷却状态更新' : '进入冷却',
+          detail: `${currentAccountState.coolingKind || '账号冷却'}，预计 ${sub2FormatUntil(currentAccountState.coolingUntil, now)}恢复。`,
+          source: 'account-snapshot',
+        });
+      } else if (coolingEnded) {
+        transitionEvents.push({
+          id: `cooldown-end:${accountId}:${previousAccountState.coolingUntil}`,
+          type: 'cooldown',
+          tone: 'ok',
+          occurredAt: now,
+          accountId: Number(accountId),
+          accountName: currentAccountState.accountName || previousAccountState.accountName,
+          title: '冷却结束',
+          detail: `${previousAccountState.coolingKind || '账号冷却'}已结束，当前快照未发现仍生效的冷却时间。`,
+          source: 'account-snapshot',
+        });
+      }
+    }
+
+    const previousHit = previousState.latestHit;
+    const currentHit = currentState.latestHit;
+    const hitAccountChanged = previousHit?.accountId && currentHit?.accountId
+      && previousHit.accountId !== currentHit.accountId
+      && previousHit.requestKey !== currentHit.requestKey;
+    if (hitAccountChanged) {
+      const previousAccountName = previousState.accounts[previousHit.accountId]?.accountName || `账号 ${previousHit.accountId}`;
+      const currentAccountName = currentState.accounts[currentHit.accountId]?.accountName || `账号 ${currentHit.accountId}`;
+      transitionEvents.push({
+        id: `hit-change:${currentHit.requestKey}:${previousHit.accountId}:${currentHit.accountId}`,
+        type: 'hit-change',
+        tone: 'info',
+        occurredAt: currentHit.createdAt || now,
+        accountId: currentHit.accountId,
+        accountName: currentAccountName,
+        requestId: currentHit.requestKey,
+        title: '最近命中账号变化',
+        detail: `${previousAccountName} -> ${currentAccountName}`,
+        source: 'request-observation',
+      });
+    }
+    return transitionEvents;
+  }
+
+  function sub2BuildReliabilitySnapshot(requestPayload, errorPayload, generatedAt = Date.now()) {
+    const normalizedRequests = sub2NormalizeRequestHistory(requestPayload);
+    const errorsAvailable = errorPayload !== null && errorPayload !== undefined;
+    const requestCoverageComplete = sub2IsPaginatedPayloadComplete(requestPayload);
+    const errorCoverageComplete = errorsAvailable && sub2IsPaginatedPayloadComplete(errorPayload);
+    const annotatedRequests = sub2AnnotateRequestHistory(
+      normalizedRequests,
+      errorsAvailable ? errorPayload : null,
+      errorCoverageComplete,
+    );
+    const routingErrors = errorsAvailable ? sub2NormalizeRoutingErrors(errorPayload) : [];
+    const successCount = annotatedRequests.filter((requestItem) => requestItem.kind === 'success').length;
+    const failureCount = annotatedRequests.filter((requestItem) => requestItem.kind === 'error').length;
+    const failoverCount = annotatedRequests.filter((requestItem) => requestItem.routeStatus === 'failover').length;
+    const trackedStatusCounts = { 403: 0, 429: 0, '5xx': 0 };
+    for (const requestItem of annotatedRequests) {
+      if (requestItem.statusCode === 403) trackedStatusCounts[403] += 1;
+      else if (requestItem.statusCode === 429) trackedStatusCounts[429] += 1;
+      else if (requestItem.statusCode >= 500 && requestItem.statusCode <= 599) trackedStatusCounts['5xx'] += 1;
+    }
+    return {
+      available: true,
+      generatedAt,
+      requestCount: annotatedRequests.length,
+      successCount,
+      failureCount,
+      successRate: annotatedRequests.length ? successCount / annotatedRequests.length * 100 : null,
+      failoverCount,
+      requestCoverageComplete,
+      failoverCoverageComplete: requestCoverageComplete && errorCoverageComplete,
+      trackedStatusCounts,
+      requestHistory: annotatedRequests,
+      routingErrors,
+    };
   }
 
   function sub2ParseUpstreamErrorEvents(detailPayload) {
@@ -1853,6 +2165,9 @@
     const errorByAccountId = errorResult.status === 'fulfilled'
       ? sub2BuildRecentRoutingErrorIndex(errorResult.value, recentRequest)
       : new Map();
+    const routingErrors = errorResult.status === 'fulfilled'
+      ? sub2NormalizeRoutingErrors(errorResult.value)
+      : [];
     sub2MergeRouteFailuresIntoErrorIndex(errorByAccountId, routeChain, recentRequest);
 
     return {
@@ -1862,12 +2177,37 @@
       concurrencyAvailable: concurrencyResult.status === 'fulfilled',
       recentRequest,
       requestHistory,
+      routingErrors,
       errorByAccountId,
       routeChain,
       routeDetailsAvailable: errorResult.status === 'fulfilled'
         && (!correlatedErrorIds.length || routeDetailsComplete),
       concurrencySnapshot,
     };
+  }
+
+  async function sub2FetchReliabilityActivity() {
+    const [requestResult, errorResult] = await Promise.allSettled([
+      sub2ApiRequestWithTimeout(
+        'GET',
+        `/admin/ops/requests?time_range=24h&kind=all&sort=created_at_desc&page=1&page_size=${SUB2_RELIABILITY_HISTORY_LIMIT}`,
+        undefined,
+        8000,
+      ),
+      sub2ApiRequestWithTimeout(
+        'GET',
+        `/admin/ops/upstream-errors?time_range=24h&page=1&page_size=${SUB2_RELIABILITY_HISTORY_LIMIT}`,
+        undefined,
+        8000,
+      ),
+    ]);
+    if (requestResult.status !== 'fulfilled') {
+      throw requestResult.reason || new Error('24 小时请求记录不可用');
+    }
+    return sub2BuildReliabilitySnapshot(
+      requestResult.value,
+      errorResult.status === 'fulfilled' ? errorResult.value : null,
+    );
   }
 
   async function sub2FetchRouteReplay(requestItem) {
@@ -2166,6 +2506,39 @@
     #${SUB2_PANEL_ID} .sub2-candidate-model-button{margin-top:6px;border:1px solid #bfdbfe;border-radius:6px;padding:3px 7px;
       background:#fff;color:#1d4ed8;font-size:10px;cursor:pointer;}
     #${SUB2_PANEL_ID} .sub2-candidate-model-button:disabled{opacity:.55;cursor:not-allowed;}
+    #${SUB2_PANEL_ID} .sub2-events-overlay{position:absolute;inset:0;z-index:22;display:flex;justify-content:flex-end;
+      background:rgba(15,23,42,.36);backdrop-filter:blur(1px);}
+    #${SUB2_PANEL_ID} .sub2-events-overlay[hidden]{display:none;}
+    #${SUB2_PANEL_ID} .sub2-events-drawer{width:100%;height:100%;display:flex;flex-direction:column;background:#fff;
+      border-left:1px solid #cbd5e1;box-shadow:-10px 0 28px rgba(15,23,42,.16);}
+    #${SUB2_PANEL_ID} .sub2-events-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:12px 14px;
+      border-bottom:1px solid #e2e8f0;background:#f8fafc;}
+    #${SUB2_PANEL_ID} .sub2-events-title{display:block;font-size:14px;}
+    #${SUB2_PANEL_ID} .sub2-events-subtitle{margin-top:3px;color:#64748b;font-size:11px;line-height:1.4;}
+    #${SUB2_PANEL_ID} .sub2-events-close{border:none;background:transparent;color:#64748b;cursor:pointer;font-size:20px;line-height:1;padding:0 2px;}
+    #${SUB2_PANEL_ID} .sub2-events-body{flex:1;min-height:0;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:10px;}
+    #${SUB2_PANEL_ID} .sub2-events-card{border:1px solid #e2e8f0;border-radius:9px;background:#fff;padding:9px;}
+    #${SUB2_PANEL_ID} .sub2-events-card h3{margin:0 0 7px;font-size:12px;color:#0f172a;}
+    #${SUB2_PANEL_ID} .sub2-reliability-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;}
+    #${SUB2_PANEL_ID} .sub2-reliability-metric{padding:8px;border:1px solid #dbeafe;border-radius:8px;background:#eff6ff;}
+    #${SUB2_PANEL_ID} .sub2-reliability-value{display:block;color:#1d4ed8;font-size:18px;font-weight:750;line-height:1.15;}
+    #${SUB2_PANEL_ID} .sub2-reliability-label{display:block;margin-top:3px;color:#64748b;font-size:9px;line-height:1.35;}
+    #${SUB2_PANEL_ID} .sub2-events-toolbar{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:5px;margin-bottom:7px;}
+    #${SUB2_PANEL_ID} .sub2-events-toolbar select{min-width:0;width:100%;border:1px solid #cbd5e1;border-radius:6px;padding:4px 5px;
+      background:#fff;color:#334155;font-size:10px;outline:none;}
+    #${SUB2_PANEL_ID} .sub2-events-clear{border:1px solid #fecaca;border-radius:6px;padding:4px 7px;background:#fff;color:#b91c1c;font-size:10px;cursor:pointer;}
+    #${SUB2_PANEL_ID} .sub2-events-policy{margin-bottom:7px;color:#64748b;font-size:9px;line-height:1.45;}
+    #${SUB2_PANEL_ID} .sub2-event-list{display:flex;flex-direction:column;gap:6px;}
+    #${SUB2_PANEL_ID} .sub2-event-item{padding:7px 8px;border:1px solid #e2e8f0;border-left-width:3px;border-radius:7px;background:#f8fafc;}
+    #${SUB2_PANEL_ID} .sub2-event-item.down{border-left-color:#ef4444;background:#fef2f2;}
+    #${SUB2_PANEL_ID} .sub2-event-item.warn{border-left-color:#f59e0b;background:#fffbeb;}
+    #${SUB2_PANEL_ID} .sub2-event-item.ok{border-left-color:#22c55e;background:#f0fdf4;}
+    #${SUB2_PANEL_ID} .sub2-event-item.info{border-left-color:#3b82f6;background:#eff6ff;}
+    #${SUB2_PANEL_ID} .sub2-event-head{display:flex;align-items:center;gap:6px;}
+    #${SUB2_PANEL_ID} .sub2-event-title{flex:1;min-width:0;color:#0f172a;font-size:10px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-event-time{color:#94a3b8;font-size:9px;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-event-detail{margin-top:3px;color:#64748b;font-size:9px;line-height:1.45;overflow-wrap:anywhere;}
+    #${SUB2_PANEL_ID} .sub2-event-meta{margin-top:3px;color:#64748b;font-size:8px;line-height:1.4;}
     @media (max-width:760px){
       #${SUB2_PANEL_ID}{width:calc(100vw - 24px);right:12px;bottom:70px;height:min(80vh,720px);}
     }
@@ -2192,6 +2565,8 @@
       this.modelListElement = null;
       this.diagnosticsOverlayElement = null;
       this.diagnosticsBodyElement = null;
+      this.eventsOverlayElement = null;
+      this.eventsBodyElement = null;
       this.accounts = [];
       this.groupsById = new Map();
       this.statsById = {};
@@ -2253,6 +2628,23 @@
       this.modelRequestSequence = 0;
       this.savedModelsByAccountId = new Map();
       this.diagnosticsOpen = false;
+      this.eventsOpen = false;
+      this.eventTypeFilter = '';
+      this.eventRetentionDays = sub2NormalizeEventRetentionDays(
+        sub2StorageGet('eventRetentionDays', SUB2_DEFAULT_EVENT_RETENTION_DAYS),
+      );
+      this.localEvents = sub2PruneLocalEvents(
+        sub2StorageGet('localEvents', []),
+        this.eventRetentionDays,
+      );
+      this.eventObservationSnapshot = sub2NormalizeObservationSnapshot(
+        sub2StorageGet('eventObservationSnapshot', null),
+      );
+      this.reliabilitySnapshot = null;
+      this.reliabilityLoading = false;
+      this.reliabilityError = '';
+      this.reliabilityRequestSequence = 0;
+      this.lastReliabilityRefreshAt = 0;
     }
 
     start() {
@@ -2298,6 +2690,7 @@
         <div class="sub2-head">
           <b>Sub2 账号健康 / 路由 <span class="sub2-version">v${SUB2_SCRIPT_VERSION}</span></b>
           <div class="sub2-head-actions">
+            <button type="button" class="sub2-events-open">事件中心</button>
             <button type="button" class="sub2-diagnostics-open">路由历史</button>
             <button class="sub2-min" title="最小化">—</button>
           </div>
@@ -2371,6 +2764,18 @@
             <div class="sub2-diagnostics-body"></div>
           </section>
         </div>
+        <div class="sub2-events-overlay" hidden>
+          <section class="sub2-events-drawer" role="dialog" aria-modal="true" aria-labelledby="sub2-events-title">
+            <div class="sub2-events-head">
+              <div>
+                <strong id="sub2-events-title" class="sub2-events-title">事件中心 / 可靠性</strong>
+                <div class="sub2-events-subtitle">汇总真实 403、429、5xx、冷却与命中变化；不主动测活。</div>
+              </div>
+              <button type="button" class="sub2-events-close" title="关闭" aria-label="关闭事件中心">×</button>
+            </div>
+            <div class="sub2-events-body"></div>
+          </section>
+        </div>
       `;
       document.body.appendChild(this.root);
 
@@ -2395,10 +2800,13 @@
       this.modelListElement = this.root.querySelector('.sub2-model-list');
       this.diagnosticsOverlayElement = this.root.querySelector('.sub2-diagnostics-overlay');
       this.diagnosticsBodyElement = this.root.querySelector('.sub2-diagnostics-body');
+      this.eventsOverlayElement = this.root.querySelector('.sub2-events-overlay');
+      this.eventsBodyElement = this.root.querySelector('.sub2-events-body');
 
       this.viewElement.value = this.viewMode;
       this.sortElement.value = this.sortMode;
       this.root.querySelector('.sub2-min').addEventListener('click', () => this.setMinimized(true));
+      this.root.querySelector('.sub2-events-open')?.addEventListener('click', () => this.openEventsDrawer());
       this.root.querySelector('.sub2-diagnostics-open')?.addEventListener('click', () => this.openDiagnosticsDrawer());
       this.root.querySelector('.sub2-refresh').addEventListener('click', () => this.refresh());
       this.searchElement.addEventListener('input', () => {
@@ -2455,6 +2863,10 @@
       this.root.querySelector('.sub2-diagnostics-close')?.addEventListener('click', () => this.closeDiagnosticsDrawer());
       this.diagnosticsOverlayElement?.addEventListener('click', (event) => {
         if (event.target === this.diagnosticsOverlayElement) this.closeDiagnosticsDrawer();
+      });
+      this.root.querySelector('.sub2-events-close')?.addEventListener('click', () => this.closeEventsDrawer());
+      this.eventsOverlayElement?.addEventListener('click', (event) => {
+        if (event.target === this.eventsOverlayElement) this.closeEventsDrawer();
       });
 
       this.applyMinimized();
@@ -2590,9 +3002,16 @@
         this.recentRequest,
         !this.routingRequestsAvailable,
       );
+      this.recordOperationalEvents(routingActivity);
       this.renderSummary();
       this.renderList();
       if (this.diagnosticsOpen) this.renderDiagnosticsDrawer();
+      if (this.eventsOpen) {
+        this.renderEventsDrawer();
+        if (Date.now() - this.lastReliabilityRefreshAt >= SUB2_RELIABILITY_REFRESH_MS) {
+          this.refreshReliabilityActivity();
+        }
+      }
     }
 
     render() {
@@ -2601,6 +3020,7 @@
       this.renderList();
       this.renderStatus();
       if (this.diagnosticsOpen) this.renderDiagnosticsDrawer();
+      if (this.eventsOpen) this.renderEventsDrawer();
     }
 
     renderFilters() {
@@ -3165,6 +3585,282 @@
       return row;
     }
 
+    recordOperationalEvents(routingActivity) {
+      const now = Date.now();
+      const currentObservationSnapshot = sub2BuildObservationSnapshot(
+        this.accounts,
+        routingActivity?.requestsAvailable ? routingActivity.recentRequest : null,
+        now,
+      );
+      if (!routingActivity?.requestsAvailable && this.eventObservationSnapshot?.latestHit) {
+        currentObservationSnapshot.latestHit = this.eventObservationSnapshot.latestHit;
+      }
+      const transitionEvents = sub2BuildObservationTransitionEvents(
+        this.eventObservationSnapshot,
+        currentObservationSnapshot,
+        now,
+      );
+      const requestEvents = sub2BuildRequestStatusEvents(
+        routingActivity?.requestsAvailable ? routingActivity.requestHistory : [],
+        routingActivity?.errorsAvailable ? routingActivity.routingErrors : [],
+      );
+      this.localEvents = sub2MergeLocalEvents(
+        this.localEvents,
+        requestEvents.concat(transitionEvents),
+        this.eventRetentionDays,
+        now,
+      );
+      this.eventObservationSnapshot = currentObservationSnapshot;
+      sub2StorageSet('localEvents', this.localEvents);
+      sub2StorageSet('eventObservationSnapshot', this.eventObservationSnapshot);
+    }
+
+    async refreshReliabilityActivity(force = false) {
+      const snapshotIsFresh = this.reliabilitySnapshot
+        && Date.now() - this.lastReliabilityRefreshAt < SUB2_RELIABILITY_REFRESH_MS;
+      if (this.reliabilityLoading || (!force && snapshotIsFresh)) return;
+
+      const requestSequence = ++this.reliabilityRequestSequence;
+      this.reliabilityLoading = true;
+      this.reliabilityError = '';
+      if (this.eventsOpen) this.renderEventsDrawer();
+      try {
+        const reliabilitySnapshot = await sub2FetchReliabilityActivity();
+        if (requestSequence !== this.reliabilityRequestSequence) return;
+        this.reliabilitySnapshot = reliabilitySnapshot;
+        this.lastReliabilityRefreshAt = Date.now();
+        this.localEvents = sub2MergeLocalEvents(
+          this.localEvents,
+          sub2BuildRequestStatusEvents(
+            reliabilitySnapshot.requestHistory,
+            reliabilitySnapshot.routingErrors,
+          ),
+          this.eventRetentionDays,
+          this.lastReliabilityRefreshAt,
+        );
+        sub2StorageSet('localEvents', this.localEvents);
+      } catch (error) {
+        if (requestSequence === this.reliabilityRequestSequence) {
+          this.reliabilityError = `24 小时可靠性读取失败：${error?.message || error}`;
+        }
+      } finally {
+        if (requestSequence === this.reliabilityRequestSequence) {
+          this.reliabilityLoading = false;
+          if (this.eventsOpen) this.renderEventsDrawer();
+        }
+      }
+    }
+
+    openEventsDrawer() {
+      this.closeDiagnosticsDrawer();
+      this.closeModelDrawer();
+      this.eventsOpen = true;
+      if (this.eventsOverlayElement) this.eventsOverlayElement.hidden = false;
+      if (this.eventsBodyElement) this.eventsBodyElement.scrollTop = 0;
+      this.renderEventsDrawer();
+      this.refreshReliabilityActivity(!this.reliabilitySnapshot);
+    }
+
+    closeEventsDrawer() {
+      this.eventsOpen = false;
+      if (this.eventsOverlayElement) this.eventsOverlayElement.hidden = true;
+    }
+
+    setEventRetentionDays(rawRetentionDays) {
+      this.eventRetentionDays = sub2NormalizeEventRetentionDays(rawRetentionDays);
+      this.localEvents = sub2PruneLocalEvents(this.localEvents, this.eventRetentionDays);
+      sub2StorageSet('eventRetentionDays', this.eventRetentionDays);
+      sub2StorageSet('localEvents', this.localEvents);
+      this.renderEventsDrawer();
+    }
+
+    clearLocalEvents() {
+      this.localEvents = [];
+      sub2StorageSet('localEvents', this.localEvents);
+      this.renderEventsDrawer();
+    }
+
+    renderEventsDrawer() {
+      if (!this.eventsOpen || !this.eventsOverlayElement || !this.eventsBodyElement) return;
+      this.eventsOverlayElement.hidden = false;
+      const savedScrollTop = this.eventsBodyElement.scrollTop;
+      const now = Date.now();
+      this.eventsBodyElement.textContent = '';
+
+      const reliabilityCard = document.createElement('section');
+      reliabilityCard.className = 'sub2-events-card';
+      const reliabilityTitle = document.createElement('h3');
+      reliabilityTitle.textContent = '近 24 小时可靠性';
+      reliabilityCard.appendChild(reliabilityTitle);
+      const reliabilitySnapshot = this.reliabilitySnapshot;
+      if (!reliabilitySnapshot) {
+        const reliabilityState = document.createElement('div');
+        reliabilityState.className = 'sub2-diagnostics-note';
+        reliabilityState.textContent = this.reliabilityLoading
+          ? '正在读取近 24 小时真实请求与故障转移摘要…'
+          : this.reliabilityError || '打开事件中心后按需读取近 24 小时可靠性统计。';
+        reliabilityCard.appendChild(reliabilityState);
+      } else {
+        const reliabilityGrid = document.createElement('div');
+        reliabilityGrid.className = 'sub2-reliability-grid';
+        const reliabilityMetrics = [
+          {
+            value: reliabilitySnapshot.successRate === null
+              ? '--'
+              : `${reliabilitySnapshot.successRate.toFixed(1)}%`,
+            label: `成功 ${reliabilitySnapshot.successCount} / 请求 ${reliabilitySnapshot.requestCount}`,
+          },
+          {
+            value: String(reliabilitySnapshot.failoverCount),
+            label: reliabilitySnapshot.failoverCoverageComplete ? '故障转移成功次数' : '已识别故障转移（下限）',
+          },
+          {
+            value: String(reliabilitySnapshot.failureCount),
+            label: '最终失败请求',
+          },
+          {
+            value: `${reliabilitySnapshot.trackedStatusCounts[429]} / ${reliabilitySnapshot.trackedStatusCounts[403]} / ${reliabilitySnapshot.trackedStatusCounts['5xx']}`,
+            label: '请求级 429 / 403 / 5xx',
+          },
+        ];
+        for (const reliabilityMetric of reliabilityMetrics) {
+          const metricElement = document.createElement('div');
+          metricElement.className = 'sub2-reliability-metric';
+          const metricValue = document.createElement('span');
+          metricValue.className = 'sub2-reliability-value';
+          metricValue.textContent = reliabilityMetric.value;
+          const metricLabel = document.createElement('span');
+          metricLabel.className = 'sub2-reliability-label';
+          metricLabel.textContent = reliabilityMetric.label;
+          metricElement.append(metricValue, metricLabel);
+          reliabilityGrid.appendChild(metricElement);
+        }
+        const coverageNote = document.createElement('div');
+        coverageNote.className = 'sub2-diagnostics-note';
+        const requestCoverageLabel = reliabilitySnapshot.requestCoverageComplete
+          ? '请求记录覆盖完整'
+          : `请求超过单次 ${SUB2_RELIABILITY_HISTORY_LIMIT} 条读取上限，统计仅代表已读取样本`;
+        const failoverCoverageLabel = reliabilitySnapshot.failoverCoverageComplete
+          ? '故障转移关联覆盖完整'
+          : '错误摘要不完整，故障转移次数按已识别下限显示';
+        coverageNote.textContent = `${requestCoverageLabel}；${failoverCoverageLabel}。更新于 ${sub2FormatRelative(reliabilitySnapshot.generatedAt, now)}。`;
+        reliabilityCard.append(reliabilityGrid, coverageNote);
+      }
+      if (this.reliabilityError && reliabilitySnapshot) {
+        const staleDataNote = document.createElement('div');
+        staleDataNote.className = 'sub2-diagnostics-note';
+        staleDataNote.textContent = `${this.reliabilityError}；当前继续显示上次成功读取的统计。`;
+        reliabilityCard.appendChild(staleDataNote);
+      }
+      this.eventsBodyElement.appendChild(reliabilityCard);
+
+      const eventsCard = document.createElement('section');
+      eventsCard.className = 'sub2-events-card';
+      const eventsTitle = document.createElement('h3');
+      eventsTitle.textContent = `本地事件 · ${this.localEvents.length}`;
+      eventsCard.appendChild(eventsTitle);
+
+      const toolbar = document.createElement('div');
+      toolbar.className = 'sub2-events-toolbar';
+      const eventTypeSelect = document.createElement('select');
+      eventTypeSelect.title = '按事件类型筛选';
+      const eventTypeOptions = [
+        { value: '', label: '全部事件' },
+        { value: 'status-429', label: '429 限流' },
+        { value: 'status-403', label: '403 鉴权' },
+        { value: 'status-5xx', label: '5xx 上游' },
+        { value: 'cooldown', label: '冷却变化' },
+        { value: 'hit-change', label: '命中变化' },
+      ];
+      for (const optionDefinition of eventTypeOptions) {
+        const optionElement = document.createElement('option');
+        optionElement.value = optionDefinition.value;
+        optionElement.textContent = optionDefinition.label;
+        eventTypeSelect.appendChild(optionElement);
+      }
+      eventTypeSelect.value = this.eventTypeFilter;
+      eventTypeSelect.addEventListener('change', () => {
+        this.eventTypeFilter = eventTypeSelect.value;
+        this.renderEventsDrawer();
+      });
+
+      const retentionSelect = document.createElement('select');
+      retentionSelect.title = '本地事件保留时间';
+      for (const retentionDays of SUB2_EVENT_RETENTION_OPTIONS) {
+        const optionElement = document.createElement('option');
+        optionElement.value = String(retentionDays);
+        optionElement.textContent = retentionDays === 1 ? '保留 24 小时' : `保留 ${retentionDays} 天`;
+        retentionSelect.appendChild(optionElement);
+      }
+      retentionSelect.value = String(this.eventRetentionDays);
+      retentionSelect.addEventListener('change', () => this.setEventRetentionDays(retentionSelect.value));
+
+      const clearButton = document.createElement('button');
+      clearButton.type = 'button';
+      clearButton.className = 'sub2-events-clear';
+      clearButton.textContent = '清空';
+      clearButton.disabled = this.localEvents.length === 0;
+      clearButton.addEventListener('click', () => this.clearLocalEvents());
+      toolbar.append(eventTypeSelect, retentionSelect, clearButton);
+      eventsCard.appendChild(toolbar);
+
+      const policyNote = document.createElement('div');
+      policyNote.className = 'sub2-events-policy';
+      policyNote.textContent = `事件只保存在当前浏览器，按保留天数自动清理，并限制最多 ${SUB2_LOCAL_EVENT_LIMIT} 条；切换保留期会立即清理过期事件。`;
+      eventsCard.appendChild(policyNote);
+
+      const matchingEvents = this.localEvents.filter(
+        (localEvent) => !this.eventTypeFilter || localEvent.type === this.eventTypeFilter,
+      );
+      const eventList = document.createElement('div');
+      eventList.className = 'sub2-event-list';
+      for (const localEvent of matchingEvents.slice(0, 150)) {
+        const eventItem = document.createElement('div');
+        eventItem.className = `sub2-event-item ${localEvent.tone}`;
+        const eventHead = document.createElement('div');
+        eventHead.className = 'sub2-event-head';
+        const eventTitle = document.createElement('span');
+        eventTitle.className = 'sub2-event-title';
+        const accountLabel = localEvent.accountId
+          ? this.getAccountDisplayName(localEvent.accountId, localEvent.accountName)
+          : '';
+        eventTitle.textContent = `${localEvent.title || '可靠性事件'}${accountLabel ? ` · ${accountLabel}` : ''}`;
+        const eventTime = document.createElement('span');
+        eventTime.className = 'sub2-event-time';
+        eventTime.textContent = sub2FormatRelative(localEvent.occurredAt, now);
+        eventHead.append(eventTitle, eventTime);
+        const eventDetail = document.createElement('div');
+        eventDetail.className = 'sub2-event-detail';
+        eventDetail.textContent = localEvent.detail || '没有附加详情。';
+        const eventMetadata = document.createElement('div');
+        eventMetadata.className = 'sub2-event-meta';
+        eventMetadata.textContent = [
+          localEvent.statusCode ? `状态 ${localEvent.statusCode}` : '',
+          localEvent.model ? `模型 ${localEvent.model}` : '',
+          localEvent.requestId ? `请求 ${localEvent.requestId}` : '',
+          `来源 ${localEvent.source}`,
+        ].filter(Boolean).join(' · ');
+        eventItem.append(eventHead, eventDetail, eventMetadata);
+        eventList.appendChild(eventItem);
+      }
+      if (!matchingEvents.length) {
+        const emptyNote = document.createElement('div');
+        emptyNote.className = 'sub2-diagnostics-note';
+        emptyNote.textContent = this.localEvents.length
+          ? '没有符合当前筛选条件的事件。'
+          : '暂无本地事件。刷新会记录真实错误和账号状态变化；打开事件中心会回填近 24 小时可读取的错误。';
+        eventList.appendChild(emptyNote);
+      } else if (matchingEvents.length > 150) {
+        const overflowNote = document.createElement('div');
+        overflowNote.className = 'sub2-diagnostics-note';
+        overflowNote.textContent = `当前只渲染最新 150 条，另有 ${matchingEvents.length - 150} 条仍按本地策略保留。`;
+        eventList.appendChild(overflowNote);
+      }
+      eventsCard.appendChild(eventList);
+      this.eventsBodyElement.appendChild(eventsCard);
+      this.eventsBodyElement.scrollTop = savedScrollTop;
+    }
+
     getDiagnosticsRequest() {
       if (!this.selectedDiagnosticsRequestKey) return this.recentRequest || this.requestHistory[0] || null;
       return this.requestHistory.find(
@@ -3394,6 +4090,7 @@
     }
 
     openDiagnosticsDrawer() {
+      this.closeEventsDrawer();
       this.routeReplayRequestSequence += 1;
       this.selectedDiagnosticsRequestKey = '';
       this.selectedRouteReplay = null;
@@ -3675,6 +4372,8 @@
     }
 
     async openModelDrawer(account) {
+      this.closeEventsDrawer();
+      this.closeDiagnosticsDrawer();
       const requestSequence = ++this.modelRequestSequence;
       this.modelAccount = account;
       this.models = [];
@@ -3994,6 +4693,18 @@
     sub2ExtractRoutingStatusCode,
     sub2NormalizeRoutingError,
     sub2GetCorrelatedRoutingErrors,
+    sub2NormalizeRoutingErrors,
+    sub2IsTrackedReliabilityStatus,
+    sub2GetReliabilityEventType,
+    sub2NormalizeLocalEvent,
+    sub2NormalizeEventRetentionDays,
+    sub2PruneLocalEvents,
+    sub2MergeLocalEvents,
+    sub2BuildRequestStatusEvents,
+    sub2NormalizeObservationSnapshot,
+    sub2BuildObservationSnapshot,
+    sub2BuildObservationTransitionEvents,
+    sub2BuildReliabilitySnapshot,
     sub2BuildRouteChain,
     sub2BuildRecentRoutingErrorIndex,
     sub2MergeRouteFailuresIntoErrorIndex,
