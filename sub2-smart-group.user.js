@@ -2,9 +2,9 @@
 // @name         Sub2 Smart Group
 // @name:zh-CN   Sub2 智能分组
 // @namespace    local.sub2.smart-group
-// @version      2.1.0
-// @description  Sub2 account health, capacity, route diagnostics, quota controls, and manual upstream model sync (no active health probing).
-// @description:zh-CN 为 sub2api 提供账号健康度、容量、路由诊断、配额控制与手动上游模型同步（不主动测活）
+// @version      2.2.0
+// @description  Sub2 account health, route history, protected capacity controls, quota controls, and manual model sync (no active probing).
+// @description:zh-CN 为 sub2api 提供账号健康度、路由历史、受保护的容量与配额控制、手动模型同步（不主动测活）
 // @license      MIT
 // @homepageURL   https://github.com/hong594/sub2-smart-group
 // @supportURL    https://github.com/hong594/sub2-smart-group/issues
@@ -47,13 +47,13 @@
   //   POST /api/v1/admin/accounts/today-stats/batch   今日真实用量（请求数 / 花费）
   //   GET  /api/v1/admin/groups/all                    完整分组列表
   //   GET  /api/v1/admin/ops/concurrency               当前容量 / 并发 / 排队快照
-  //   GET  /api/v1/admin/ops/requests                  最近成功请求
+  //   GET  /api/v1/admin/ops/requests                  最近真实请求
   //   GET  /api/v1/admin/ops/upstream-errors           真实上游故障摘要
   //   GET  /api/v1/admin/ops/upstream-errors/:id       故障转移事件详情
   // 手动操作（不读取或提交 API Key）：
   //   POST /api/v1/admin/accounts/:id/schedulable      摘出 / 挂回调度池
   //   POST /api/v1/admin/accounts/:id/recover-state    清除冷却 / 恢复
-  //   PUT  /api/v1/admin/accounts/:id                  仅调整账号优先级
+  //   PUT  /api/v1/admin/accounts/:id                  仅调整账号优先级 / 并发容量
   //   GET  /api/v1/admin/accounts/:id/models           查看 sub2 已保存的模型
   //   POST /api/v1/admin/accounts/:id/models/sync-upstream
   //                                                        用户点击后拉取并同步上游模型
@@ -67,9 +67,11 @@
   const SUB2_API_BASE = '/api/v1';
   const SUB2_POLL_SECONDS = 10;
   const SUB2_ROUTING_LOOKBACK_MS = 30 * 60 * 1000;
+  const SUB2_REQUEST_HISTORY_LIMIT = 30;
+  const SUB2_CAPACITY_MAX = 10000;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '2.1.0';
+    : '2.2.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -157,6 +159,17 @@
     if (hours < 24) return `${hours} 小时前`;
     const days = Math.floor(hours / 24);
     return `${days} 天前`;
+  }
+
+  function sub2FormatDuration(durationMs) {
+    if (durationMs === null || durationMs === undefined || durationMs === '') return '耗时未知';
+    const numericDuration = Number(durationMs);
+    if (!Number.isFinite(numericDuration) || numericDuration < 0) return '耗时未知';
+    if (numericDuration < 1000) return `${Math.round(numericDuration)} ms`;
+    if (numericDuration < 60000) return `${(numericDuration / 1000).toFixed(numericDuration < 10000 ? 1 : 0)} 秒`;
+    const wholeMinutes = Math.floor(numericDuration / 60000);
+    const remainingSeconds = Math.round((numericDuration % 60000) / 1000);
+    return remainingSeconds > 0 ? `${wholeMinutes} 分 ${remainingSeconds} 秒` : `${wholeMinutes} 分钟`;
   }
 
   function sub2GetNumericAccountField(account, fieldName) {
@@ -481,24 +494,96 @@
     return [];
   }
 
+  function sub2IsPaginatedPayloadComplete(payload) {
+    const items = sub2GetPaginatedItems(payload);
+    const numericTotal = Number(payload?.total);
+    return !Number.isFinite(numericTotal) || numericTotal <= items.length;
+  }
+
+  function sub2NormalizeRequestHistory(payload) {
+    const normalizedRequests = [];
+    for (const requestItem of sub2GetPaginatedItems(payload)) {
+      const createdAt = Date.parse(requestItem?.created_at);
+      if (!Number.isFinite(createdAt)) continue;
+
+      const kind = requestItem?.kind === 'error' ? 'error' : 'success';
+      const numericAccountId = Number(requestItem?.account_id);
+      const numericGroupId = Number(requestItem?.group_id);
+      const rawDurationMs = requestItem?.duration_ms;
+      const numericDurationMs = Number(rawDurationMs);
+      const numericStatusCode = Number(requestItem?.status_code);
+      const numericErrorId = Number(requestItem?.error_id);
+      const requestId = String(requestItem?.request_id || '').trim();
+      normalizedRequests.push({
+        accountId: Number.isInteger(numericAccountId) && numericAccountId > 0 ? numericAccountId : null,
+        createdAt,
+        durationMs: rawDurationMs !== null
+          && rawDurationMs !== undefined
+          && Number.isFinite(numericDurationMs)
+          && numericDurationMs >= 0
+          ? numericDurationMs
+          : null,
+        errorId: Number.isInteger(numericErrorId) && numericErrorId > 0 ? numericErrorId : null,
+        groupId: Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null,
+        kind,
+        message: String(requestItem?.message || '').trim(),
+        model: String(requestItem?.model || '').trim(),
+        phase: String(requestItem?.phase || '').trim(),
+        platform: String(requestItem?.platform || '').trim(),
+        requestId,
+        routeStatus: kind === 'error' ? 'error' : 'unknown',
+        source: 'ops',
+        statusCode: Number.isInteger(numericStatusCode) && numericStatusCode >= 100 && numericStatusCode <= 599
+          ? numericStatusCode
+          : null,
+      });
+    }
+    return normalizedRequests.sort((leftRequest, rightRequest) => rightRequest.createdAt - leftRequest.createdAt);
+  }
+
+  function sub2GetRequestHistoryKey(requestItem) {
+    const requestId = String(requestItem?.requestId || '').trim();
+    if (requestId) return requestId;
+    return [
+      requestItem?.kind || 'unknown',
+      Number(requestItem?.createdAt) || 0,
+      Number(requestItem?.accountId) || 0,
+      requestItem?.model || '',
+    ].join(':');
+  }
+
+  function sub2AnnotateRequestHistory(requestHistory, errorPayload, errorCoverageComplete) {
+    return (Array.isArray(requestHistory) ? requestHistory : []).map((requestItem) => {
+      if (requestItem.kind === 'error') return { ...requestItem, routeStatus: 'error' };
+      const correlatedErrors = sub2GetCorrelatedRoutingErrors(errorPayload, requestItem);
+      return {
+        ...requestItem,
+        routeStatus: correlatedErrors.length
+          ? 'failover'
+          : errorCoverageComplete ? 'direct' : 'unknown',
+      };
+    });
+  }
+
   function sub2NormalizeRecentRequest(payload) {
-    const recentRequest = sub2GetPaginatedItems(payload).find((item) => item?.kind === 'success') || null;
-    if (!recentRequest) return null;
+    return sub2NormalizeRequestHistory(payload).find(
+      (requestItem) => requestItem.kind === 'success' && requestItem.accountId,
+    ) || null;
+  }
 
-    const accountId = Number(recentRequest.account_id);
-    const createdAt = Date.parse(recentRequest.created_at);
-    if (!Number.isInteger(accountId) || accountId <= 0 || !Number.isFinite(createdAt)) return null;
-
-    const numericGroupId = Number(recentRequest.group_id);
-    return {
-      accountId,
-      createdAt,
-      groupId: Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null,
-      platform: String(recentRequest.platform || '').trim(),
-      model: String(recentRequest.model || '').trim(),
-      requestId: String(recentRequest.request_id || '').trim(),
-      source: 'ops',
-    };
+  function sub2ParseCapacityInput(rawCapacity, maximumCapacity = SUB2_CAPACITY_MAX) {
+    const normalizedValue = String(rawCapacity ?? '').trim();
+    if (!/^\d+$/.test(normalizedValue)) {
+      return { value: null, error: '容量必须是正整数。' };
+    }
+    const numericCapacity = Number(normalizedValue);
+    if (!Number.isSafeInteger(numericCapacity) || numericCapacity < 1) {
+      return { value: null, error: '容量必须至少为 1。' };
+    }
+    if (numericCapacity > maximumCapacity) {
+      return { value: null, error: `容量不能超过 ${maximumCapacity}。` };
+    }
+    return { value: numericCapacity, error: '' };
   }
 
   function sub2ExtractRoutingStatusCode(errorItem) {
@@ -697,7 +782,22 @@
       }
     }
 
-    if (recentRequest) {
+    if (recentRequest?.kind === 'error' && recentRequest.accountId) {
+      uniqueEvents.push({
+        type: 'failure',
+        accountId: recentRequest.accountId,
+        accountName: '',
+        occurredAt: recentRequest.createdAt,
+        statusCode: recentRequest.statusCode,
+        platform: recentRequest.platform,
+        kind: 'request_error',
+        stage: recentRequest.phase,
+        scope: '',
+        reason: recentRequest.message || '请求最终失败',
+        sequence: sequence++,
+        source: 'request',
+      });
+    } else if (recentRequest) {
       uniqueEvents.push({
         type: 'success',
         accountId: recentRequest.accountId,
@@ -727,7 +827,9 @@
         ? detailsComplete && summaryFallbackCount === 0 && unresolvedRecoveredSummaryCount === 0
           ? 'detailed'
           : 'partial'
-        : correlatedErrors.length ? 'summary' : 'success-only',
+        : correlatedErrors.length
+          ? 'summary'
+          : recentRequest?.kind === 'error' ? 'request-error' : 'success-only',
       unresolvedRecoveredSummaryCount,
     };
   }
@@ -1696,7 +1798,7 @@
     const [requestResult, errorResult, concurrencyResult] = await Promise.allSettled([
       sub2ApiRequestWithTimeout(
         'GET',
-        '/admin/ops/requests?time_range=30m&kind=success&sort=created_at_desc&page=1&page_size=1',
+        `/admin/ops/requests?time_range=30m&kind=all&sort=created_at_desc&page=1&page_size=${SUB2_REQUEST_HISTORY_LIMIT}`,
       ),
       sub2ApiRequestWithTimeout(
         'GET',
@@ -1705,9 +1807,19 @@
       sub2ApiRequestWithTimeout('GET', '/admin/ops/concurrency'),
     ]);
 
-    const recentRequest = requestResult.status === 'fulfilled'
-      ? sub2NormalizeRecentRequest(requestResult.value)
-      : null;
+    const normalizedRequestHistory = requestResult.status === 'fulfilled'
+      ? sub2NormalizeRequestHistory(requestResult.value)
+      : [];
+    const requestHistory = sub2AnnotateRequestHistory(
+      normalizedRequestHistory,
+      errorResult.status === 'fulfilled' ? errorResult.value : null,
+      errorResult.status === 'fulfilled' && sub2IsPaginatedPayloadComplete(errorResult.value),
+    );
+    const recentRequest = requestHistory.find(
+      (requestItem) => requestItem.kind === 'success' && requestItem.accountId,
+    ) || null;
+    const errorCoverageComplete = errorResult.status === 'fulfilled'
+      && sub2IsPaginatedPayloadComplete(errorResult.value);
     const correlatedErrors = errorResult.status === 'fulfilled'
       ? sub2GetCorrelatedRoutingErrors(errorResult.value, recentRequest)
       : [];
@@ -1726,7 +1838,8 @@
     const detailPayloads = detailResults
       .filter((detailResult) => detailResult.status === 'fulfilled')
       .map((detailResult) => detailResult.value);
-    const routeDetailsComplete = correlatedErrorIds.length === fetchedErrorIds.length
+    const routeDetailsComplete = errorCoverageComplete
+      && correlatedErrorIds.length === fetchedErrorIds.length
       && detailResults.every((detailResult) => detailResult.status === 'fulfilled');
     const concurrencySnapshot = concurrencyResult.status === 'fulfilled'
       ? sub2NormalizeConcurrencySnapshot(concurrencyResult.value)
@@ -1745,13 +1858,59 @@
     return {
       requestsAvailable: requestResult.status === 'fulfilled',
       errorsAvailable: errorResult.status === 'fulfilled',
+      errorsComplete: errorCoverageComplete,
       concurrencyAvailable: concurrencyResult.status === 'fulfilled',
       recentRequest,
+      requestHistory,
       errorByAccountId,
       routeChain,
       routeDetailsAvailable: errorResult.status === 'fulfilled'
         && (!correlatedErrorIds.length || routeDetailsComplete),
       concurrencySnapshot,
+    };
+  }
+
+  async function sub2FetchRouteReplay(requestItem) {
+    const requestId = String(requestItem?.requestId || '').trim();
+    if (!requestId) {
+      return {
+        errorsAvailable: false,
+        errorsComplete: false,
+        routeChain: sub2BuildRouteChain(requestItem, [], [], false),
+        routeDetailsAvailable: false,
+      };
+    }
+
+    const encodedRequestId = encodeURIComponent(requestId);
+    const errorPayload = await sub2ApiRequestWithTimeout(
+      'GET',
+      `/admin/ops/upstream-errors?time_range=24h&page=1&page_size=100&q=${encodedRequestId}`,
+      undefined,
+      5000,
+    );
+    const errorCoverageComplete = sub2IsPaginatedPayloadComplete(errorPayload);
+    const correlatedErrors = sub2GetCorrelatedRoutingErrors(errorPayload, requestItem);
+    const correlatedErrorIds = correlatedErrors
+      .map((routingError) => routingError.id)
+      .filter((errorId, index, errorIds) => errorId && errorIds.indexOf(errorId) === index);
+    const fetchedErrorIds = correlatedErrorIds.slice(0, 8);
+    const detailResults = await Promise.allSettled(fetchedErrorIds.map((errorId) => sub2ApiRequestWithTimeout(
+      'GET',
+      `/admin/ops/upstream-errors/${errorId}`,
+      undefined,
+      3500,
+    )));
+    const detailPayloads = detailResults
+      .filter((detailResult) => detailResult.status === 'fulfilled')
+      .map((detailResult) => detailResult.value);
+    const routeDetailsComplete = errorCoverageComplete
+      && correlatedErrorIds.length === fetchedErrorIds.length
+      && detailResults.every((detailResult) => detailResult.status === 'fulfilled');
+    return {
+      errorsAvailable: true,
+      errorsComplete: errorCoverageComplete,
+      routeChain: sub2BuildRouteChain(requestItem, correlatedErrors, detailPayloads, routeDetailsComplete),
+      routeDetailsAvailable: !correlatedErrorIds.length || routeDetailsComplete,
     };
   }
 
@@ -1777,6 +1936,11 @@
   async function sub2UpdatePriority(account, priority) {
     // 只更新账号级 priority，避免 group_ids 触发分组关联重建并覆盖组内优先级。
     return sub2ApiRequest('PUT', `/admin/accounts/${account.id}`, { priority });
+  }
+
+  async function sub2UpdateCapacity(account, concurrency) {
+    // 官方更新 DTO 将 concurrency 定义为指针；只提交该字段不会重写凭据、分组或优先级。
+    return sub2ApiRequest('PUT', `/admin/accounts/${account.id}`, { concurrency });
   }
 
   async function sub2UpdateDailyQuota(account, dailyLimit) {
@@ -1911,6 +2075,16 @@
     #${SUB2_PANEL_ID} .sub2-quota-prefix{padding:0 6px;color:#0369a1;font-weight:700;}
     #${SUB2_PANEL_ID} .sub2-quota-input{width:100%;min-width:0;border:none;outline:none;padding:5px 6px 5px 0;font-size:12px;color:#0f172a;}
     #${SUB2_PANEL_ID} .sub2-quota-help{grid-column:1 / -1;color:#64748b;font-size:10px;line-height:1.4;}
+    #${SUB2_PANEL_ID} .sub2-capacity-editor{display:grid;grid-template-columns:auto minmax(72px,1fr) auto auto;align-items:center;gap:6px;
+      padding:7px;border:1px solid #c4b5fd;border-radius:8px;background:#f5f3ff;}
+    #${SUB2_PANEL_ID} .sub2-capacity-editor[hidden]{display:none;}
+    #${SUB2_PANEL_ID} .sub2-capacity-step{width:28px;height:28px;border:1px solid #c4b5fd;border-radius:6px;background:#fff;color:#5b21b6;
+      font-size:16px;font-weight:700;line-height:1;cursor:pointer;}
+    #${SUB2_PANEL_ID} .sub2-capacity-input{width:100%;min-width:0;box-sizing:border-box;border:1px solid #a78bfa;border-radius:6px;
+      padding:5px 6px;color:#0f172a;font-size:12px;text-align:center;outline:none;}
+    #${SUB2_PANEL_ID} .sub2-capacity-help{grid-column:1 / -1;color:#64748b;font-size:10px;line-height:1.45;}
+    #${SUB2_PANEL_ID} .sub2-capacity-warning{grid-column:1 / -1;color:#b45309;font-size:10px;line-height:1.45;}
+    #${SUB2_PANEL_ID} .sub2-capacity-warning:empty{display:none;}
     #${SUB2_PANEL_ID} .sub2-status{padding:6px 12px;border-top:1px solid #f1f5f9;font-size:11px;color:#64748b;}
     #${SUB2_PANEL_ID} .sub2-status.error{color:#b91c1c;}
     #${SUB2_PANEL_ID} .sub2-model-overlay{position:absolute;inset:0;z-index:20;display:flex;justify-content:flex-end;
@@ -1949,6 +2123,23 @@
     #${SUB2_PANEL_ID} .sub2-diagnostics-body{flex:1;min-height:0;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:10px;}
     #${SUB2_PANEL_ID} .sub2-diagnostics-card{border:1px solid #e2e8f0;border-radius:9px;background:#fff;padding:9px;}
     #${SUB2_PANEL_ID} .sub2-diagnostics-card h3{margin:0 0 6px;font-size:12px;color:#0f172a;}
+    #${SUB2_PANEL_ID} .sub2-history-filters{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin-bottom:7px;}
+    #${SUB2_PANEL_ID} .sub2-history-filters select{min-width:0;width:100%;border:1px solid #cbd5e1;border-radius:6px;padding:4px 5px;
+      background:#fff;color:#334155;font-size:10px;outline:none;}
+    #${SUB2_PANEL_ID} .sub2-history-list{display:flex;flex-direction:column;gap:5px;max-height:230px;overflow-y:auto;}
+    #${SUB2_PANEL_ID} .sub2-history-item{width:100%;display:flex;align-items:center;gap:7px;box-sizing:border-box;border:1px solid #e2e8f0;
+      border-radius:7px;padding:6px 7px;background:#f8fafc;color:#334155;text-align:left;cursor:pointer;}
+    #${SUB2_PANEL_ID} .sub2-history-item:hover{border-color:#93c5fd;background:#eff6ff;}
+    #${SUB2_PANEL_ID} .sub2-history-item.selected{border-color:#60a5fa;background:#dbeafe;box-shadow:0 0 0 1px rgba(59,130,246,.12);}
+    #${SUB2_PANEL_ID} .sub2-history-main{flex:1;min-width:0;}
+    #${SUB2_PANEL_ID} .sub2-history-title{display:block;font-size:10px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-history-meta{display:block;margin-top:2px;color:#64748b;font-size:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-history-badges{display:flex;flex-direction:column;align-items:flex-end;gap:3px;}
+    #${SUB2_PANEL_ID} .sub2-history-badge{padding:1px 5px;border-radius:999px;background:#e2e8f0;color:#475569;font-size:8px;font-weight:750;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-history-badge.success{background:#dcfce7;color:#166534;}
+    #${SUB2_PANEL_ID} .sub2-history-badge.error{background:#fee2e2;color:#991b1b;}
+    #${SUB2_PANEL_ID} .sub2-history-badge.failover{background:#ffedd5;color:#9a3412;}
+    #${SUB2_PANEL_ID} .sub2-history-badge.direct{background:#e0f2fe;color:#075985;}
     #${SUB2_PANEL_ID} .sub2-request-facts{display:flex;flex-wrap:wrap;gap:5px 9px;color:#475569;font-size:11px;line-height:1.5;}
     #${SUB2_PANEL_ID} .sub2-diagnostics-note{padding:7px 9px;border-radius:7px;background:#f8fafc;color:#64748b;font-size:10px;line-height:1.5;}
     #${SUB2_PANEL_ID} .sub2-route-chain{display:flex;flex-direction:column;gap:0;}
@@ -2005,12 +2196,24 @@
       this.groupsById = new Map();
       this.statsById = {};
       this.recentRequest = null;
+      this.requestHistory = [];
+      this.selectedDiagnosticsRequestKey = '';
+      this.selectedRouteReplay = null;
+      this.routeReplayCache = new Map();
+      this.routeReplayLoading = false;
+      this.routeReplayError = '';
+      this.routeReplayRequestSequence = 0;
+      this.historyModelFilter = '';
+      this.historyGroupFilter = '';
+      this.historyAccountFilter = '';
+      this.historyRouteFilter = '';
       this.latestHit = null;
       this.recentRoutingErrorByAccountId = new Map();
       this.routeChain = { events: [], detailLevel: 'success-only' };
       this.routeDetailsAvailable = false;
       this.routingRequestsAvailable = false;
       this.routingErrorsAvailable = false;
+      this.routingErrorsComplete = false;
       this.concurrencyAvailable = false;
       this.concurrencyEnabled = false;
       this.concurrencyTimestamp = 0;
@@ -2024,6 +2227,7 @@
       this.pendingRefresh = false;
       this.refreshRequestSequence = 0;
       this.quotaSaving = false;
+      this.capacitySaving = false;
       this.busyIds = new Set();
       this.filterText = '';
       this.viewMode = String(sub2StorageGet('viewMode', 'group')) === 'flat' ? 'flat' : 'group';
@@ -2056,16 +2260,16 @@
       this.mount();
       this.refresh();
       this.refreshTimer = window.setInterval(() => {
-        if (!this.minimized && document.visibilityState !== 'hidden' && !this.isQuotaInteractionActive()) this.refresh();
+        if (!this.minimized && document.visibilityState !== 'hidden' && !this.isAccountInteractionActive()) this.refresh();
       }, SUB2_POLL_SECONDS * 1000);
       this.visibilityHandler = () => {
-        if (!this.minimized && document.visibilityState === 'visible' && !this.isQuotaInteractionActive()) this.refresh();
+        if (!this.minimized && document.visibilityState === 'visible' && !this.isAccountInteractionActive()) this.refresh();
       };
       document.addEventListener('visibilitychange', this.visibilityHandler);
       // 每秒重绘倒计时：仅当存在“冷却中”的账号时才重建列表，
       // 避免无谓的每秒全量重建把滚动位置顶掉（会表现为面板每秒自己往下滚）。
       this.tickTimer = window.setInterval(() => {
-        if (this.minimized || !this.accounts.length || this.isQuotaInteractionActive()) return;
+        if (this.minimized || !this.accounts.length || this.isAccountInteractionActive()) return;
         const now = Date.now();
         const hasCountdown = this.accounts.some((account) => sub2ComputeHealth(account, now).coolingUntil > now);
         if (hasCountdown) this.renderList();
@@ -2094,7 +2298,7 @@
         <div class="sub2-head">
           <b>Sub2 账号健康 / 路由 <span class="sub2-version">v${SUB2_SCRIPT_VERSION}</span></b>
           <div class="sub2-head-actions">
-            <button type="button" class="sub2-diagnostics-open">路由诊断</button>
+            <button type="button" class="sub2-diagnostics-open">路由历史</button>
             <button class="sub2-min" title="最小化">—</button>
           </div>
         </div>
@@ -2159,8 +2363,8 @@
           <section class="sub2-diagnostics-drawer" role="dialog" aria-modal="true" aria-labelledby="sub2-diagnostics-title">
             <div class="sub2-diagnostics-head">
               <div>
-                <strong id="sub2-diagnostics-title" class="sub2-diagnostics-title">最近路由诊断</strong>
-                <div class="sub2-diagnostics-subtitle">只读分析真实流量与当前配置；不测活、不自动改路由。</div>
+                <strong id="sub2-diagnostics-title" class="sub2-diagnostics-title">请求历史 / 路由回放</strong>
+                <div class="sub2-diagnostics-subtitle">查看真实请求并按需回放路由；不测活、不自动改路由。</div>
               </div>
               <button type="button" class="sub2-diagnostics-close" title="关闭" aria-label="关闭路由诊断">×</button>
             </div>
@@ -2260,8 +2464,15 @@
       return Boolean(this.root?.querySelector('.sub2-quota-editor:not([hidden])'));
     }
 
-    isQuotaInteractionActive() {
-      return this.quotaSaving || this.hasOpenQuotaEditor();
+    hasOpenCapacityEditor() {
+      return Boolean(this.root?.querySelector('.sub2-capacity-editor:not([hidden])'));
+    }
+
+    isAccountInteractionActive() {
+      return this.quotaSaving
+        || this.capacitySaving
+        || this.hasOpenQuotaEditor()
+        || this.hasOpenCapacityEditor();
     }
 
     setMinimized(minimized) {
@@ -2281,7 +2492,7 @@
         this.pendingRefresh = true;
         return;
       }
-      if (this.isQuotaInteractionActive()) return;
+      if (this.isAccountInteractionActive()) return;
 
       this.pendingRefresh = false;
       const requestSequence = ++this.refreshRequestSequence;
@@ -2300,7 +2511,7 @@
           nextStatsById = this.statsById || {};
         }
 
-        if (requestSequence !== this.refreshRequestSequence || this.isQuotaInteractionActive()) return;
+        if (requestSequence !== this.refreshRequestSequence || this.isAccountInteractionActive()) return;
 
         this.accounts = accounts;
         if (groups !== null) this.groupsById = sub2BuildGroupIndex(groups);
@@ -2314,7 +2525,7 @@
         this.lastUpdatedAt = Date.now();
         shouldRender = true;
       } catch (error) {
-        if (requestSequence === this.refreshRequestSequence && !this.isQuotaInteractionActive()) {
+        if (requestSequence === this.refreshRequestSequence && !this.isAccountInteractionActive()) {
           this.lastError = error?.status === 401
             ? '登录已失效，请重新登录 sub2 后台后再刷新。'
             : `读取失败：${error?.message || error}`;
@@ -2326,7 +2537,7 @@
         if (shouldRender && requestSequence === this.refreshRequestSequence) {
           this.refreshRoutingActivity(requestSequence);
         }
-        if (this.pendingRefresh && !this.isQuotaInteractionActive()) {
+        if (this.pendingRefresh && !this.isAccountInteractionActive()) {
           this.pendingRefresh = false;
           window.setTimeout(() => this.refresh(), 0);
         }
@@ -2339,14 +2550,25 @@
       if (
         routingRequestSequence !== this.routingRequestSequence
         || accountRequestSequence !== this.refreshRequestSequence
-        || this.isQuotaInteractionActive()
+        || this.isAccountInteractionActive()
       ) {
         return;
       }
 
       this.routingRequestsAvailable = routingActivity.requestsAvailable;
       this.routingErrorsAvailable = routingActivity.errorsAvailable;
+      this.routingErrorsComplete = routingActivity.errorsComplete;
       this.recentRequest = routingActivity.requestsAvailable ? routingActivity.recentRequest : null;
+      this.requestHistory = routingActivity.requestsAvailable ? routingActivity.requestHistory : [];
+      if (
+        this.selectedDiagnosticsRequestKey
+        && !this.requestHistory.some(
+          (requestItem) => sub2GetRequestHistoryKey(requestItem) === this.selectedDiagnosticsRequestKey,
+        )
+      ) {
+        this.selectedDiagnosticsRequestKey = '';
+        this.selectedRouteReplay = null;
+      }
       this.recentRoutingErrorByAccountId = routingActivity.errorsAvailable
         ? routingActivity.errorByAccountId
         : new Map();
@@ -2723,7 +2945,7 @@
           : null,
         recentError: this.recentRoutingErrorByAccountId.get(Number(account.id)) || null,
         groupsById: this.groupsById,
-        errorsAvailable: this.routingErrorsAvailable,
+        errorsAvailable: this.routingErrorsAvailable && this.routingErrorsComplete,
         routeChain: this.routeChain,
         concurrency: requestConcurrency,
         concurrencyAvailable: this.concurrencyAvailable,
@@ -2752,6 +2974,97 @@
       modelsBtn.disabled = busy;
       modelsBtn.addEventListener('click', () => this.openModelDrawer(account));
       actions.appendChild(modelsBtn);
+
+      const configuredCapacity = Number.isInteger(Number(account.concurrency))
+        ? Number(account.concurrency)
+        : 0;
+      const currentCapacityUsage = displayConcurrency?.currentInUse ?? 0;
+      const capacityBtn = document.createElement('button');
+      capacityBtn.className = 'sub2-btn primary';
+      capacityBtn.textContent = '容量';
+      capacityBtn.title = `人工调整账号并发容量；当前配置 ${configuredCapacity}`;
+      capacityBtn.disabled = busy;
+      actions.appendChild(capacityBtn);
+
+      const capacityEditor = document.createElement('div');
+      capacityEditor.className = 'sub2-capacity-editor';
+      capacityEditor.hidden = true;
+      const decreaseCapacityButton = document.createElement('button');
+      decreaseCapacityButton.type = 'button';
+      decreaseCapacityButton.className = 'sub2-capacity-step';
+      decreaseCapacityButton.textContent = '−';
+      decreaseCapacityButton.title = '输入值减 1（不会立即保存）';
+      const capacityInput = document.createElement('input');
+      capacityInput.className = 'sub2-capacity-input';
+      capacityInput.type = 'number';
+      capacityInput.min = '1';
+      capacityInput.max = String(SUB2_CAPACITY_MAX);
+      capacityInput.step = '1';
+      capacityInput.value = String(Math.max(1, configuredCapacity));
+      capacityInput.setAttribute('aria-label', '账号并发容量');
+      const increaseCapacityButton = document.createElement('button');
+      increaseCapacityButton.type = 'button';
+      increaseCapacityButton.className = 'sub2-capacity-step';
+      increaseCapacityButton.textContent = '+';
+      increaseCapacityButton.title = '输入值加 1（不会立即保存）';
+      const applyCapacityButton = document.createElement('button');
+      applyCapacityButton.type = 'button';
+      applyCapacityButton.className = 'sub2-btn primary';
+      applyCapacityButton.textContent = '应用';
+      applyCapacityButton.disabled = busy;
+      const capacityHelp = document.createElement('div');
+      capacityHelp.className = 'sub2-capacity-help';
+      capacityHelp.textContent = `配置 ${configuredCapacity} · 当前占用 ${currentCapacityUsage}`
+        + (displayConcurrency?.waitingInQueue > 0 ? ` · 排队 ${displayConcurrency.waitingInQueue}` : '')
+        + '；加减只改输入，点击“应用”才写入。';
+      const capacityWarning = document.createElement('div');
+      capacityWarning.className = 'sub2-capacity-warning';
+
+      const updateCapacityWarning = () => {
+        const parsedCapacity = sub2ParseCapacityInput(capacityInput.value);
+        if (parsedCapacity.error) {
+          capacityWarning.textContent = parsedCapacity.error;
+        } else if (parsedCapacity.value < currentCapacityUsage) {
+          capacityWarning.textContent = '新容量低于当前占用；不会中断已有请求，但新请求可能暂时排队。';
+        } else if (parsedCapacity.value === configuredCapacity) {
+          capacityWarning.textContent = '输入值与当前配置相同。';
+        } else {
+          capacityWarning.textContent = '';
+        }
+      };
+      const stepCapacityInput = (delta) => {
+        const parsedCapacity = sub2ParseCapacityInput(capacityInput.value);
+        const currentInputValue = parsedCapacity.error ? Math.max(1, configuredCapacity) : parsedCapacity.value;
+        capacityInput.value = String(Math.min(SUB2_CAPACITY_MAX, Math.max(1, currentInputValue + delta)));
+        updateCapacityWarning();
+      };
+      decreaseCapacityButton.addEventListener('click', () => stepCapacityInput(-1));
+      increaseCapacityButton.addEventListener('click', () => stepCapacityInput(1));
+      capacityInput.addEventListener('input', updateCapacityWarning);
+      capacityInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') this.handleCapacity(account, capacityInput.value);
+      });
+      applyCapacityButton.addEventListener('click', () => this.handleCapacity(account, capacityInput.value));
+      capacityEditor.append(
+        decreaseCapacityButton,
+        capacityInput,
+        increaseCapacityButton,
+        applyCapacityButton,
+        capacityHelp,
+        capacityWarning,
+      );
+      capacityBtn.addEventListener('click', () => {
+        const editorWillOpen = capacityEditor.hidden;
+        capacityEditor.hidden = !editorWillOpen;
+        if (editorWillOpen) {
+          this.refreshRequestSequence += 1;
+          updateCapacityWarning();
+          capacityInput.focus();
+          capacityInput.select();
+        } else {
+          this.refresh();
+        }
+      });
 
       let quotaEditor = null;
       let quotaInput = null;
@@ -2848,10 +3161,244 @@
       if (routingNote) row.appendChild(routingNote);
       row.appendChild(actions);
       if (quotaEditor) row.appendChild(quotaEditor);
+      row.appendChild(capacityEditor);
       return row;
     }
 
+    getDiagnosticsRequest() {
+      if (!this.selectedDiagnosticsRequestKey) return this.recentRequest || this.requestHistory[0] || null;
+      return this.requestHistory.find(
+        (requestItem) => sub2GetRequestHistoryKey(requestItem) === this.selectedDiagnosticsRequestKey,
+      ) || this.recentRequest;
+    }
+
+    getDiagnosticsRouteState(diagnosticsRequest) {
+      const isLatestSuccessRequest = diagnosticsRequest
+        && this.recentRequest
+        && sub2GetRequestHistoryKey(diagnosticsRequest) === sub2GetRequestHistoryKey(this.recentRequest);
+      if (isLatestSuccessRequest) {
+        return {
+          errorsAvailable: this.routingErrorsAvailable,
+          errorsComplete: this.routingErrorsComplete,
+          routeChain: this.routeChain,
+          routeDetailsAvailable: this.routeDetailsAvailable,
+        };
+      }
+      if (!this.selectedDiagnosticsRequestKey) {
+        return {
+          errorsAvailable: false,
+          errorsComplete: false,
+          routeChain: sub2BuildRouteChain(diagnosticsRequest, [], [], false),
+          routeDetailsAvailable: false,
+        };
+      }
+      if (this.selectedRouteReplay?.requestKey === sub2GetRequestHistoryKey(diagnosticsRequest)) {
+        return this.selectedRouteReplay;
+      }
+      return {
+        errorsAvailable: false,
+        errorsComplete: false,
+        routeChain: sub2BuildRouteChain(diagnosticsRequest, [], [], false),
+        routeDetailsAvailable: false,
+      };
+    }
+
+    createHistoryFilter(options, value, title, onChange) {
+      const selectElement = document.createElement('select');
+      selectElement.title = title;
+      for (const optionDefinition of options) {
+        const optionElement = document.createElement('option');
+        optionElement.value = optionDefinition.value;
+        optionElement.textContent = optionDefinition.label;
+        selectElement.appendChild(optionElement);
+      }
+      selectElement.value = options.some((optionDefinition) => optionDefinition.value === value) ? value : '';
+      selectElement.addEventListener('change', () => onChange(selectElement.value));
+      return selectElement;
+    }
+
+    renderRequestHistoryCard(now) {
+      const historyCard = document.createElement('section');
+      historyCard.className = 'sub2-diagnostics-card';
+      const historyTitle = document.createElement('h3');
+      historyTitle.textContent = `真实请求历史（最近 ${this.requestHistory.length} 条 / 30 分钟）`;
+      historyCard.appendChild(historyTitle);
+
+      if (!this.requestHistory.length) {
+        const historyEmpty = document.createElement('div');
+        historyEmpty.className = 'sub2-diagnostics-note';
+        historyEmpty.textContent = this.routingRequestsAvailable
+          ? '最近 30 分钟没有可展示的真实请求。'
+          : 'sub2 运维请求接口当前不可用。';
+        historyCard.appendChild(historyEmpty);
+        return historyCard;
+      }
+
+      const modelValues = [...new Set(this.requestHistory.map((requestItem) => requestItem.model).filter(Boolean))]
+        .sort((leftValue, rightValue) => leftValue.localeCompare(rightValue));
+      const groupValues = [...new Set(this.requestHistory.map((requestItem) => requestItem.groupId).filter(Boolean))]
+        .sort((leftValue, rightValue) => leftValue - rightValue);
+      const accountValues = [...new Set(this.requestHistory.map((requestItem) => requestItem.accountId).filter(Boolean))]
+        .sort((leftValue, rightValue) => this.getAccountDisplayName(leftValue).localeCompare(this.getAccountDisplayName(rightValue)));
+      const filtersElement = document.createElement('div');
+      filtersElement.className = 'sub2-history-filters';
+      filtersElement.append(
+        this.createHistoryFilter(
+          [{ value: '', label: '全部模型' }].concat(modelValues.map((model) => ({ value: model, label: model }))),
+          this.historyModelFilter,
+          '按模型筛选请求历史',
+          (value) => { this.historyModelFilter = value; this.renderDiagnosticsDrawer(); },
+        ),
+        this.createHistoryFilter(
+          [{ value: '', label: '全部分组' }].concat(groupValues.map((groupId) => ({
+            value: String(groupId),
+            label: String(sub2GetIndexedGroup(this.groupsById, groupId)?.name || `分组 ${groupId}`),
+          }))),
+          this.historyGroupFilter,
+          '按分组筛选请求历史',
+          (value) => { this.historyGroupFilter = value; this.renderDiagnosticsDrawer(); },
+        ),
+        this.createHistoryFilter(
+          [{ value: '', label: '全部账号' }].concat(accountValues.map((accountId) => ({
+            value: String(accountId),
+            label: this.getAccountDisplayName(accountId),
+          }))),
+          this.historyAccountFilter,
+          '按最终账号筛选请求历史',
+          (value) => { this.historyAccountFilter = value; this.renderDiagnosticsDrawer(); },
+        ),
+        this.createHistoryFilter([
+          { value: '', label: '全部结果' },
+          { value: 'direct', label: '直接成功' },
+          { value: 'failover', label: '故障转移成功' },
+          { value: 'error', label: '最终失败' },
+          { value: 'unknown', label: '链路未知' },
+        ], this.historyRouteFilter, '按路由结果筛选请求历史', (value) => {
+          this.historyRouteFilter = value;
+          this.renderDiagnosticsDrawer();
+        }),
+      );
+      historyCard.appendChild(filtersElement);
+
+      const matchingRequests = this.requestHistory.filter((requestItem) => {
+        if (this.historyModelFilter && requestItem.model !== this.historyModelFilter) return false;
+        if (this.historyGroupFilter && String(requestItem.groupId || '') !== this.historyGroupFilter) return false;
+        if (this.historyAccountFilter && String(requestItem.accountId || '') !== this.historyAccountFilter) return false;
+        if (this.historyRouteFilter && requestItem.routeStatus !== this.historyRouteFilter) return false;
+        return true;
+      });
+      const historyList = document.createElement('div');
+      historyList.className = 'sub2-history-list';
+      const selectedRequest = this.getDiagnosticsRequest();
+      const selectedRequestKey = selectedRequest ? sub2GetRequestHistoryKey(selectedRequest) : '';
+      const routeStatusLabels = {
+        direct: '直接成功',
+        failover: '故障转移',
+        error: '最终失败',
+        unknown: '链路未知',
+      };
+      for (const requestItem of matchingRequests) {
+        const requestKey = sub2GetRequestHistoryKey(requestItem);
+        const requestButton = document.createElement('button');
+        requestButton.type = 'button';
+        requestButton.className = `sub2-history-item${requestKey === selectedRequestKey ? ' selected' : ''}`;
+        requestButton.addEventListener('click', () => this.handleSelectDiagnosticsRequest(requestItem));
+        const requestMain = document.createElement('span');
+        requestMain.className = 'sub2-history-main';
+        const requestTitle = document.createElement('span');
+        requestTitle.className = 'sub2-history-title';
+        requestTitle.textContent = [
+          requestItem.model || '模型未知',
+          requestItem.accountId ? this.getAccountDisplayName(requestItem.accountId) : '账号未知',
+        ].join(' · ');
+        const requestMetadata = document.createElement('span');
+        requestMetadata.className = 'sub2-history-meta';
+        const group = requestItem.groupId ? sub2GetIndexedGroup(this.groupsById, requestItem.groupId) : null;
+        requestMetadata.textContent = [
+          sub2FormatRelative(requestItem.createdAt, now),
+          sub2FormatDuration(requestItem.durationMs),
+          group ? String(group.name || requestItem.groupId) : requestItem.groupId ? `分组 ${requestItem.groupId}` : '',
+        ].filter(Boolean).join(' · ');
+        requestMain.append(requestTitle, requestMetadata);
+        const requestBadges = document.createElement('span');
+        requestBadges.className = 'sub2-history-badges';
+        const outcomeBadge = document.createElement('span');
+        outcomeBadge.className = `sub2-history-badge ${requestItem.kind}`;
+        outcomeBadge.textContent = requestItem.kind === 'success' ? '成功' : `${requestItem.statusCode || ''} 失败`.trim();
+        const routeBadge = document.createElement('span');
+        routeBadge.className = `sub2-history-badge ${requestItem.routeStatus}`;
+        routeBadge.textContent = routeStatusLabels[requestItem.routeStatus] || '链路未知';
+        requestBadges.append(outcomeBadge, routeBadge);
+        requestButton.append(requestMain, requestBadges);
+        historyList.appendChild(requestButton);
+      }
+      if (!matchingRequests.length) {
+        const filteredEmpty = document.createElement('div');
+        filteredEmpty.className = 'sub2-diagnostics-note';
+        filteredEmpty.textContent = '没有符合当前筛选条件的请求。';
+        historyList.appendChild(filteredEmpty);
+      }
+      historyCard.appendChild(historyList);
+      return historyCard;
+    }
+
+    async handleSelectDiagnosticsRequest(requestItem) {
+      const requestKey = sub2GetRequestHistoryKey(requestItem);
+      this.selectedDiagnosticsRequestKey = requestKey;
+      this.routeReplayError = '';
+      const latestRequestKey = this.recentRequest ? sub2GetRequestHistoryKey(this.recentRequest) : '';
+      if (requestKey === latestRequestKey) {
+        this.selectedRouteReplay = null;
+        this.routeReplayLoading = false;
+        this.renderDiagnosticsDrawer();
+        return;
+      }
+
+      const cachedReplay = this.routeReplayCache.get(requestKey);
+      if (cachedReplay) {
+        this.selectedRouteReplay = cachedReplay;
+        this.routeReplayLoading = false;
+        this.renderDiagnosticsDrawer();
+        return;
+      }
+
+      const requestSequence = ++this.routeReplayRequestSequence;
+      this.routeReplayLoading = true;
+      this.selectedRouteReplay = null;
+      this.renderDiagnosticsDrawer();
+      try {
+        const replay = await sub2FetchRouteReplay(requestItem);
+        if (requestSequence !== this.routeReplayRequestSequence || this.selectedDiagnosticsRequestKey !== requestKey) return;
+        const cachedValue = { ...replay, requestKey };
+        this.routeReplayCache.set(requestKey, cachedValue);
+        this.selectedRouteReplay = cachedValue;
+        if (requestItem.kind === 'success') {
+          const hasFailureEvent = Array.isArray(replay.routeChain?.events)
+            && replay.routeChain.events.some((routeEvent) => routeEvent.type === 'failure');
+          this.requestHistory = this.requestHistory.map((historyItem) => sub2GetRequestHistoryKey(historyItem) === requestKey
+            ? {
+              ...historyItem,
+              routeStatus: hasFailureEvent ? 'failover' : replay.errorsComplete ? 'direct' : 'unknown',
+            }
+            : historyItem);
+        }
+      } catch (error) {
+        if (requestSequence !== this.routeReplayRequestSequence || this.selectedDiagnosticsRequestKey !== requestKey) return;
+        this.routeReplayError = `请求回放读取失败：${error?.message || error}`;
+      } finally {
+        if (requestSequence === this.routeReplayRequestSequence && this.selectedDiagnosticsRequestKey === requestKey) {
+          this.routeReplayLoading = false;
+          this.renderDiagnosticsDrawer();
+        }
+      }
+    }
+
     openDiagnosticsDrawer() {
+      this.routeReplayRequestSequence += 1;
+      this.selectedDiagnosticsRequestKey = '';
+      this.selectedRouteReplay = null;
+      this.routeReplayLoading = false;
+      this.routeReplayError = '';
       this.diagnosticsOpen = true;
       if (this.diagnosticsOverlayElement) this.diagnosticsOverlayElement.hidden = false;
       if (this.diagnosticsBodyElement) this.diagnosticsBodyElement.scrollTop = 0;
@@ -2874,8 +3421,10 @@
       const savedScrollTop = this.diagnosticsBodyElement.scrollTop;
       const now = Date.now();
       this.diagnosticsBodyElement.textContent = '';
+      this.diagnosticsBodyElement.appendChild(this.renderRequestHistoryCard(now));
+      const diagnosticsRequest = this.getDiagnosticsRequest();
 
-      if (!this.recentRequest) {
+      if (!diagnosticsRequest) {
         const emptyCard = document.createElement('section');
         emptyCard.className = 'sub2-diagnostics-card';
         const emptyTitle = document.createElement('h3');
@@ -2883,7 +3432,7 @@
         const emptyMessage = document.createElement('div');
         emptyMessage.className = 'sub2-diagnostics-note';
         emptyMessage.textContent = this.routingRequestsAvailable
-          ? '最近 30 分钟没有成功请求。脚本不会为了生成诊断而主动发送模型请求。'
+          ? '最近 30 分钟没有真实请求。脚本不会为了生成诊断而主动发送模型请求。'
           : 'sub2 运维请求接口当前不可用，无法建立请求级诊断。账号健康与容量仍按可用接口显示。';
         emptyCard.append(emptyTitle, emptyMessage);
         this.diagnosticsBodyElement.appendChild(emptyCard);
@@ -2893,67 +3442,83 @@
       const requestCard = document.createElement('section');
       requestCard.className = 'sub2-diagnostics-card';
       const requestTitle = document.createElement('h3');
-      requestTitle.textContent = '最近成功请求';
+      requestTitle.textContent = diagnosticsRequest.kind === 'success' ? '请求回放 · 成功' : '请求回放 · 失败';
       const requestFacts = document.createElement('div');
       requestFacts.className = 'sub2-request-facts';
-      const requestGroup = this.recentRequest.groupId
-        ? sub2GetIndexedGroup(this.groupsById, this.recentRequest.groupId)
+      const requestGroup = diagnosticsRequest.groupId
+        ? sub2GetIndexedGroup(this.groupsById, diagnosticsRequest.groupId)
         : null;
       const factValues = [
-        `命中 ${this.getAccountDisplayName(this.recentRequest.accountId)}`,
-        this.recentRequest.model ? `模型 ${this.recentRequest.model}` : '',
-        this.recentRequest.platform ? `平台 ${this.recentRequest.platform}` : '',
-        this.recentRequest.groupId
-          ? `分组 ${String(requestGroup?.name || this.recentRequest.groupId).trim()}`
+        diagnosticsRequest.accountId
+          ? `${diagnosticsRequest.kind === 'success' ? '命中' : '最终账号'} ${this.getAccountDisplayName(diagnosticsRequest.accountId)}`
+          : '最终账号 未记录',
+        diagnosticsRequest.model ? `模型 ${diagnosticsRequest.model}` : '',
+        diagnosticsRequest.platform ? `平台 ${diagnosticsRequest.platform}` : '',
+        diagnosticsRequest.groupId
+          ? `分组 ${String(requestGroup?.name || diagnosticsRequest.groupId).trim()}`
           : '',
-        `时间 ${sub2FormatRelative(this.recentRequest.createdAt, now)}`,
+        `时间 ${sub2FormatRelative(diagnosticsRequest.createdAt, now)}`,
+        sub2FormatDuration(diagnosticsRequest.durationMs),
+        diagnosticsRequest.statusCode ? `状态 ${diagnosticsRequest.statusCode}` : '',
       ].filter(Boolean);
       for (const factValue of factValues) {
         const fact = document.createElement('span');
         fact.textContent = factValue;
         requestFacts.appendChild(fact);
       }
-      if (this.recentRequest.requestId) {
+      if (diagnosticsRequest.requestId) {
         const requestId = document.createElement('span');
-        requestId.textContent = `请求 ${this.recentRequest.requestId.length > 22
-          ? `${this.recentRequest.requestId.slice(0, 19)}...`
-          : this.recentRequest.requestId}`;
-        requestId.title = this.recentRequest.requestId;
+        requestId.textContent = `请求 ${diagnosticsRequest.requestId.length > 22
+          ? `${diagnosticsRequest.requestId.slice(0, 19)}...`
+          : diagnosticsRequest.requestId}`;
+        requestId.title = diagnosticsRequest.requestId;
         requestFacts.appendChild(requestId);
       }
       requestCard.append(requestTitle, requestFacts);
       this.diagnosticsBodyElement.appendChild(requestCard);
 
+      const diagnosticsRouteState = this.getDiagnosticsRouteState(diagnosticsRequest);
+      const diagnosticsRouteChain = diagnosticsRouteState.routeChain || { events: [], detailLevel: 'success-only' };
       const routeCard = document.createElement('section');
       routeCard.className = 'sub2-diagnostics-card';
       const routeTitle = document.createElement('h3');
       routeTitle.textContent = '故障转移链';
       const routeNote = document.createElement('div');
       routeNote.className = 'sub2-diagnostics-note';
-      if (!this.routingErrorsAvailable) {
-        routeNote.textContent = '上游错误接口本次不可用，无法判断该成功请求之前是否发生过失败或降级。';
-      } else if (this.routeChain.detailLevel === 'detailed') {
-        routeNote.textContent = '详情链：来自该请求关联错误详情中的 upstream_errors，并追加最终成功账号。';
-      } else if (this.routeChain.detailLevel === 'partial') {
+      if (this.routeReplayLoading) {
+        routeNote.textContent = '正在按请求 ID 读取关联错误和详情；只在你点击历史记录时执行，不发送模型请求。';
+      } else if (this.routeReplayError) {
+        routeNote.textContent = this.routeReplayError;
+      } else if (!diagnosticsRouteState.errorsAvailable) {
+        routeNote.textContent = '上游错误接口本次不可用，无法判断该请求之前是否发生过失败或降级。';
+      } else if (!diagnosticsRouteState.errorsComplete && diagnosticsRouteChain.detailLevel === 'success-only') {
+        routeNote.textContent = '上游错误摘要超过本次读取上限，当前未匹配到该请求，不能据此断言它是直接成功。可点击该历史记录按请求 ID 精确回放。';
+      } else if (diagnosticsRouteChain.detailLevel === 'detailed') {
+        routeNote.textContent = diagnosticsRequest.kind === 'success'
+          ? '详情链：来自该请求关联错误详情中的 upstream_errors，并追加最终成功账号。'
+          : '详情链：来自该失败请求关联错误详情中的 upstream_errors，并追加最终失败节点。';
+      } else if (diagnosticsRouteChain.detailLevel === 'partial') {
         routeNote.textContent = '部分详情链：已合并成功读取的详情事件和其余关联摘要，可能仍缺少中间尝试，不能视为完整轨迹。';
-      } else if (this.routeChain.detailLevel === 'summary') {
+      } else if (diagnosticsRouteChain.detailLevel === 'summary') {
         routeNote.textContent = '摘要链：当前只拿到关联错误列表摘要，可能缺少中间尝试账号，不能视为完整轨迹。';
+      } else if (diagnosticsRouteChain.detailLevel === 'request-error') {
+        routeNote.textContent = '只确认请求最终失败，未读取到关联的上游尝试详情。';
       } else {
         routeNote.textContent = '未发现与该成功请求关联的上游失败，当前链路只包含最终成功账号。';
       }
       if (
-        this.routingErrorsAvailable
-        && !this.routeDetailsAvailable
-        && (this.routeChain.detailLevel === 'summary' || this.routeChain.detailLevel === 'partial')
+        diagnosticsRouteState.errorsAvailable
+        && !diagnosticsRouteState.routeDetailsAvailable
+        && (diagnosticsRouteChain.detailLevel === 'summary' || diagnosticsRouteChain.detailLevel === 'partial')
       ) {
         routeNote.textContent += ' 部分错误详情本次读取失败或超过读取上限。';
       }
-      if (this.routeChain.unresolvedRecoveredSummaryCount > 0) {
+      if (diagnosticsRouteChain.unresolvedRecoveredSummaryCount > 0) {
         routeNote.textContent += ' 已确认发生过恢复型故障，但摘要行只记录最终请求账号；失败账号需以详情事件为准。';
       }
       const routeChainElement = document.createElement('div');
       routeChainElement.className = 'sub2-route-chain';
-      const routeEvents = Array.isArray(this.routeChain?.events) ? this.routeChain.events : [];
+      const routeEvents = Array.isArray(diagnosticsRouteChain?.events) ? diagnosticsRouteChain.events : [];
       for (const routeEvent of routeEvents) {
         const routeEventElement = document.createElement('div');
         routeEventElement.className = `sub2-route-event${routeEvent.type === 'success' ? ' success' : ''}`;
@@ -2982,18 +3547,19 @@
       candidatesTitle.textContent = '更高优先级账号资格';
       const candidatesList = document.createElement('div');
       candidatesList.className = 'sub2-candidate-list';
-      const hitAccount = this.accounts.find(
-        (account) => Number(account?.id) === Number(this.recentRequest.accountId),
-      );
+      const requestSucceeded = diagnosticsRequest.kind === 'success' && Boolean(diagnosticsRequest.accountId);
+      const hitAccount = requestSucceeded
+        ? this.accounts.find((account) => Number(account?.id) === Number(diagnosticsRequest.accountId))
+        : null;
       const hitEffectivePriority = hitAccount
-        ? sub2GetEffectivePriority(hitAccount, this.recentRequest.groupId, this.groupsById)
+        ? sub2GetEffectivePriority(hitAccount, diagnosticsRequest.groupId, this.groupsById)
         : null;
       const candidateAccounts = hitAccount
         ? this.accounts
-          .filter((account) => Number(account?.id) !== Number(this.recentRequest.accountId))
+          .filter((account) => Number(account?.id) !== Number(diagnosticsRequest.accountId))
           .map((account) => ({
             account,
-            effectivePriority: sub2GetEffectivePriority(account, this.recentRequest.groupId, this.groupsById),
+            effectivePriority: sub2GetEffectivePriority(account, diagnosticsRequest.groupId, this.groupsById),
           }))
           .filter((candidate) => candidate.effectivePriority < hitEffectivePriority)
           .sort((leftCandidate, rightCandidate) => leftCandidate.effectivePriority - rightCandidate.effectivePriority
@@ -3007,7 +3573,12 @@
         eligible: '当前可候选',
         unknown: '仍需判断',
       };
-      if (!hitAccount) {
+      if (!requestSucceeded) {
+        const failedRequestNote = document.createElement('div');
+        failedRequestNote.className = 'sub2-diagnostics-note';
+        failedRequestNote.textContent = '该记录最终失败，没有最终成功账号，因此不进行更高优先级候选比较。';
+        candidatesList.appendChild(failedRequestNote);
+      } else if (!hitAccount) {
         const unavailableComparison = document.createElement('div');
         unavailableComparison.className = 'sub2-diagnostics-note';
         unavailableComparison.textContent = '最终成功账号不在当前账号列表中，仍可查看请求和故障转移链，但无法比较请求内有效优先级。';
@@ -3023,12 +3594,12 @@
         const accountId = Number(candidate.account.id);
         const savedModelState = this.savedModelsByAccountId.get(accountId) || null;
         const eligibility = sub2EvaluateCandidateEligibility(candidate.account, {
-          recentRequest: this.recentRequest,
+          recentRequest: diagnosticsRequest,
           groupsById: this.groupsById,
-          routeChain: this.routeChain,
+          routeChain: diagnosticsRouteChain,
           concurrency: sub2ResolveAccountConcurrency(
             accountId,
-            this.recentRequest.groupId,
+            diagnosticsRequest.groupId,
             this.concurrencyByAccountId,
             this.concurrencyRecordsByAccountId,
           ),
@@ -3057,7 +3628,7 @@
         candidateReasons.textContent = `${eligibility.evidence}：${eligibility.reasons.join('；')}`;
         candidateElement.append(candidateHead, candidateReasons);
 
-        if (eligibility.modelCheckNeeded && this.recentRequest.model) {
+        if (eligibility.modelCheckNeeded && diagnosticsRequest.model) {
           const modelButton = document.createElement('button');
           modelButton.type = 'button';
           modelButton.className = 'sub2-candidate-model-button';
@@ -3088,7 +3659,7 @@
       if (!Number.isInteger(numericAccountId) || numericAccountId <= 0) return;
       this.savedModelsByAccountId.set(numericAccountId, { status: 'loading', models: [] });
       this.renderDiagnosticsDrawer();
-      if (!this.isQuotaInteractionActive()) this.renderList();
+      if (!this.isAccountInteractionActive()) this.renderList();
       try {
         const models = await sub2FetchAccountModels(numericAccountId);
         this.savedModelsByAccountId.set(numericAccountId, { status: 'loaded', models });
@@ -3100,7 +3671,7 @@
         });
       }
       this.renderDiagnosticsDrawer();
-      if (!this.isQuotaInteractionActive()) this.renderList();
+      if (!this.isAccountInteractionActive()) this.renderList();
     }
 
     async openModelDrawer(account) {
@@ -3262,7 +3833,7 @@
       }
       const when = this.lastUpdatedAt ? sub2FormatRelative(this.lastUpdatedAt, Date.now()) : '刚刚';
       const groupCount = sub2CountDistinctGroups(this.accounts, this.groupsById);
-      this.statusElement.textContent = `v${SUB2_SCRIPT_VERSION} · ${groupCount} 个分组 / ${this.accounts.length} 个账号 · 更新于 ${when} · 每 ${SUB2_POLL_SECONDS}s 刷新（后台/最小化/配额编辑暂停，不测活）`;
+      this.statusElement.textContent = `v${SUB2_SCRIPT_VERSION} · ${groupCount} 个分组 / ${this.accounts.length} 个账号 · 更新于 ${when} · 每 ${SUB2_POLL_SECONDS}s 刷新（后台/最小化/账号编辑暂停，不测活）`;
     }
 
     setBusy(accountId, busy) {
@@ -3314,8 +3885,45 @@
       }
     }
 
+    async handleCapacity(account, rawCapacity) {
+      if (this.capacitySaving || this.quotaSaving) return;
+      const parsedCapacity = sub2ParseCapacityInput(rawCapacity);
+      if (parsedCapacity.error) {
+        this.lastError = parsedCapacity.error;
+        this.renderStatus();
+        return;
+      }
+
+      const currentCapacity = Number(account?.concurrency);
+      if (parsedCapacity.value === currentCapacity) {
+        this.lastError = '';
+        this.renderStatus();
+        return;
+      }
+
+      let updateSucceeded = false;
+      this.capacitySaving = true;
+      this.refreshRequestSequence += 1;
+      this.pendingRefresh = false;
+      try {
+        await sub2UpdateCapacity(account, parsedCapacity.value);
+        this.lastError = '';
+        updateSucceeded = true;
+      } catch (error) {
+        this.lastError = `设置容量失败：${error?.message || error}`;
+        this.renderStatus();
+      } finally {
+        this.capacitySaving = false;
+        if (updateSucceeded) {
+          // 成功后刷新账号配置和 Ops 快照；失败时保留编辑器及输入值以便重试。
+          this.renderList();
+          await this.refresh();
+        }
+      }
+    }
+
     async handleDailyQuota(account, rawDailyLimit) {
-      if (this.quotaSaving) return;
+      if (this.quotaSaving || this.capacitySaving) return;
       let dailyLimit = null;
       if (rawDailyLimit !== null) {
         const normalizedValue = String(rawDailyLimit || '').trim();
@@ -3377,7 +3985,12 @@
     sub2GetPoolModeState,
     sub2BuildDailyQuotaExtra,
     sub2GetPaginatedItems,
+    sub2IsPaginatedPayloadComplete,
+    sub2NormalizeRequestHistory,
+    sub2GetRequestHistoryKey,
+    sub2AnnotateRequestHistory,
     sub2NormalizeRecentRequest,
+    sub2ParseCapacityInput,
     sub2ExtractRoutingStatusCode,
     sub2NormalizeRoutingError,
     sub2GetCorrelatedRoutingErrors,
