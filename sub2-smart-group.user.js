@@ -2,9 +2,9 @@
 // @name         Sub2 Smart Group
 // @name:zh-CN   Sub2 智能分组
 // @namespace    local.sub2.smart-group
-// @version      2.4.1
-// @description  Sub2 account health, route history, reliability events, protected controls, and manual model sync (no active probing).
-// @description:zh-CN 为 sub2api 提供账号健康度、路由历史、可靠性事件、受保护控制与手动模型同步（不主动测活）
+// @version      2.5.0
+// @description  Sub2 account health, route history, reliability events, manual upstream balance queries, and protected controls (no active probing).
+// @description:zh-CN 为 sub2api 提供账号健康度、路由历史、可靠性事件、手动上游余额查询与受保护控制（不主动测活）
 // @license      MIT
 // @homepageURL   https://github.com/hong594/sub2-smart-group
 // @supportURL    https://github.com/hong594/sub2-smart-group/issues
@@ -15,10 +15,20 @@
 // @match        http://localhost:8080/*
 // @match        http://127.0.0.1:8080/*
 // @grant        GM_addStyle
+// @grant        GM_deleteValue
 // @grant        GM_getValue
 // @grant        GM_info
 // @grant        GM_registerMenuCommand
 // @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
+// @connect      api.aijws.com
+// @connect      api.ark717.com
+// @connect      api.123nhh.com
+// @connect      sub.100xlabs.space
+// @connect      muyuan.do
+// @connect      welfare.0xpsyche.me
+// @connect      runanytime.hxi.me
+// @connect      new.ambition.qz.io
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -30,7 +40,7 @@
 //   // @match https://your-sub2-domain.com/*
 // 脚本仅在检测到 sub2api 后台登录令牌时启动，且不会主动调用测活接口。
 
-/* global module, GM_info */
+/* global module, GM_deleteValue, GM_info, GM_xmlhttpRequest */
 
 (function (factory) {
   const exported = factory();
@@ -50,13 +60,16 @@
   //   GET  /api/v1/admin/ops/requests                  最近真实请求
   //   GET  /api/v1/admin/ops/upstream-errors           真实上游故障摘要
   //   GET  /api/v1/admin/ops/upstream-errors/:id       故障转移事件详情
-  // 手动操作（不读取或提交 API Key）：
+  // sub2 后台手动操作（不读取或提交账号 credentials 里的 API Key）：
   //   POST /api/v1/admin/accounts/:id/schedulable      摘出 / 挂回调度池
   //   POST /api/v1/admin/accounts/:id/recover-state    清除冷却 / 恢复
   //   PUT  /api/v1/admin/accounts/:id                  仅调整账号优先级 / 并发容量
   //   GET  /api/v1/admin/accounts/:id/models           查看 sub2 已保存的模型
   //   POST /api/v1/admin/accounts/:id/models/sync-upstream
   //                                                        用户点击后拉取并同步上游模型
+  // 外部余额查询（凭据由用户逐账号保存在 Tampermonkey，仅点击时发送）：
+  //   GET  <allowlisted-origin>/v1/usage                 sub2api 余额
+  //   GET  <allowlisted-origin>/api/user/self            newapi 余额
   // 不调用任何 test / probe / 测活类接口。模型同步只会由用户明确点击触发，
   // 健康度仍然只反映“真实流量触发的状态”。
   // ===========================================================================
@@ -66,6 +79,22 @@
   const SUB2_STORAGE_PREFIX = 'sub2-smart-group:';
   const SUB2_API_BASE = '/api/v1';
   const SUB2_POLL_SECONDS = 10;
+  const SUB2_BALANCE_CONFIG_STORAGE_KEY_PREFIX = `${SUB2_STORAGE_PREFIX}balanceConfig:`;
+  const SUB2_BALANCE_QUERY_TIMEOUT_MS = 15000;
+  const SUB2_TODAY_STATS_MAX_AGE_MS = SUB2_POLL_SECONDS * 3 * 1000;
+  const SUB2_NEWAPI_QUOTA_DIVISOR = 500000;
+  const SUB2_HIGH_AVERAGE_COST_USD = 0.5;
+  const SUB2_HIGH_AVERAGE_COST_MIN_REQUESTS = 3;
+  const SUB2_BALANCE_ALLOWED_HOSTS = Object.freeze([
+    'api.aijws.com',
+    'api.ark717.com',
+    'api.123nhh.com',
+    'sub.100xlabs.space',
+    'muyuan.do',
+    'welfare.0xpsyche.me',
+    'runanytime.hxi.me',
+    'new.ambition.qz.io',
+  ]);
   const SUB2_ROUTING_LOOKBACK_MS = 30 * 60 * 1000;
   const SUB2_REQUEST_HISTORY_LIMIT = 30;
   const SUB2_RELIABILITY_HISTORY_LIMIT = 1000;
@@ -85,7 +114,7 @@
   const SUB2_CAPACITY_HIGH_LOAD_RATIO = 0.8;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '2.4.1';
+    : '2.5.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -477,6 +506,405 @@
     } catch {
       return '';
     }
+  }
+
+  function sub2ParseBalanceTarget(rawProviderType, rawBaseUrl) {
+    const providerType = String(rawProviderType || '').trim().toLowerCase();
+    if (providerType !== 'sub2api' && providerType !== 'newapi') {
+      return { target: null, error: '余额来源必须选择 sub2api 或 newapi。' };
+    }
+
+    const normalizedBaseUrl = String(rawBaseUrl || '').trim();
+    let parsedBaseUrl;
+    try {
+      parsedBaseUrl = new URL(normalizedBaseUrl);
+    } catch {
+      return { target: null, error: '上游地址必须是完整的 HTTPS 站点根地址。' };
+    }
+    if (parsedBaseUrl.protocol !== 'https:') {
+      return { target: null, error: '余额凭据只允许发送到 HTTPS 上游。' };
+    }
+    if (parsedBaseUrl.username || parsedBaseUrl.password) {
+      return { target: null, error: '上游地址不能包含用户名或密码。' };
+    }
+    if (parsedBaseUrl.port) {
+      return { target: null, error: '余额请求只允许标准 HTTPS 端口，不能指定自定义端口。' };
+    }
+    if (parsedBaseUrl.pathname !== '/' || parsedBaseUrl.search || parsedBaseUrl.hash) {
+      return { target: null, error: '上游地址只能填写站点根地址，不能包含路径、查询参数或片段。' };
+    }
+    const normalizedHostname = parsedBaseUrl.hostname.toLowerCase();
+    if (!SUB2_BALANCE_ALLOWED_HOSTS.includes(normalizedHostname)) {
+      return { target: null, error: `域名 ${normalizedHostname || '未知'} 不在脚本的余额请求白名单中。` };
+    }
+    return {
+      target: { type: providerType, baseUrl: parsedBaseUrl.origin },
+      error: '',
+    };
+  }
+
+  function sub2BuildBalanceCredentialContext(providerType, baseUrl) {
+    const parsedTarget = sub2ParseBalanceTarget(providerType, baseUrl);
+    if (parsedTarget.error) return '';
+    return `${parsedTarget.target.type}|${parsedTarget.target.baseUrl}`;
+  }
+
+  function sub2ParseBalanceConfig(rawConfig) {
+    const parsedTarget = sub2ParseBalanceTarget(rawConfig?.type, rawConfig?.baseUrl);
+    if (parsedTarget.error) return { config: null, error: parsedTarget.error };
+    const { type: providerType, baseUrl } = parsedTarget.target;
+
+    const rawLowBalanceThreshold = rawConfig?.lowBalanceThreshold;
+    let lowBalanceThreshold = null;
+    if (rawLowBalanceThreshold !== null && rawLowBalanceThreshold !== undefined && rawLowBalanceThreshold !== '') {
+      lowBalanceThreshold = Number(rawLowBalanceThreshold);
+      if (!Number.isFinite(lowBalanceThreshold) || lowBalanceThreshold < 0) {
+        return { config: null, error: '低余额阈值必须是大于或等于 0 的数字，也可以留空。' };
+      }
+    }
+
+    const normalizedConfig = {
+      type: providerType,
+      baseUrl,
+      lowBalanceThreshold,
+    };
+    if (providerType === 'sub2api') {
+      const apiKey = String(rawConfig?.apiKey || '').trim();
+      if (!apiKey) return { config: null, error: 'sub2api 余额查询需要 API Key。' };
+      if (/\r|\n/.test(apiKey)) return { config: null, error: 'API Key 不能包含换行符。' };
+      normalizedConfig.apiKey = apiKey;
+    } else {
+      const accessToken = String(rawConfig?.accessToken || '').trim();
+      const userId = String(rawConfig?.userId || '').trim();
+      if (!accessToken) return { config: null, error: 'newapi 余额查询需要 Access Token。' };
+      if (/\r|\n/.test(accessToken)) return { config: null, error: 'Access Token 不能包含换行符。' };
+      if (!/^\d+$/.test(userId) || Number(userId) <= 0) {
+        return { config: null, error: 'newapi User ID 必须是正整数。' };
+      }
+      normalizedConfig.accessToken = accessToken;
+      normalizedConfig.userId = userId;
+    }
+    return { config: normalizedConfig, error: '' };
+  }
+
+  function sub2NormalizeStoredBalanceConfig(rawConfig) {
+    let candidateConfig = rawConfig;
+    if (typeof candidateConfig === 'string') {
+      try {
+        candidateConfig = JSON.parse(candidateConfig);
+      } catch {
+        candidateConfig = null;
+      }
+    }
+    const parsedConfig = sub2ParseBalanceConfig(candidateConfig);
+    return parsedConfig.error ? null : parsedConfig.config;
+  }
+
+  function sub2BuildBalanceConfigStorageKey(accountId, sub2Origin = null) {
+    const normalizedAccountId = Number(accountId);
+    if (!Number.isInteger(normalizedAccountId) || normalizedAccountId <= 0) return '';
+    const candidateOrigin = sub2Origin === null && typeof window !== 'undefined'
+      ? window.location.origin
+      : String(sub2Origin || '').trim();
+    try {
+      const parsedOrigin = new URL(candidateOrigin);
+      if (parsedOrigin.protocol !== 'http:' && parsedOrigin.protocol !== 'https:') return '';
+      return `${SUB2_BALANCE_CONFIG_STORAGE_KEY_PREFIX}${encodeURIComponent(parsedOrigin.origin)}:${normalizedAccountId}`;
+    } catch {
+      return '';
+    }
+  }
+
+  function sub2LoadBalanceConfig(accountId) {
+    try {
+      const storageKey = sub2BuildBalanceConfigStorageKey(accountId);
+      if (!storageKey || typeof GM_getValue !== 'function') return null;
+      return sub2NormalizeStoredBalanceConfig(GM_getValue(storageKey, null));
+    } catch {
+      return null;
+    }
+  }
+
+  function sub2SaveBalanceConfig(accountId, rawConfig) {
+    if (typeof GM_setValue !== 'function') {
+      throw new Error('Tampermonkey 私密存储不可用，未保存余额凭据。');
+    }
+    const storageKey = sub2BuildBalanceConfigStorageKey(accountId);
+    const normalizedConfig = sub2NormalizeStoredBalanceConfig(rawConfig);
+    if (!storageKey || !normalizedConfig) throw new Error('余额配置无效，未写入 Tampermonkey。');
+    GM_setValue(storageKey, normalizedConfig);
+  }
+
+  function sub2DeleteBalanceConfig(accountId) {
+    if (typeof GM_deleteValue !== 'function') {
+      throw new Error('Tampermonkey 私密存储不可用，未清除余额凭据。');
+    }
+    const storageKey = sub2BuildBalanceConfigStorageKey(accountId);
+    if (!storageKey) throw new Error('账号余额存储键无效。');
+    GM_deleteValue(storageKey);
+  }
+
+  function sub2BuildBalanceRequest(rawConfig) {
+    const parsedConfig = sub2ParseBalanceConfig(rawConfig);
+    if (parsedConfig.error) return { request: null, config: null, error: parsedConfig.error };
+
+    const balanceConfig = parsedConfig.config;
+    if (balanceConfig.type === 'sub2api') {
+      return {
+        config: balanceConfig,
+        error: '',
+        request: {
+          url: `${balanceConfig.baseUrl}/v1/usage`,
+          method: 'GET',
+          headers: { Authorization: `Bearer ${balanceConfig.apiKey}` },
+        },
+      };
+    }
+    return {
+      config: balanceConfig,
+      error: '',
+      request: {
+        url: `${balanceConfig.baseUrl}/api/user/self`,
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${balanceConfig.accessToken}`,
+          'User-Agent': 'c-switch/1.0',
+          'New-Api-User': balanceConfig.userId,
+        },
+      },
+    };
+  }
+
+  function sub2ParseBalanceNumericValue(rawValue) {
+    if (typeof rawValue === 'number') return Number.isFinite(rawValue) ? rawValue : null;
+    if (typeof rawValue !== 'string' || !rawValue.trim()) return null;
+    const numericValue = Number(rawValue.trim());
+    return Number.isFinite(numericValue) ? numericValue : null;
+  }
+
+  function sub2NormalizeBalanceUnit(rawUnit) {
+    if (typeof rawUnit !== 'string') return '';
+    const normalizedUnit = rawUnit.trim();
+    if (!normalizedUnit || normalizedUnit.length > 16 || /[\x00-\x1f\x7f]/.test(normalizedUnit)) return '';
+    return normalizedUnit;
+  }
+
+  function sub2SanitizeUpstreamText(rawValue, fallback) {
+    if (typeof rawValue !== 'string' && typeof rawValue !== 'number') return fallback;
+    const normalizedValue = String(rawValue).replace(/[\r\n\t]+/g, ' ').trim().slice(0, 200);
+    return normalizedValue || fallback;
+  }
+
+  function sub2ExtractBalanceResult(providerType, responsePayload) {
+    if (providerType === 'sub2api') {
+      const rawRemaining = responsePayload?.remaining
+        ?? responsePayload?.quota?.remaining
+        ?? responsePayload?.balance;
+      const remaining = sub2ParseBalanceNumericValue(rawRemaining);
+      const isValid = responsePayload?.is_active ?? responsePayload?.isValid ?? true;
+      if (!isValid) {
+        return { isValid: false, invalidMessage: '上游返回账号无效或未激活。' };
+      }
+      if (remaining === null) {
+        return { isValid: false, invalidMessage: '上游响应中没有可识别的余额字段。' };
+      }
+      const unit = sub2NormalizeBalanceUnit(responsePayload?.unit ?? responsePayload?.quota?.unit ?? 'USD');
+      if (!unit) return { isValid: false, invalidMessage: '上游响应中的余额单位无效。' };
+      return { isValid: true, remaining, unit };
+    }
+
+    if (providerType === 'newapi') {
+      if (responsePayload?.success === true
+        && responsePayload?.data
+        && typeof responsePayload.data === 'object'
+        && !Array.isArray(responsePayload.data)) {
+        const rawQuota = responsePayload.data.quota;
+        const rawUsedQuota = responsePayload.data.used_quota;
+        if (rawQuota === null || rawQuota === undefined || rawQuota === ''
+          || rawUsedQuota === null || rawUsedQuota === undefined || rawUsedQuota === '') {
+          return { isValid: false, invalidMessage: 'newapi 响应中的 quota 或 used_quota 缺失。' };
+        }
+        const quota = sub2ParseBalanceNumericValue(rawQuota);
+        const usedQuota = sub2ParseBalanceNumericValue(rawUsedQuota);
+        if (quota === null || usedQuota === null) {
+          return { isValid: false, invalidMessage: 'newapi 响应中的 quota 或 used_quota 无效。' };
+        }
+        return {
+          isValid: true,
+          planName: sub2SanitizeUpstreamText(responsePayload.data.group, '默认套餐'),
+          remaining: quota / SUB2_NEWAPI_QUOTA_DIVISOR,
+          used: usedQuota / SUB2_NEWAPI_QUOTA_DIVISOR,
+          total: (quota + usedQuota) / SUB2_NEWAPI_QUOTA_DIVISOR,
+          unit: 'USD',
+        };
+      }
+      return {
+        isValid: false,
+        invalidMessage: sub2SanitizeUpstreamText(responsePayload?.message, '查询失败'),
+      };
+    }
+
+    return { isValid: false, invalidMessage: '未知的余额来源类型。' };
+  }
+
+  function sub2BuildAccountUsageSnapshot(rawStats, now = Date.now()) {
+    const parsedRequests = sub2ParseBalanceNumericValue(rawStats?.requests);
+    const parsedCost = sub2ParseBalanceNumericValue(rawStats?.cost);
+    const requests = parsedRequests === null ? 0 : Math.max(0, Math.floor(parsedRequests));
+    const cost = parsedCost === null ? 0 : Math.max(0, parsedCost);
+    const averageCost = requests > 0 ? cost / requests : null;
+    const highAverageCost = requests >= SUB2_HIGH_AVERAGE_COST_MIN_REQUESTS
+      && averageCost >= SUB2_HIGH_AVERAGE_COST_USD;
+    const normalizedNow = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+    const localDayStart = new Date(normalizedNow);
+    localDayStart.setHours(0, 0, 0, 0);
+    const elapsedHours = Math.max(0, (normalizedNow - localDayStart.getTime()) / (60 * 60 * 1000));
+    const hourlyCost = cost > 0 && elapsedHours > 0 ? cost / elapsedHours : 0;
+    return {
+      requests,
+      cost,
+      averageCost,
+      highAverageCost,
+      elapsedHours,
+      hourlyCost,
+      rateWindowSufficient: elapsedHours >= 1,
+    };
+  }
+
+  function sub2FormatEstimatedBalanceHours(estimatedHours) {
+    if (estimatedHours === null || estimatedHours === undefined || estimatedHours === '') return '';
+    const numericHours = Number(estimatedHours);
+    if (!Number.isFinite(numericHours) || numericHours < 0) return '';
+    if (numericHours === 0) return '0 小时';
+    if (numericHours < 1) return '<1 小时';
+    if (numericHours < 10) return `${numericHours.toFixed(1)} 小时`;
+    if (numericHours > 9999) return '>9999 小时';
+    return `${Math.round(numericHours)} 小时`;
+  }
+
+  function sub2FormatBalanceAmount(amount, unit) {
+    const normalizedUnit = String(unit || 'USD').trim().toLocaleUpperCase() || 'USD';
+    return normalizedUnit === 'USD'
+      ? `$${sub2FormatCost(amount)}`
+      : `${sub2FormatCost(amount)} ${normalizedUnit}`;
+  }
+
+  function sub2IsTodayUsageAvailable(usageContext, now = Date.now()) {
+    const normalizedNow = Number(now);
+    const statsFetchedAt = Number(usageContext?.fetchedAt);
+    if (usageContext?.available !== true
+      || !Number.isFinite(normalizedNow)
+      || !Number.isFinite(statsFetchedAt)
+      || statsFetchedAt <= 0) {
+      return false;
+    }
+    const statsAgeMs = normalizedNow - statsFetchedAt;
+    return statsAgeMs >= 0
+      && statsAgeMs <= SUB2_TODAY_STATS_MAX_AGE_MS
+      && new Date(statsFetchedAt).toDateString() === new Date(normalizedNow).toDateString();
+  }
+
+  function sub2BuildBalanceStatusSnapshot(
+    balanceConfig,
+    balanceState,
+    rawStats,
+    now = Date.now(),
+    usageContext = {},
+  ) {
+    const statsFetchedAt = Number(usageContext?.fetchedAt) || 0;
+    const usageSnapshot = sub2BuildAccountUsageSnapshot(rawStats, statsFetchedAt || now);
+    const usageAvailable = sub2IsTodayUsageAvailable(usageContext, now);
+    const todayCostLabel = usageAvailable ? `$${sub2FormatCost(usageSnapshot.cost)}` : '暂不可用';
+    const averageCostLabel = usageSnapshot.averageCost === null
+      ? '单均 --'
+      : `单均 $${sub2FormatCost(usageSnapshot.averageCost)}${usageSnapshot.highAverageCost ? '（偏高）' : ''}`;
+    const usageText = usageAvailable
+      ? `今日消耗 ${todayCostLabel} · ${averageCostLabel}`
+      : `今日消耗 ${todayCostLabel}`;
+    const highAverageCostNote = usageAvailable && usageSnapshot.highAverageCost
+      ? `“单均偏高”仅表示今日至少 ${SUB2_HIGH_AVERAGE_COST_MIN_REQUESTS} 次请求且单均不低于 $${SUB2_HIGH_AVERAGE_COST_USD}，不能证明上游倍率。`
+      : '';
+    const evidenceNote = usageAvailable
+      ? '消耗来自 sub2 的今日账号级统计，不代表上游真实倍率。'
+      : `本次今日统计不可用${statsFetchedAt ? `；上次成功读取于 ${sub2FormatRelative(statsFetchedAt, now)}` : ''}，未使用旧快照估算续航。`;
+    const evidenceDescription = `${evidenceNote}${highAverageCostNote ? ` ${highAverageCostNote}` : ''}`;
+    const stateStatus = String(balanceState?.status || '');
+
+    if (stateStatus === 'loading') {
+      return {
+        text: `余额查询中… · ${usageText}`,
+        title: `${evidenceDescription} 查询由本次点击触发。`,
+        tone: usageAvailable && usageSnapshot.highAverageCost ? 'warn' : 'info',
+        usageSnapshot,
+      };
+    }
+    if (stateStatus === 'error') {
+      return {
+        text: `余额查询失败 · ${usageText}`,
+        title: `${String(balanceState?.error || '未知错误')} ${evidenceDescription}`,
+        tone: 'error',
+        usageSnapshot,
+      };
+    }
+    if (stateStatus !== 'success' || !balanceState?.result?.isValid) {
+      return {
+        text: `${balanceConfig ? '余额待查询' : '余额未配置'} · ${usageText}`,
+        title: evidenceDescription,
+        tone: usageAvailable && usageSnapshot.highAverageCost ? 'warn' : 'muted',
+        usageSnapshot,
+      };
+    }
+
+    const balanceResult = balanceState.result;
+    const normalizedUnit = String(balanceResult.unit || 'USD').trim().toLocaleUpperCase() || 'USD';
+    const remaining = Number(balanceResult.remaining);
+    const threshold = balanceConfig?.lowBalanceThreshold;
+    const thresholdConfigured = threshold !== null
+      && threshold !== undefined
+      && threshold !== ''
+      && Number.isFinite(Number(threshold));
+    const lowBalance = thresholdConfigured && remaining <= Number(threshold);
+    const estimatedHours = usageAvailable
+      && usageSnapshot.rateWindowSufficient
+      && normalizedUnit === 'USD'
+      && usageSnapshot.hourlyCost > 0
+      ? Math.max(0, remaining) / usageSnapshot.hourlyCost
+      : null;
+    const estimatedHoursLabel = sub2FormatEstimatedBalanceHours(estimatedHours);
+    const textParts = [
+      `余额 ${sub2FormatBalanceAmount(remaining, normalizedUnit)}`,
+      `今日消耗 ${todayCostLabel}`,
+    ];
+    if (estimatedHoursLabel) textParts.push(`按今日平均速率约剩 ${estimatedHoursLabel}`);
+    if (usageAvailable) textParts.push(averageCostLabel);
+
+    const titleParts = [evidenceDescription];
+    if (estimatedHoursLabel) {
+      titleParts.push('续航按浏览器本地今日已过时长的平均消耗速率粗略估算，不是承诺或实时倍率。');
+    } else if (usageAvailable && normalizedUnit !== 'USD') {
+      titleParts.push('余额单位与本地美元花费不同，未计算续航。');
+    } else if (usageAvailable && !usageSnapshot.rateWindowSufficient) {
+      titleParts.push('今日统计窗口不足 1 小时，暂不计算续航。');
+    } else if (usageAvailable && usageSnapshot.hourlyCost <= 0) {
+      titleParts.push('今日尚无可用花费速率，未计算续航。');
+    }
+    if (balanceResult.planName) titleParts.push(`套餐：${balanceResult.planName}。`);
+    if (Number.isFinite(Number(balanceResult.used))) {
+      titleParts.push(`上游返回已用 ${sub2FormatBalanceAmount(balanceResult.used, normalizedUnit)}。`);
+    }
+    if (balanceState.queriedAt) {
+      titleParts.push(`查询于 ${sub2FormatRelative(balanceState.queriedAt, now)}。`);
+    }
+    return {
+      text: textParts.join(' · '),
+      title: titleParts.join(' '),
+      tone: lowBalance ? 'low' : usageAvailable && usageSnapshot.highAverageCost ? 'warn' : 'ok',
+      usageSnapshot,
+      estimatedHours,
+      lowBalance,
+      usageAvailable,
+    };
   }
 
   function sub2GetPoolModeState(account) {
@@ -2457,6 +2885,102 @@
     return true;
   }
 
+  function sub2QueryUpstreamBalance(rawConfig) {
+    const requestDefinition = sub2BuildBalanceRequest(rawConfig);
+    if (requestDefinition.error) return Promise.reject(new Error(requestDefinition.error));
+    if (typeof GM_xmlhttpRequest !== 'function') {
+      return Promise.reject(new Error('Tampermonkey 跨域请求能力不可用。'));
+    }
+
+    return new Promise((resolve, reject) => {
+      let requestSettled = false;
+      let requestHandle = null;
+      let timeoutWatchdogId = null;
+      const clearTimeoutWatchdog = () => {
+        if (timeoutWatchdogId !== null) {
+          window.clearTimeout(timeoutWatchdogId);
+          timeoutWatchdogId = null;
+        }
+      };
+      const resolveOnce = (value) => {
+        if (requestSettled) return;
+        requestSettled = true;
+        clearTimeoutWatchdog();
+        resolve(value);
+      };
+      const rejectOnce = (message) => {
+        if (requestSettled) return;
+        requestSettled = true;
+        clearTimeoutWatchdog();
+        reject(new Error(message));
+      };
+
+      timeoutWatchdogId = window.setTimeout(() => {
+        rejectOnce(`余额查询超过 ${SUB2_BALANCE_QUERY_TIMEOUT_MS / 1000} 秒。`);
+        try {
+          requestHandle?.abort?.();
+        } catch {
+          // The promise is already rejected; abort support is best-effort.
+        }
+      }, SUB2_BALANCE_QUERY_TIMEOUT_MS);
+
+      try {
+        requestHandle = GM_xmlhttpRequest({
+          ...requestDefinition.request,
+          anonymous: true,
+          nocache: true,
+          redirect: 'error',
+          responseType: 'json',
+          timeout: SUB2_BALANCE_QUERY_TIMEOUT_MS,
+          onload(response) {
+            const status = Number(response?.status);
+            if (!Number.isInteger(status) || status < 200 || status >= 300) {
+              rejectOnce(`余额接口返回 HTTP ${Number.isInteger(status) ? status : '未知状态'}。`);
+              return;
+            }
+
+            const finalUrl = typeof response?.finalUrl === 'string' ? response.finalUrl : '';
+            if (!finalUrl) {
+              rejectOnce('余额接口未提供可验证的最终地址，已拒绝使用响应。');
+              return;
+            }
+            if (finalUrl !== requestDefinition.request.url) {
+              rejectOnce('余额接口发生了重定向或最终地址不匹配，已拒绝使用响应。');
+              return;
+            }
+
+            let responsePayload = response?.response;
+            if (!responsePayload || typeof responsePayload !== 'object') {
+              try {
+                responsePayload = JSON.parse(String(response?.responseText || ''));
+              } catch {
+                rejectOnce('余额接口没有返回有效 JSON。');
+                return;
+              }
+            }
+            const balanceResult = sub2ExtractBalanceResult(requestDefinition.config.type, responsePayload);
+            if (!balanceResult.isValid) {
+              rejectOnce(balanceResult.invalidMessage || '余额响应无效。');
+              return;
+            }
+            resolveOnce(balanceResult);
+          },
+          onabort() {
+            rejectOnce('余额查询已取消。');
+          },
+          onerror() {
+            rejectOnce('余额接口网络请求失败。');
+          },
+          ontimeout() {
+            rejectOnce(`余额查询超过 ${SUB2_BALANCE_QUERY_TIMEOUT_MS / 1000} 秒。`);
+          },
+        });
+      } catch {
+        rejectOnce('无法发起余额查询。');
+      }
+    });
+  }
+
   async function sub2ApiRequest(method, path, body, signal = null) {
     const token = sub2ReadAuthToken();
     const headers = { Accept: 'application/json' };
@@ -2518,7 +3042,10 @@
   async function sub2FetchTodayStats(accountIds) {
     if (!Array.isArray(accountIds) || !accountIds.length) return {};
     const data = await sub2ApiRequest('POST', '/admin/accounts/today-stats/batch', { account_ids: accountIds });
-    return data?.stats || {};
+    if (!data?.stats || typeof data.stats !== 'object' || Array.isArray(data.stats)) {
+      throw new Error('今日账号统计响应缺少 stats 对象。');
+    }
+    return data.stats;
   }
 
   async function sub2FetchRecentRoutingActivity() {
@@ -2811,6 +3338,13 @@
       box-shadow:0 0 0 3px rgba(6,182,212,.14);}
     #${SUB2_PANEL_ID} .sub2-platform{font-size:11px;color:#64748b;}
     #${SUB2_PANEL_ID} .sub2-meta{font-size:12px;color:#475569;display:flex;flex-wrap:wrap;gap:6px 9px;}
+    #${SUB2_PANEL_ID} .sub2-balance-summary{padding:5px 7px;border:1px solid #e2e8f0;border-radius:7px;background:#f8fafc;
+      color:#64748b;font-size:10px;font-weight:650;line-height:1.45;cursor:help;}
+    #${SUB2_PANEL_ID} .sub2-balance-summary.ok{border-color:#bbf7d0;background:#f0fdf4;color:#166534;}
+    #${SUB2_PANEL_ID} .sub2-balance-summary.info{border-color:#bae6fd;background:#f0f9ff;color:#0369a1;}
+    #${SUB2_PANEL_ID} .sub2-balance-summary.warn{border-color:#fde68a;background:#fffbeb;color:#92400e;}
+    #${SUB2_PANEL_ID} .sub2-balance-summary.low,#${SUB2_PANEL_ID} .sub2-balance-summary.error{
+      border-color:#fecaca;background:#fef2f2;color:#b91c1c;}
     #${SUB2_PANEL_ID} .sub2-quota-summary{font-weight:600;color:#0369a1;}
     #${SUB2_PANEL_ID} .sub2-quota-summary.warn{color:#b45309;}
     #${SUB2_PANEL_ID} .sub2-quota-summary.down{color:#b91c1c;}
@@ -2850,6 +3384,22 @@
     #${SUB2_PANEL_ID} .sub2-capacity-help{grid-column:1 / -1;color:#64748b;font-size:10px;line-height:1.45;}
     #${SUB2_PANEL_ID} .sub2-capacity-warning{grid-column:1 / -1;color:#b45309;font-size:10px;line-height:1.45;}
     #${SUB2_PANEL_ID} .sub2-capacity-warning:empty{display:none;}
+    #${SUB2_PANEL_ID} .sub2-balance-editor{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:end;gap:7px;
+      padding:8px;border:1px solid #93c5fd;border-radius:8px;background:#eff6ff;}
+    #${SUB2_PANEL_ID} .sub2-balance-editor[hidden]{display:none;}
+    #${SUB2_PANEL_ID} .sub2-balance-editor-title{grid-column:1 / -1;color:#1e3a8a;font-size:11px;font-weight:750;}
+    #${SUB2_PANEL_ID} .sub2-balance-field{display:flex;min-width:0;flex-direction:column;gap:3px;color:#475569;font-size:10px;}
+    #${SUB2_PANEL_ID} .sub2-balance-field.full{grid-column:1 / -1;}
+    #${SUB2_PANEL_ID} .sub2-balance-field[hidden]{display:none;}
+    #${SUB2_PANEL_ID} .sub2-balance-field input,#${SUB2_PANEL_ID} .sub2-balance-field select{width:100%;min-width:0;box-sizing:border-box;
+      border:1px solid #93c5fd;border-radius:6px;padding:5px 6px;background:#fff;color:#0f172a;font-size:11px;outline:none;}
+    #${SUB2_PANEL_ID} .sub2-balance-field input:focus,#${SUB2_PANEL_ID} .sub2-balance-field select:focus{
+      border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,.12);}
+    #${SUB2_PANEL_ID} .sub2-balance-editor-actions{grid-column:1 / -1;display:flex;flex-wrap:wrap;gap:6px;}
+    #${SUB2_PANEL_ID} .sub2-balance-notice{grid-column:1 / -1;padding:6px 7px;border-radius:6px;background:#fff7ed;color:#9a3412;
+      font-size:10px;line-height:1.45;}
+    #${SUB2_PANEL_ID} .sub2-balance-message{grid-column:1 / -1;color:#b91c1c;font-size:10px;line-height:1.45;}
+    #${SUB2_PANEL_ID} .sub2-balance-message:empty{display:none;}
     #${SUB2_PANEL_ID} .sub2-status{padding:6px 12px;border-top:1px solid #f1f5f9;font-size:11px;color:#64748b;}
     #${SUB2_PANEL_ID} .sub2-status.error{color:#b91c1c;}
     #${SUB2_PANEL_ID} .sub2-model-overlay{position:absolute;inset:0;z-index:20;display:flex;justify-content:flex-end;
@@ -3023,6 +3573,12 @@
       this.accounts = [];
       this.groupsById = new Map();
       this.statsById = {};
+      this.todayStatsAvailable = false;
+      this.todayStatsFetchedAt = 0;
+      this.balanceConfigsById = {};
+      this.loadedBalanceConfigIds = new Set();
+      this.balanceStateById = new Map();
+      this.balanceQueryingIds = new Set();
       this.recentRequest = null;
       this.requestHistory = [];
       this.selectedDiagnosticsRequestKey = '';
@@ -3120,9 +3676,11 @@
       // 每秒重绘倒计时：仅当存在“冷却中”的账号时才重建列表，
       // 避免无谓的每秒全量重建把滚动位置顶掉（会表现为面板每秒自己往下滚）。
       this.tickTimer = window.setInterval(() => {
-        if (this.minimized || !this.accounts.length || this.isAccountInteractionActive()) return;
-        if (this.isListScrollActive()) return;
+        if (this.minimized || !this.accounts.length) return;
         const now = Date.now();
+        this.refreshBalanceEvidenceSummaries(now);
+        if (this.isAccountInteractionActive()) return;
+        if (this.isListScrollActive()) return;
         const hasCountdown = this.accounts.some((account) => sub2ComputeHealth(account, now).coolingUntil > now);
         if (hasCountdown) this.renderList();
       }, 1000);
@@ -3383,18 +3941,27 @@
       return Boolean(this.root?.querySelector('.sub2-capacity-editor:not([hidden])'));
     }
 
+    hasOpenBalanceEditor() {
+      return Boolean(this.root?.querySelector('.sub2-balance-editor:not([hidden])'));
+    }
+
     isAccountInteractionActive() {
       return this.quotaSaving
         || this.capacitySaving
+        || this.balanceQueryingIds.size > 0
         || this.hasOpenQuotaEditor()
-        || this.hasOpenCapacityEditor();
+        || this.hasOpenCapacityEditor()
+        || this.hasOpenBalanceEditor();
     }
 
     setMinimized(minimized) {
       this.minimized = minimized === true;
       sub2StorageSet('minimized', this.minimized);
       this.applyMinimized();
-      if (!this.minimized) this.refresh();
+      if (!this.minimized) {
+        this.refreshBalanceEvidenceSummaries(Date.now());
+        this.refresh();
+      }
     }
 
     applyMinimized() {
@@ -3418,10 +3985,21 @@
           sub2FetchAccounts(),
           sub2FetchGroups().catch(() => null),
         ]);
+        for (const account of accounts) {
+          const accountId = Number(account?.id);
+          if (!Number.isInteger(accountId) || accountId <= 0 || this.loadedBalanceConfigIds.has(accountId)) continue;
+          const balanceConfig = sub2LoadBalanceConfig(accountId);
+          if (balanceConfig) this.balanceConfigsById[String(accountId)] = balanceConfig;
+          this.loadedBalanceConfigIds.add(accountId);
+        }
         const ids = accounts.map((account) => account.id).filter((id) => Number.isFinite(Number(id)));
         let nextStatsById = this.statsById || {};
+        let nextTodayStatsAvailable = false;
+        let nextTodayStatsFetchedAt = this.todayStatsFetchedAt;
         try {
           nextStatsById = await sub2FetchTodayStats(ids);
+          nextTodayStatsAvailable = true;
+          nextTodayStatsFetchedAt = Date.now();
         } catch {
           nextStatsById = this.statsById || {};
         }
@@ -3431,6 +4009,8 @@
         this.accounts = accounts;
         if (groups !== null) this.groupsById = sub2BuildGroupIndex(groups);
         this.statsById = nextStatsById;
+        this.todayStatsAvailable = nextTodayStatsAvailable;
+        this.todayStatsFetchedAt = nextTodayStatsFetchedAt;
         this.latestHit = sub2ResolveLatestHit(
           this.accounts,
           this.routingRequestsAvailable ? this.recentRequest : null,
@@ -3441,6 +4021,7 @@
         shouldRender = true;
       } catch (error) {
         if (requestSequence === this.refreshRequestSequence && !this.isAccountInteractionActive()) {
+          this.todayStatsAvailable = false;
           this.lastError = error?.status === 401
             ? '登录已失效，请重新登录 sub2 后台后再刷新。'
             : `读取失败：${error?.message || error}`;
@@ -3626,6 +4207,8 @@
 
     renderList() {
       if (!this.listElement) return;
+      // 余额草稿含敏感输入；编辑期间延后筛选等触发的列表重建，避免无提示丢失草稿。
+      if (this.hasOpenBalanceEditor()) return;
       this.listElement.classList.toggle('sub2-flat-list', this.viewMode === 'flat');
       // 重建会清空 DOM，浏览器随即把 scrollTop 夹到新内容高度内。直接读当前
       // scrollTop 会拿到被夹小的值，所以优先使用滚动事件里记录的真实位置。
@@ -3767,6 +4350,353 @@
       return groupSection;
     }
 
+    getBalanceConfig(accountId) {
+      return this.balanceConfigsById[String(Number(accountId))] || null;
+    }
+
+    saveBalanceConfig(accountId, rawConfig) {
+      const parsedConfig = sub2ParseBalanceConfig(rawConfig);
+      if (parsedConfig.error) return { config: null, error: parsedConfig.error };
+
+      const normalizedAccountId = Number(accountId);
+      try {
+        sub2SaveBalanceConfig(normalizedAccountId, parsedConfig.config);
+      } catch (error) {
+        return { config: null, error: error?.message || String(error) };
+      }
+      this.balanceConfigsById = {
+        ...this.balanceConfigsById,
+        [String(normalizedAccountId)]: parsedConfig.config,
+      };
+      this.loadedBalanceConfigIds.add(normalizedAccountId);
+      this.balanceStateById.delete(normalizedAccountId);
+      return { config: parsedConfig.config, error: '' };
+    }
+
+    clearBalanceConfig(accountId) {
+      const normalizedAccountId = Number(accountId);
+      try {
+        sub2DeleteBalanceConfig(normalizedAccountId);
+      } catch (error) {
+        return error?.message || String(error);
+      }
+      const updatedConfigs = { ...this.balanceConfigsById };
+      delete updatedConfigs[String(normalizedAccountId)];
+      this.balanceConfigsById = updatedConfigs;
+      this.loadedBalanceConfigIds.add(normalizedAccountId);
+      this.balanceStateById.delete(normalizedAccountId);
+      return '';
+    }
+
+    buildBalanceSummaryElement(account, stats, now) {
+      const accountId = Number(account.id);
+      const balanceConfig = this.getBalanceConfig(accountId);
+      const balanceState = this.balanceStateById.get(accountId) || null;
+      const balanceSnapshot = sub2BuildBalanceStatusSnapshot(
+        balanceConfig,
+        balanceState,
+        stats,
+        now,
+        { available: this.todayStatsAvailable, fetchedAt: this.todayStatsFetchedAt },
+      );
+      const summaryElement = document.createElement('div');
+      summaryElement.className = `sub2-balance-summary ${balanceSnapshot.tone}`;
+      summaryElement.dataset.accountId = String(accountId);
+      summaryElement.textContent = balanceSnapshot.text;
+      summaryElement.title = balanceSnapshot.title;
+      return summaryElement;
+    }
+
+    refreshBalanceEvidenceSummaries(now = Date.now()) {
+      if (!this.root) return;
+      const usageContext = { available: this.todayStatsAvailable, fetchedAt: this.todayStatsFetchedAt };
+      const usageAvailable = sub2IsTodayUsageAvailable(usageContext, now);
+      for (const account of this.accounts) {
+        const accountId = Number(account?.id);
+        const stats = this.statsById?.[accountId] || {};
+        const balanceConfig = this.getBalanceConfig(accountId);
+        const balanceState = this.balanceStateById.get(accountId) || null;
+        const balanceSnapshot = sub2BuildBalanceStatusSnapshot(
+          balanceConfig,
+          balanceState,
+          stats,
+          now,
+          usageContext,
+        );
+        for (const summaryElement of this.root.querySelectorAll(`.sub2-balance-summary[data-account-id="${accountId}"]`)) {
+          summaryElement.className = `sub2-balance-summary ${balanceSnapshot.tone}`;
+          summaryElement.textContent = balanceSnapshot.text;
+          summaryElement.title = balanceSnapshot.title;
+        }
+        for (const requestCountElement of this.root.querySelectorAll(`.sub2-today-request-count[data-account-id="${accountId}"]`)) {
+          requestCountElement.textContent = usageAvailable
+            ? `今日 ${Math.max(0, Math.floor(Number(stats.requests) || 0))} 次`
+            : '今日请求 暂不可用';
+        }
+      }
+    }
+
+    buildBalanceControls(account, busy) {
+      const accountId = Number(account.id);
+      const currentConfig = this.getBalanceConfig(accountId);
+      const balanceQuerying = this.balanceQueryingIds.has(accountId);
+      const actionButtons = [];
+
+      const queryButton = document.createElement('button');
+      queryButton.type = 'button';
+      queryButton.className = 'sub2-btn primary';
+      queryButton.textContent = balanceQuerying
+        ? '查询中…'
+        : currentConfig ? '查余额' : '配置余额';
+      queryButton.title = currentConfig
+        ? '仅本次点击会向该账号配置的上游发送余额请求'
+        : '先为该账号单独配置余额来源与凭据';
+      queryButton.disabled = busy || balanceQuerying;
+      actionButtons.push(queryButton);
+
+      const settingsButton = document.createElement('button');
+      settingsButton.type = 'button';
+      settingsButton.className = 'sub2-btn';
+      settingsButton.textContent = '余额设置';
+      settingsButton.title = '修改或清除该账号保存在 Tampermonkey 中的余额凭据';
+      settingsButton.disabled = busy || balanceQuerying;
+      if (currentConfig) actionButtons.push(settingsButton);
+
+      const editor = document.createElement('div');
+      editor.className = 'sub2-balance-editor';
+      editor.hidden = true;
+
+      const editorTitle = document.createElement('div');
+      editorTitle.className = 'sub2-balance-editor-title';
+      editorTitle.textContent = '账号余额来源';
+
+      const createBalanceField = (labelText, inputElement, fullWidth = false) => {
+        const field = document.createElement('label');
+        field.className = `sub2-balance-field${fullWidth ? ' full' : ''}`;
+        const label = document.createElement('span');
+        label.textContent = labelText;
+        field.append(label, inputElement);
+        return field;
+      };
+
+      const providerSelect = document.createElement('select');
+      const sub2apiOption = document.createElement('option');
+      sub2apiOption.value = 'sub2api';
+      sub2apiOption.textContent = 'sub2api';
+      const newapiOption = document.createElement('option');
+      newapiOption.value = 'newapi';
+      newapiOption.textContent = 'newapi';
+      providerSelect.append(sub2apiOption, newapiOption);
+      providerSelect.value = currentConfig?.type || 'sub2api';
+      const providerField = createBalanceField('来源类型', providerSelect);
+
+      const thresholdInput = document.createElement('input');
+      thresholdInput.type = 'number';
+      thresholdInput.min = '0';
+      thresholdInput.step = '0.01';
+      thresholdInput.placeholder = '留空不报警';
+      thresholdInput.value = currentConfig?.lowBalanceThreshold === null
+        || currentConfig?.lowBalanceThreshold === undefined
+        ? ''
+        : String(currentConfig.lowBalanceThreshold);
+      const thresholdField = createBalanceField('低余额阈值（余额单位）', thresholdInput);
+
+      const baseUrlInput = document.createElement('input');
+      baseUrlInput.type = 'url';
+      baseUrlInput.placeholder = 'https://example.com';
+      baseUrlInput.autocomplete = 'off';
+      baseUrlInput.spellcheck = false;
+      baseUrlInput.value = currentConfig?.baseUrl || sub2GetUpstreamWebsiteUrl(account).replace(/\/$/, '');
+      const baseUrlField = createBalanceField('HTTPS 上游站点根地址', baseUrlInput, true);
+
+      const apiKeyInput = document.createElement('input');
+      apiKeyInput.type = 'password';
+      apiKeyInput.placeholder = currentConfig?.type === 'sub2api'
+        ? '已保存；留空保持不变'
+        : 'sub2api API Key';
+      apiKeyInput.autocomplete = 'new-password';
+      apiKeyInput.spellcheck = false;
+      const apiKeyField = createBalanceField('API Key', apiKeyInput, true);
+
+      const accessTokenInput = document.createElement('input');
+      accessTokenInput.type = 'password';
+      accessTokenInput.placeholder = currentConfig?.type === 'newapi'
+        ? '已保存；留空保持不变'
+        : 'newapi Access Token（不是 sub2 API Key）';
+      accessTokenInput.autocomplete = 'new-password';
+      accessTokenInput.spellcheck = false;
+      const accessTokenField = createBalanceField('Access Token', accessTokenInput, true);
+
+      const userIdInput = document.createElement('input');
+      userIdInput.type = 'text';
+      userIdInput.inputMode = 'numeric';
+      userIdInput.placeholder = currentConfig?.type === 'newapi'
+        ? '已保存；留空保持不变'
+        : 'newapi User ID';
+      userIdInput.autocomplete = 'off';
+      const userIdField = createBalanceField('User ID', userIdInput, true);
+
+      const editorActions = document.createElement('div');
+      editorActions.className = 'sub2-balance-editor-actions';
+      const saveButton = document.createElement('button');
+      saveButton.type = 'button';
+      saveButton.className = 'sub2-btn primary';
+      saveButton.textContent = '保存';
+      const saveAndQueryButton = document.createElement('button');
+      saveAndQueryButton.type = 'button';
+      saveAndQueryButton.className = 'sub2-btn primary';
+      saveAndQueryButton.textContent = '保存并查询';
+      const clearButton = document.createElement('button');
+      clearButton.type = 'button';
+      clearButton.className = 'sub2-btn danger';
+      clearButton.textContent = '清除凭据';
+      clearButton.hidden = !currentConfig;
+      const cancelButton = document.createElement('button');
+      cancelButton.type = 'button';
+      cancelButton.className = 'sub2-btn';
+      cancelButton.textContent = '取消';
+      editorActions.append(saveButton, saveAndQueryButton, clearButton, cancelButton);
+
+      const securityNotice = document.createElement('div');
+      securityNotice.className = 'sub2-balance-notice';
+      securityNotice.textContent = '凭据以未加密形式保存在 Tampermonkey 的脚本存储中，已保存值不会回填到页面 DOM，也不写入网页 localStorage、sub2 或日志；仅点击查询时发送到所填白名单 HTTPS 域名。';
+      const editorMessage = document.createElement('div');
+      editorMessage.className = 'sub2-balance-message';
+
+      const credentialInputs = { apiKey: apiKeyInput, accessToken: accessTokenInput, userId: userIdInput };
+      const credentialDraftContexts = { apiKey: '', accessToken: '', userId: '' };
+      const getCurrentCredentialContext = () => sub2BuildBalanceCredentialContext(
+        providerSelect.value,
+        baseUrlInput.value,
+      );
+      const clearMismatchedCredentialDrafts = (clearAll = false) => {
+        const currentCredentialContext = getCurrentCredentialContext();
+        let clearedCredential = false;
+        for (const [credentialName, inputElement] of Object.entries(credentialInputs)) {
+          if (inputElement.value
+            && (clearAll || credentialDraftContexts[credentialName] !== currentCredentialContext)) {
+            inputElement.value = '';
+            clearedCredential = true;
+          }
+          if (!inputElement.value) credentialDraftContexts[credentialName] = '';
+        }
+        if (clearedCredential) editorMessage.textContent = '余额来源已变更，请重新输入对应凭据。';
+      };
+      const updateProviderFields = () => {
+        const usesSub2api = providerSelect.value === 'sub2api';
+        apiKeyField.hidden = !usesSub2api;
+        accessTokenField.hidden = usesSub2api;
+        userIdField.hidden = usesSub2api;
+      };
+      const openEditor = () => {
+        for (const openEditorElement of this.root?.querySelectorAll('.sub2-balance-editor:not([hidden])') || []) {
+          openEditorElement.hidden = true;
+        }
+        this.refreshRequestSequence += 1;
+        this.pendingRefresh = false;
+        editor.hidden = false;
+        editorMessage.textContent = '';
+        updateProviderFields();
+        providerSelect.focus();
+      };
+      const collectDraftConfig = () => {
+        const selectedProviderType = providerSelect.value;
+        const latestPersistedConfig = sub2LoadBalanceConfig(accountId);
+        const finalCredentialContext = getCurrentCredentialContext();
+        const persistedCredentialContext = latestPersistedConfig
+          ? sub2BuildBalanceCredentialContext(latestPersistedConfig.type, latestPersistedConfig.baseUrl)
+          : '';
+        const canReuseStoredCredentials = Boolean(finalCredentialContext)
+          && persistedCredentialContext === finalCredentialContext;
+        const getBoundDraftCredential = (credentialName) => {
+          const inputValue = credentialInputs[credentialName].value;
+          return inputValue
+            && finalCredentialContext
+            && credentialDraftContexts[credentialName] === finalCredentialContext
+            ? inputValue
+            : '';
+        };
+        return {
+          type: selectedProviderType,
+          baseUrl: baseUrlInput.value,
+          lowBalanceThreshold: thresholdInput.value,
+          apiKey: getBoundDraftCredential('apiKey')
+            || (canReuseStoredCredentials ? latestPersistedConfig?.apiKey : ''),
+          accessToken: getBoundDraftCredential('accessToken')
+            || (canReuseStoredCredentials ? latestPersistedConfig?.accessToken : ''),
+          userId: getBoundDraftCredential('userId')
+            || (canReuseStoredCredentials ? latestPersistedConfig?.userId : ''),
+        };
+      };
+      const saveDraftConfig = (queryAfterSave, userEvent) => {
+        if (!userEvent?.isTrusted) return;
+        const saveResult = this.saveBalanceConfig(accountId, collectDraftConfig());
+        if (saveResult.error) {
+          editorMessage.textContent = saveResult.error;
+          return;
+        }
+        editor.hidden = true;
+        this.lastError = '';
+        this.renderStatus();
+        this.renderList();
+        if (queryAfterSave) this.handleBalanceQuery(account, true);
+      };
+
+      for (const [credentialName, inputElement] of Object.entries(credentialInputs)) {
+        inputElement.addEventListener('input', () => {
+          credentialDraftContexts[credentialName] = inputElement.value
+            ? getCurrentCredentialContext()
+            : '';
+        });
+      }
+      providerSelect.addEventListener('change', () => {
+        clearMismatchedCredentialDrafts(true);
+        updateProviderFields();
+      });
+      baseUrlInput.addEventListener('input', () => clearMismatchedCredentialDrafts());
+      queryButton.addEventListener('click', (event) => {
+        if (!event.isTrusted) return;
+        if (currentConfig) this.handleBalanceQuery(account, true);
+        else openEditor();
+      });
+      settingsButton.addEventListener('click', (event) => {
+        if (event.isTrusted) openEditor();
+      });
+      saveButton.addEventListener('click', (event) => saveDraftConfig(false, event));
+      saveAndQueryButton.addEventListener('click', (event) => saveDraftConfig(true, event));
+      clearButton.addEventListener('click', (event) => {
+        if (!event.isTrusted) return;
+        const accountName = String(account.name || `账号 ${account.id}`).trim() || `账号 ${account.id}`;
+        if (!window.confirm(`确定清除“${accountName}”保存在 Tampermonkey 中的余额凭据吗？`)) return;
+        const clearError = this.clearBalanceConfig(accountId);
+        if (clearError) {
+          editorMessage.textContent = clearError;
+          return;
+        }
+        editor.hidden = true;
+        this.renderList();
+      });
+      cancelButton.addEventListener('click', (event) => {
+        if (!event.isTrusted) return;
+        editor.hidden = true;
+        this.refresh();
+      });
+      updateProviderFields();
+      editor.append(
+        editorTitle,
+        providerField,
+        thresholdField,
+        baseUrlField,
+        apiKeyField,
+        accessTokenField,
+        userIdField,
+        editorActions,
+        securityNotice,
+        editorMessage,
+      );
+      return { actionButtons, editor };
+    }
+
     buildRow(account, now, groupMembership = null) {
       const health = sub2ComputeHealth(account, now);
       const stats = this.statsById?.[account.id] || {};
@@ -3824,12 +4754,20 @@
       const meta = document.createElement('div');
       meta.className = 'sub2-meta';
       const requests = Number(stats.requests) || 0;
-      const cost = sub2FormatCost(stats.cost);
       const todayUsage = document.createElement('span');
-      todayUsage.textContent = `今日 ${requests} 次 / $${cost}`;
+      todayUsage.className = 'sub2-today-request-count';
+      todayUsage.dataset.accountId = String(Number(account.id));
+      todayUsage.textContent = sub2IsTodayUsageAvailable({
+        available: this.todayStatsAvailable,
+        fetchedAt: this.todayStatsFetchedAt,
+      }, now)
+        ? `今日 ${requests} 次`
+        : '今日请求 暂不可用';
       const lastUsed = document.createElement('span');
       lastUsed.textContent = `最近使用 ${sub2FormatRelative(account.last_used_at, now)}`;
       meta.append(todayUsage, lastUsed);
+
+      const balanceSummary = this.buildBalanceSummaryElement(account, stats, now);
 
       const displayConcurrency = sub2ResolveAccountConcurrency(
         account.id,
@@ -3952,6 +4890,9 @@
       modelsBtn.disabled = busy;
       modelsBtn.addEventListener('click', () => this.openModelDrawer(account));
       actions.appendChild(modelsBtn);
+
+      const balanceControls = this.buildBalanceControls(account, busy);
+      actions.append(...balanceControls.actionButtons);
 
       const configuredCapacity = Number.isInteger(Number(account.concurrency))
         ? Number(account.concurrency)
@@ -4135,9 +5076,10 @@
         actions.appendChild(recoverBtn);
       }
 
-      row.append(top, meta, reasons);
+      row.append(top, meta, balanceSummary, reasons);
       if (routingNote) row.appendChild(routingNote);
       row.appendChild(actions);
+      row.appendChild(balanceControls.editor);
       if (quotaEditor) row.appendChild(quotaEditor);
       row.appendChild(capacityEditor);
       return row;
@@ -5280,6 +6222,51 @@
       this.renderList();
     }
 
+    async handleBalanceQuery(account, userInitiated = false) {
+      const accountId = Number(account?.id);
+      if (userInitiated !== true || this.balanceQueryingIds.has(accountId)) return;
+      const balanceConfig = sub2LoadBalanceConfig(accountId);
+      if (!balanceConfig) {
+        const updatedConfigs = { ...this.balanceConfigsById };
+        delete updatedConfigs[String(accountId)];
+        this.balanceConfigsById = updatedConfigs;
+        this.balanceStateById.delete(accountId);
+        this.renderList();
+        return;
+      }
+      this.balanceConfigsById = {
+        ...this.balanceConfigsById,
+        [String(accountId)]: balanceConfig,
+      };
+
+      this.balanceQueryingIds.add(accountId);
+      this.balanceStateById.set(accountId, { status: 'loading', startedAt: Date.now() });
+      // 查询期间暂停自动刷新，避免卡片重建影响本次明确的用户操作。
+      this.refreshRequestSequence += 1;
+      this.pendingRefresh = false;
+      this.renderList();
+      try {
+        const balanceResult = await sub2QueryUpstreamBalance(balanceConfig);
+        this.balanceStateById.set(accountId, {
+          status: 'success',
+          result: balanceResult,
+          queriedAt: Date.now(),
+        });
+      } catch (error) {
+        const errorMessage = String(error?.message || error || '未知错误')
+          .replace(/[\r\n]+/g, ' ')
+          .slice(0, 300);
+        this.balanceStateById.set(accountId, {
+          status: 'error',
+          error: errorMessage,
+          queriedAt: Date.now(),
+        });
+      } finally {
+        this.balanceQueryingIds.delete(accountId);
+        this.renderList();
+      }
+    }
+
     async handleToggleSchedulable(account) {
       const target = !(account.schedulable !== false);
       this.setBusy(account.id, true);
@@ -5420,6 +6407,17 @@
     sub2SupportsDailyQuota,
     sub2GetUpstreamBaseUrl,
     sub2GetUpstreamWebsiteUrl,
+    sub2BuildBalanceCredentialContext,
+    sub2ParseBalanceConfig,
+    sub2NormalizeStoredBalanceConfig,
+    sub2BuildBalanceConfigStorageKey,
+    sub2BuildBalanceRequest,
+    sub2ExtractBalanceResult,
+    sub2BuildAccountUsageSnapshot,
+    sub2FormatEstimatedBalanceHours,
+    sub2FormatBalanceAmount,
+    sub2IsTodayUsageAvailable,
+    sub2BuildBalanceStatusSnapshot,
     sub2GetPoolModeState,
     sub2BuildDailyQuotaExtra,
     sub2GetPaginatedItems,
