@@ -1,0 +1,6 @@
+{"file":".trellis/spec/frontend/index.md","reason":"Check the change against all active userscript frontend contracts."}
+{"file":".trellis/spec/frontend/model-policy-and-sync.md","reason":"Verify account preview and creation reuse the exact shared model-family policy."}
+{"file":".trellis/spec/frontend/manual-balance-monitoring.md","reason":"Verify API-key secrecy, destination binding, and trusted-click boundaries remain intact."}
+{"file":".trellis/tasks/07-27-routing-reliability-account-tools/research/sub2api-contracts.md","reason":"Verify exact preview/create payloads, idempotency, and backend priority semantics."}
+{"file":".trellis/tasks/07-27-routing-reliability-account-tools/research/userscript-evidence.md","reason":"Verify integration, overlay behavior, exports, and complete regression coverage."}
+{"file":".trellis/spec/frontend/account-creation.md","reason":"Verify preview, secret handling, complete decision snapshots, idempotent mutation lifecycle, readback, and non-shrinking grouped-list contracts."}

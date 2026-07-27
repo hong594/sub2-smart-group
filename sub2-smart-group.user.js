@@ -2,7 +2,7 @@
 // @name         Sub2 Smart Group
 // @name:zh-CN   Sub2 智能分组
 // @namespace    local.sub2.smart-group
-// @version      2.5.0
+// @version      2.6.0
 // @description  Sub2 account health, route history, reliability events, manual upstream balance queries, and protected controls (no active probing).
 // @description:zh-CN 为 sub2api 提供账号健康度、路由历史、可靠性事件、手动上游余额查询与受保护控制（不主动测活）
 // @license      MIT
@@ -61,7 +61,7 @@
   //   GET  /api/v1/admin/ops/upstream-errors           真实上游故障摘要
   //   GET  /api/v1/admin/ops/upstream-errors/:id       故障转移事件详情
   //   GET  /api/v1/admin/usage                         流式请求首字耗时样本
-  // sub2 后台手动操作（不读取或提交账号 credentials 里的 API Key）：
+  // sub2 后台手动操作（不读取已有账号 credentials 里的 API Key；添加账号只提交用户当次输入）：
   //   POST /api/v1/admin/accounts/:id/schedulable      摘出 / 挂回调度池
   //   POST /api/v1/admin/accounts/:id/recover-state    清除冷却 / 恢复
   //   PUT  /api/v1/admin/accounts/:id                  仅调整账号优先级 / 并发容量
@@ -69,11 +69,14 @@
   //   POST /api/v1/admin/accounts/:id/models/sync-upstream
   //                                                        用户点击后只拉取上游模型
   //   POST /api/v1/admin/accounts/bulk-update           仅合并写入过滤后的 model_mapping
+  //   POST /api/v1/admin/accounts/models/sync-upstream-preview
+  //                                                        用户点击后用当次凭据识别平台/模型
+  //   POST /api/v1/admin/accounts                       用户确认后创建一个已分组 API Key 账号
   // 外部余额查询（凭据由用户逐账号保存在 Tampermonkey，仅点击时发送）：
   //   GET  <allowlisted-origin>/v1/usage                 sub2api 余额
   //   GET  <allowlisted-origin>/api/user/self            newapi 余额
-  // 不调用任何 test / probe / 测活类接口。模型同步只会由用户明确点击触发，
-  // 健康度仍然只反映“真实流量触发的状态”。
+  // 用户脚本不调用任何 test / probe / 测活类接口。模型同步和账号识别/创建只会由用户明确点击触发；
+  // OpenAI 创建后的 Responses 能力探测是官方 create 端点的后端异步副作用。健康度仍然只反映“真实流量触发的状态”。
   // ===========================================================================
 
   const SUB2_PANEL_ID = 'sub2-smart-group-panel';
@@ -120,7 +123,7 @@
   const SUB2_CAPACITY_HIGH_LOAD_RATIO = 0.8;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '2.5.0';
+    : '2.6.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -135,6 +138,7 @@
     'llama3-', 'meta-llama', 'mistral-', 'mixtral-', 'baichuan-', 'ernie-', 'step-', 'seed-', 'yi-',
   ]);
   const SUB2_MODEL_SYNC_PLATFORMS = Object.freeze(['openai', 'anthropic']);
+  const SUB2_ACCOUNT_CREATE_TIMEOUT_MS = 30000;
   const SUB2_OPENAI_NON_TEXT_MODEL_MARKER = /(?:^|[-_.])(?:image|images|audio|realtime|transcribe|transcription|speech|tts|embedding|embeddings)(?:$|[-_.])/;
 
   function sub2StorageGet(key, fallback) {
@@ -2736,6 +2740,277 @@
     return `抓取 ${Number(counts?.fetched) || 0} 个，允许 ${Number(counts?.allowed) || 0} 个，排除 ${Number(counts?.excluded) || 0} 个，持久化 ${Number(counts?.persisted) || 0} 个`;
   }
 
+  function sub2NormalizeAccountBaseUrl(rawValue) {
+    const value = String(rawValue || '').trim();
+    if (!value) return { ok: false, baseUrl: '', hostname: '', reason: 'missing-url' };
+
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(value);
+    } catch {
+      return { ok: false, baseUrl: '', hostname: '', reason: 'invalid-url' };
+    }
+
+    const authorityMatch = /^[a-z][a-z\d+.-]*:\/\/([^/?#\\]*)/i.exec(value);
+    const hasExplicitUserinfo = Boolean(authorityMatch?.[1]?.includes('@'));
+    if (parsedUrl.username || parsedUrl.password || hasExplicitUserinfo) {
+      return { ok: false, baseUrl: '', hostname: '', reason: 'embedded-credentials' };
+    }
+    if (parsedUrl.search || value.includes('?')) {
+      return { ok: false, baseUrl: '', hostname: '', reason: 'query-not-allowed' };
+    }
+    if (parsedUrl.hash || value.includes('#')) {
+      return { ok: false, baseUrl: '', hostname: '', reason: 'fragment-not-allowed' };
+    }
+
+    const protocol = parsedUrl.protocol.toLowerCase();
+    const hostname = parsedUrl.hostname.toLowerCase();
+    const loopbackHosts = ['localhost', '127.0.0.1', '[::1]', '::1'];
+    if (protocol !== 'https:' && !(protocol === 'http:' && loopbackHosts.includes(hostname))) {
+      return { ok: false, baseUrl: '', hostname: '', reason: 'unsupported-protocol' };
+    }
+    if (!hostname) return { ok: false, baseUrl: '', hostname: '', reason: 'missing-host' };
+
+    const pathname = parsedUrl.pathname.replace(/\/+$/, '');
+    return {
+      ok: true,
+      baseUrl: `${parsedUrl.origin}${pathname === '/' ? '' : pathname}`,
+      hostname,
+      reason: '',
+    };
+  }
+
+  function sub2EvaluateAccountPreviewCandidates(settledResults) {
+    const platforms = SUB2_MODEL_SYNC_PLATFORMS;
+    const candidates = platforms.map((platform, index) => {
+      const settledResult = Array.isArray(settledResults) ? settledResults[index] : null;
+      if (!settledResult || settledResult.status !== 'fulfilled') {
+        return {
+          platform,
+          valid: false,
+          reason: 'request-failed',
+          fetched: [],
+          allowedModels: [],
+          excluded: [],
+          counts: { fetched: 0, allowed: 0, excluded: 0 },
+        };
+      }
+      const responseModels = Array.isArray(settledResult.value)
+        ? settledResult.value
+        : settledResult.value?.models;
+      if (!Array.isArray(responseModels)) {
+        return {
+          platform,
+          valid: false,
+          reason: 'invalid-response',
+          fetched: [],
+          allowedModels: [],
+          excluded: [],
+          counts: { fetched: 0, allowed: 0, excluded: 0 },
+        };
+      }
+      const filtered = sub2FilterModelsForPlatform(responseModels, platform);
+      return {
+        platform,
+        valid: filtered.allowed.length > 0,
+        reason: filtered.allowed.length ? 'matched' : 'no-family-models',
+        fetched: filtered.fetched,
+        allowedModels: filtered.allowed,
+        excluded: filtered.excluded,
+        counts: filtered.counts,
+      };
+    });
+    const validCandidates = candidates.filter((candidate) => candidate.valid);
+    return {
+      ok: validCandidates.length === 1,
+      reason: validCandidates.length === 1
+        ? 'resolved'
+        : validCandidates.length > 1
+          ? 'ambiguous-platform'
+          : 'unsupported-platform',
+      candidate: validCandidates.length === 1 ? validCandidates[0] : null,
+      candidates,
+      validCandidates,
+    };
+  }
+
+  function sub2GetGroupCollectionValues(groups) {
+    if (Array.isArray(groups)) return groups;
+    if (groups && typeof groups.values === 'function') return Array.from(groups.values());
+    if (groups && typeof groups === 'object') return Object.values(groups);
+    return [];
+  }
+
+  function sub2IsGroupExplicitlyInactive(group) {
+    const status = String(group?.status || '').trim().toLowerCase();
+    return group?.active === false
+      || group?.is_active === false
+      || group?.enabled === false
+      || status === 'inactive'
+      || status === 'disabled';
+  }
+
+  function sub2CollectCompatibleAccountGroups(groups, targetPlatform) {
+    const platform = sub2NormalizeModelPlatform(targetPlatform);
+    if (!SUB2_MODEL_SYNC_PLATFORMS.includes(platform)) return [];
+    const groupsByNumericId = new Map();
+    for (const group of sub2GetGroupCollectionValues(groups)) {
+      const groupId = Number(group?.id);
+      if (!Number.isInteger(groupId) || groupId <= 0) continue;
+      if (sub2NormalizeModelPlatform(group?.platform) !== platform) continue;
+      if (sub2IsGroupExplicitlyInactive(group)) continue;
+      groupsByNumericId.set(groupId, {
+        id: groupId,
+        key: `id:${groupId}`,
+        name: sub2GetFirstReadableText(group?.name) || `分组 ${groupId}`,
+        platform,
+        status: sub2GetFirstReadableText(group?.status),
+      });
+    }
+    return Array.from(groupsByNumericId.values()).sort((leftGroup, rightGroup) => (
+      leftGroup.name.localeCompare(rightGroup.name) || leftGroup.id - rightGroup.id
+    ));
+  }
+
+  function sub2ResolveAccountCreateGroupSelection(compatibleGroups, activeGroupFilter = '') {
+    const groups = Array.isArray(compatibleGroups) ? compatibleGroups : [];
+    if (!groups.length) {
+      return { blocked: true, selectedGroupId: null, requiresSelection: false, reason: 'no-compatible-group' };
+    }
+    const activeMatch = /^id:(\d+)$/.exec(String(activeGroupFilter || '').trim());
+    const activeGroupId = activeMatch ? Number(activeMatch[1]) : null;
+    const selectedGroup = Number.isInteger(activeGroupId)
+      ? groups.find((group) => group.id === activeGroupId)
+      : null;
+    if (selectedGroup) {
+      return { blocked: false, selectedGroupId: selectedGroup.id, requiresSelection: false, reason: 'active-filter' };
+    }
+    if (groups.length === 1) {
+      return { blocked: false, selectedGroupId: groups[0].id, requiresSelection: false, reason: 'sole-compatible-group' };
+    }
+    return { blocked: false, selectedGroupId: null, requiresSelection: true, reason: 'selection-required' };
+  }
+
+  function sub2BuildUniqueAccountName(baseUrl, platform, accounts) {
+    const normalizedUrl = sub2NormalizeAccountBaseUrl(baseUrl);
+    if (!normalizedUrl.ok) return '';
+    const familyLabel = sub2NormalizeModelPlatform(platform) === 'anthropic' ? 'Claude' : 'GPT';
+    const baseName = `${normalizedUrl.hostname} | ${familyLabel}`;
+    const existingNames = new Set((Array.isArray(accounts) ? accounts : [])
+      .map((account) => String(account?.name || '').trim().toLocaleLowerCase())
+      .filter(Boolean));
+    if (!existingNames.has(baseName.toLocaleLowerCase())) return baseName;
+    let suffix = 2;
+    while (existingNames.has(`${baseName} (${suffix})`.toLocaleLowerCase())) suffix += 1;
+    return `${baseName} (${suffix})`;
+  }
+
+  function sub2IsAccountNameAvailable(name, accounts) {
+    const normalizedName = String(name || '').trim().toLocaleLowerCase();
+    if (!normalizedName) return false;
+    return !(Array.isArray(accounts) ? accounts : []).some(
+      (account) => String(account?.name || '').trim().toLocaleLowerCase() === normalizedName,
+    );
+  }
+
+  function sub2ComputeAccountCreatePriority(accounts, groupId, groupsById = null) {
+    const numericGroupId = Number(groupId);
+    if (!Number.isInteger(numericGroupId) || numericGroupId <= 0) return 1;
+    const groupPlatform = sub2NormalizeModelPlatform(
+      sub2GetIndexedGroup(groupsById, numericGroupId)?.platform,
+    );
+    const memberPriorities = (Array.isArray(accounts) ? accounts : [])
+      .filter((account) => (
+        (!groupPlatform || sub2NormalizeModelPlatform(account?.platform) === groupPlatform)
+        && sub2GetGroupMemberships(account, groupsById)
+          .some((membership) => membership.groupId === numericGroupId)
+      ))
+      .map((account) => Number(account?.priority))
+      .filter(Number.isFinite)
+      .map((priority) => Math.trunc(priority));
+    return memberPriorities.length ? Math.max(0, ...memberPriorities) + 1 : 1;
+  }
+
+  function sub2BuildIdentityModelMapping(modelIds) {
+    return Object.fromEntries(sub2NormalizeFetchedModelIds(modelIds).map((modelId) => [modelId, modelId]));
+  }
+
+  function sub2BuildCreateAccountPayload(input) {
+    const name = String(input?.name || '').trim();
+    if (!name) throw new TypeError('A non-empty account name is required.');
+    const platform = sub2NormalizeModelPlatform(input?.platform);
+    if (!SUB2_MODEL_SYNC_PLATFORMS.includes(platform)) throw new TypeError('A supported platform is required.');
+    const normalizedUrl = sub2NormalizeAccountBaseUrl(input?.baseUrl);
+    if (!normalizedUrl.ok) throw new TypeError('A valid account base URL is required.');
+    const apiKey = String(input?.apiKey || '').trim();
+    if (!apiKey) throw new TypeError('A non-empty API key is required.');
+    const groupId = Number(input?.groupId);
+    if (!Number.isInteger(groupId) || groupId <= 0) throw new TypeError('A compatible group is required.');
+    const priority = Number(input?.priority);
+    if (!Number.isInteger(priority) || priority <= 0) throw new TypeError('A positive account priority is required.');
+    const allowedModelIds = sub2FilterModelsForPlatform(input?.allowedModelIds, platform).allowed;
+    const modelMapping = sub2BuildIdentityModelMapping(allowedModelIds);
+    if (!Object.keys(modelMapping).length) throw new TypeError('At least one allowed model is required.');
+    return {
+      name,
+      platform,
+      type: 'apikey',
+      credentials: {
+        base_url: normalizedUrl.baseUrl,
+        api_key: apiKey,
+        model_mapping: modelMapping,
+      },
+      concurrency: 1,
+      priority,
+      rate_multiplier: 1,
+      group_ids: [groupId],
+    };
+  }
+
+  function sub2BuildAccountCreateAttemptFingerprint(payload) {
+    return JSON.stringify({
+      name: String(payload?.name || '').trim(),
+      platform: sub2NormalizeModelPlatform(payload?.platform),
+      type: String(payload?.type || ''),
+      baseUrl: String(payload?.credentials?.base_url || ''),
+      modelIds: Object.keys(payload?.credentials?.model_mapping || {}).sort(),
+      concurrency: Number(payload?.concurrency),
+      priority: Number(payload?.priority),
+      rateMultiplier: Number(payload?.rate_multiplier),
+      groupIds: (Array.isArray(payload?.group_ids) ? payload.group_ids : []).map(Number).sort((a, b) => a - b),
+    });
+  }
+
+  function sub2GenerateIdempotencyKey() {
+    if (typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID();
+    const randomParts = new Uint32Array(4);
+    if (typeof globalThis.crypto?.getRandomValues === 'function') {
+      globalThis.crypto.getRandomValues(randomParts);
+    } else {
+      for (let index = 0; index < randomParts.length; index += 1) {
+        randomParts[index] = Math.floor(Math.random() * 0x100000000);
+      }
+    }
+    return `sub2-${Date.now().toString(36)}-${Array.from(randomParts)
+      .map((part) => part.toString(16).padStart(8, '0'))
+      .join('')}`;
+  }
+
+  function sub2IsRetryableAccountCreateError(error) {
+    if (error?.name === 'AbortError') return true;
+    const status = Number(error?.status);
+    if (Number.isInteger(status) && status > 0) {
+      if (status >= 500 || [408, 425, 429].includes(status)) return true;
+      if (status !== 409) return false;
+      return ['IDEMPOTENCY_IN_PROGRESS', 'IDEMPOTENCY_RETRY_BACKOFF'].includes(
+        String(error?.reason || '').trim().toUpperCase(),
+      );
+    }
+    const errorCode = error?.code;
+    if (errorCode !== null && errorCode !== undefined && String(errorCode).trim()) return false;
+    return true;
+  }
+
   function sub2NormalizeModels(payload) {
     const candidateCollections = [
       payload,
@@ -3716,9 +3991,17 @@
     });
   }
 
-  async function sub2ApiRequest(method, path, body, signal = null) {
+  async function sub2ApiRequest(method, path, body, signal = null, additionalHeaders = null) {
     const token = sub2ReadAuthToken();
     const headers = { Accept: 'application/json' };
+    if (additionalHeaders && typeof additionalHeaders === 'object') {
+      for (const [headerName, headerValue] of Object.entries(additionalHeaders)) {
+        const normalizedHeaderName = String(headerName || '').trim();
+        if (!normalizedHeaderName || headerValue === null || headerValue === undefined) continue;
+        if (['accept', 'authorization', 'content-type'].includes(normalizedHeaderName.toLowerCase())) continue;
+        headers[normalizedHeaderName] = String(headerValue);
+      }
+    }
     if (token) headers.Authorization = `Bearer ${token}`;
     const options = { method, headers, credentials: 'same-origin' };
     if (signal) options.signal = signal;
@@ -3736,11 +4019,24 @@
     if (!response.ok) {
       const error = new Error(payload?.message || `HTTP ${response.status}`);
       error.status = response.status;
+      const errorCode = payload?.code ?? payload?.error?.code;
+      const errorReason = payload?.reason
+        ?? payload?.error?.reason
+        ?? (typeof payload?.error === 'string' ? payload.error : '');
+      if (errorCode !== null && errorCode !== undefined && String(errorCode).trim()) {
+        error.code = errorCode;
+      }
+      if (errorReason !== null && errorReason !== undefined && String(errorReason).trim()) {
+        error.reason = String(errorReason).trim();
+      }
       throw error;
     }
     if (payload && typeof payload.code === 'number' && payload.code !== 0) {
       const error = new Error(payload.message || `业务错误 code=${payload.code}`);
       error.code = payload.code;
+      if (payload.reason !== null && payload.reason !== undefined && String(payload.reason).trim()) {
+        error.reason = String(payload.reason).trim();
+      }
       throw error;
     }
     return payload ? payload.data : null;
@@ -3759,6 +4055,22 @@
   async function sub2FetchAccounts() {
     const data = await sub2ApiRequest('GET', '/admin/accounts?page=1&page_size=200');
     return Array.isArray(data?.items) ? data.items : [];
+  }
+
+  async function sub2FetchAllAccounts() {
+    const pageSize = 1000;
+    const accounts = [];
+    for (let page = 1; ; page += 1) {
+      const data = await sub2ApiRequest('GET', `/admin/accounts?page=${page}&page_size=${pageSize}`);
+      const items = Array.isArray(data?.items) ? data.items : [];
+      accounts.push(...items);
+      const total = Number(data?.total);
+      if (!items.length
+        || items.length < pageSize
+        || (Number.isFinite(total) && accounts.length >= total)) {
+        return accounts;
+      }
+    }
   }
 
   async function sub2FetchAccount(accountId) {
@@ -3988,6 +4300,31 @@
     return sub2ApiRequest('POST', '/admin/accounts/bulk-update', payload);
   }
 
+  async function sub2PreviewAccountModels(platform, baseUrl, apiKey) {
+    const data = await sub2ApiRequest('POST', '/admin/accounts/models/sync-upstream-preview', {
+      platform,
+      type: 'apikey',
+      base_url: baseUrl,
+      api_key: apiKey,
+    });
+    if (!data || !Array.isArray(data.models)) throw new Error('Account preview did not return models.');
+    return data.models;
+  }
+
+  async function sub2CreateAccount(payload, idempotencyKey) {
+    const normalizedIdempotencyKey = String(idempotencyKey || '').trim();
+    if (!normalizedIdempotencyKey) throw new TypeError('An idempotency key is required.');
+    const abortController = new AbortController();
+    const timeoutId = window.setTimeout(() => abortController.abort(), SUB2_ACCOUNT_CREATE_TIMEOUT_MS);
+    try {
+      return await sub2ApiRequest('POST', '/admin/accounts', payload, abortController.signal, {
+        'Idempotency-Key': normalizedIdempotencyKey,
+      });
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  }
+
   async function sub2SetSchedulable(accountId, schedulable) {
     return sub2ApiRequest('POST', `/admin/accounts/${accountId}/schedulable`, { schedulable });
   }
@@ -4028,7 +4365,7 @@
     #${SUB2_PANEL_ID}.sub2-hidden{display:none;}
     #${SUB2_PANEL_ID} .sub2-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;
       background:#0f172a;color:#fff;}
-    #${SUB2_PANEL_ID} .sub2-head b{font-size:14px;}
+    #${SUB2_PANEL_ID} .sub2-head b{min-width:0;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-version{margin-left:5px;color:#93c5fd;font-size:11px;font-weight:600;}
     #${SUB2_PANEL_ID} .sub2-head .sub2-min{background:transparent;border:none;color:#cbd5e1;cursor:pointer;font-size:16px;line-height:1;}
     #${SUB2_PANEL_ID} .sub2-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid #f1f5f9;}
@@ -4039,7 +4376,17 @@
     #${SUB2_PANEL_ID} .sub2-chip.down{background:#fee2e2;color:#991b1b;}
     #${SUB2_PANEL_ID} .sub2-chip.info{background:#dbeafe;color:#1d4ed8;}
     #${SUB2_PANEL_ID} .sub2-chip.muted{background:#f1f5f9;color:#64748b;}
-    #${SUB2_PANEL_ID} .sub2-head-actions{display:flex;align-items:center;gap:7px;}
+    #${SUB2_PANEL_ID} .sub2-head-actions{display:flex;align-items:center;gap:7px;flex:none;}
+    #${SUB2_PANEL_ID} .sub2-head-actions>button{white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-account-add-open{width:25px;height:25px;display:inline-flex;align-items:center;justify-content:center;
+      flex:none;border:1px solid #86efac;border-radius:6px;background:#f0fdf4;color:#166534;font-size:18px;line-height:1;cursor:pointer;}
+    #${SUB2_PANEL_ID} .sub2-account-add-open:hover{background:#dcfce7;}
+    #${SUB2_PANEL_ID} .sub2-audit-open,#${SUB2_PANEL_ID} .sub2-events-open{border-radius:999px;padding:3px 8px;
+      font-size:11px;font-weight:700;cursor:pointer;}
+    #${SUB2_PANEL_ID} .sub2-audit-open{border:1px solid #cbd5e1;background:#f8fafc;color:#334155;}
+    #${SUB2_PANEL_ID} .sub2-audit-open:hover{background:#f1f5f9;}
+    #${SUB2_PANEL_ID} .sub2-events-open{border:1px solid #fbbf24;background:#fffbeb;color:#92400e;}
+    #${SUB2_PANEL_ID} .sub2-events-open:hover{background:#fef3c7;}
     #${SUB2_PANEL_ID} .sub2-diagnostics-open{border:1px solid #60a5fa;border-radius:999px;padding:3px 9px;
       background:#eff6ff;color:#1d4ed8;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-diagnostics-open:hover{background:#dbeafe;}
@@ -4085,7 +4432,7 @@
     #${SUB2_PANEL_ID} .sub2-list{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;
       padding:6px 8px;display:flex;flex-direction:column;gap:6px;}
     #${SUB2_PANEL_ID} .sub2-list.sub2-flat-list{display:flex;flex-direction:column;}
-    #${SUB2_PANEL_ID} .sub2-group{border:1px solid #cbd5e1;border-radius:9px;background:#f8fafc;overflow:hidden;}
+    #${SUB2_PANEL_ID} .sub2-group{flex:0 0 auto;border:1px solid #cbd5e1;border-radius:9px;background:#f8fafc;overflow:hidden;}
     #${SUB2_PANEL_ID} .sub2-group-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;padding:8px 9px;
       border-bottom:1px solid #e2e8f0;background:#eef2ff;}
     #${SUB2_PANEL_ID} .sub2-group-title{display:flex;align-items:center;gap:6px;min-width:0;}
@@ -4185,8 +4532,38 @@
       font-size:10px;line-height:1.45;}
     #${SUB2_PANEL_ID} .sub2-balance-message{grid-column:1 / -1;color:#b91c1c;font-size:10px;line-height:1.45;}
     #${SUB2_PANEL_ID} .sub2-balance-message:empty{display:none;}
-    #${SUB2_PANEL_ID} .sub2-status{padding:6px 12px;border-top:1px solid #f1f5f9;font-size:11px;color:#64748b;}
+    #${SUB2_PANEL_ID} .sub2-status{padding:6px 12px;border-top:1px solid #f1f5f9;font-size:11px;color:#64748b;overflow-wrap:anywhere;}
     #${SUB2_PANEL_ID} .sub2-status.error{color:#b91c1c;}
+    #${SUB2_PANEL_ID} .sub2-account-create-overlay{position:absolute;inset:0;z-index:24;display:flex;justify-content:flex-end;
+      background:rgba(15,23,42,.36);backdrop-filter:blur(1px);}
+    #${SUB2_PANEL_ID} .sub2-account-create-overlay[hidden]{display:none;}
+    #${SUB2_PANEL_ID} .sub2-account-create-dialog{width:100%;height:100%;display:flex;flex-direction:column;background:#fff;
+      border-left:1px solid #cbd5e1;box-shadow:-10px 0 28px rgba(15,23,42,.16);}
+    #${SUB2_PANEL_ID} .sub2-account-create-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:12px 14px;
+      border-bottom:1px solid #e2e8f0;background:#f8fafc;}
+    #${SUB2_PANEL_ID} .sub2-account-create-title{display:block;font-size:14px;}
+    #${SUB2_PANEL_ID} .sub2-account-create-subtitle{margin-top:3px;color:#64748b;font-size:11px;line-height:1.4;}
+    #${SUB2_PANEL_ID} .sub2-account-create-close{border:none;background:transparent;color:#64748b;cursor:pointer;font-size:20px;line-height:1;padding:0 2px;}
+    #${SUB2_PANEL_ID} .sub2-account-create-close:disabled{opacity:.5;cursor:not-allowed;}
+    #${SUB2_PANEL_ID} .sub2-account-create-body{flex:1;min-height:0;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px;}
+    #${SUB2_PANEL_ID} .sub2-account-create-section{display:flex;flex-direction:column;gap:10px;}
+    #${SUB2_PANEL_ID} .sub2-account-create-section[hidden]{display:none;}
+    #${SUB2_PANEL_ID} .sub2-account-create-field{display:flex;flex-direction:column;gap:4px;color:#475569;font-size:11px;}
+    #${SUB2_PANEL_ID} .sub2-account-create-field input,#${SUB2_PANEL_ID} .sub2-account-create-field select{width:100%;min-width:0;height:34px;
+      box-sizing:border-box;border:1px solid #cbd5e1;border-radius:6px;padding:6px 8px;background:#fff;color:#0f172a;font-size:12px;outline:none;}
+    #${SUB2_PANEL_ID} .sub2-account-create-field input:focus,#${SUB2_PANEL_ID} .sub2-account-create-field select:focus{
+      border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,.12);}
+    #${SUB2_PANEL_ID} .sub2-account-create-facts{display:grid;grid-template-columns:minmax(96px,auto) minmax(0,1fr);gap:0;
+      border-top:1px solid #e2e8f0;border-bottom:1px solid #e2e8f0;}
+    #${SUB2_PANEL_ID} .sub2-account-create-fact-label,#${SUB2_PANEL_ID} .sub2-account-create-fact-value{padding:7px 5px;border-bottom:1px solid #f1f5f9;font-size:11px;line-height:1.4;}
+    #${SUB2_PANEL_ID} .sub2-account-create-fact-label{color:#64748b;}
+    #${SUB2_PANEL_ID} .sub2-account-create-fact-value{min-width:0;color:#0f172a;font-weight:650;overflow-wrap:anywhere;}
+    #${SUB2_PANEL_ID} .sub2-account-create-fact-label:nth-last-child(-n+2),#${SUB2_PANEL_ID} .sub2-account-create-fact-value:last-child{border-bottom:none;}
+    #${SUB2_PANEL_ID} .sub2-account-create-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;padding-top:2px;}
+    #${SUB2_PANEL_ID} .sub2-account-create-message{min-height:18px;padding:7px 8px;border-radius:6px;background:#f8fafc;color:#475569;font-size:11px;line-height:1.45;}
+    #${SUB2_PANEL_ID} .sub2-account-create-message:empty{display:none;}
+    #${SUB2_PANEL_ID} .sub2-account-create-message.error{background:#fef2f2;color:#b91c1c;}
+    #${SUB2_PANEL_ID} .sub2-account-create-boundary{padding:7px 8px;border-left:3px solid #60a5fa;background:#eff6ff;color:#1e40af;font-size:10px;line-height:1.5;}
     #${SUB2_PANEL_ID} .sub2-model-overlay{position:absolute;inset:0;z-index:20;display:flex;justify-content:flex-end;
       background:rgba(15,23,42,.36);backdrop-filter:blur(1px);}
     #${SUB2_PANEL_ID} .sub2-model-overlay[hidden]{display:none;}
@@ -4336,6 +4713,10 @@
     #${SUB2_PANEL_ID} .sub2-audit-action:hover{background:#f1f5f9;}
     @media (max-width:760px){
       #${SUB2_PANEL_ID}{width:calc(100vw - 24px);right:12px;bottom:70px;height:min(80vh,720px);}
+      #${SUB2_PANEL_ID} .sub2-head{align-items:stretch;flex-direction:column;gap:6px;}
+      #${SUB2_PANEL_ID} .sub2-head-actions{display:grid;grid-template-columns:25px repeat(3,minmax(0,1fr)) 25px;gap:4px;width:100%;}
+      #${SUB2_PANEL_ID} .sub2-head-actions>button{min-width:0;padding-left:4px;padding-right:4px;}
+      #${SUB2_PANEL_ID} .sub2-head .sub2-min{width:25px;padding:0;}
     }
   `;
 
@@ -4362,6 +4743,14 @@
       this.diagnosticsBodyElement = null;
       this.eventsOverlayElement = null;
       this.eventsBodyElement = null;
+      this.accountCreateOverlayElement = null;
+      this.accountCreateInputSectionElement = null;
+      this.accountCreateReviewSectionElement = null;
+      this.accountCreateUrlElement = null;
+      this.accountCreateKeyElement = null;
+      this.accountCreateNameElement = null;
+      this.accountCreateGroupElement = null;
+      this.accountCreateMessageElement = null;
       this.accounts = [];
       this.groupsById = new Map();
       this.statsById = {};
@@ -4435,6 +4824,18 @@
       this.modelError = '';
       this.modelRequestSequence = 0;
       this.savedModelsByAccountId = new Map();
+      this.accountCreateOpen = false;
+      this.accountCreatePhase = 'input';
+      this.accountCreatePending = false;
+      this.accountCreateOperation = '';
+      this.accountCreatePreview = null;
+      this.accountCreateError = '';
+      this.accountCreateMessage = '';
+      this.accountCreateKeyBaseUrl = '';
+      this.accountCreateIdempotencyKey = '';
+      this.accountCreateAttemptFingerprint = '';
+      this.accountCreateRequestSequence = 0;
+      this.accountCreateResultMessage = '';
       this.diagnosticsOpen = false;
       this.eventsOpen = false;
       this.auditOpen = false;
@@ -4507,6 +4908,7 @@
         <div class="sub2-head">
           <b>Sub2 账号健康 / 路由 <span class="sub2-version">v${SUB2_SCRIPT_VERSION}</span></b>
           <div class="sub2-head-actions">
+            <button type="button" class="sub2-account-add-open" title="添加账号" aria-label="添加账号">+</button>
             <button type="button" class="sub2-audit-open">配置审计</button>
             <button type="button" class="sub2-events-open">事件中心</button>
             <button type="button" class="sub2-diagnostics-open">路由历史</button>
@@ -4556,6 +4958,55 @@
         </div>
         <div class="sub2-list"></div>
         <div class="sub2-status">加载中…</div>
+        <div class="sub2-account-create-overlay" hidden>
+          <section class="sub2-account-create-dialog" role="dialog" aria-modal="true" aria-labelledby="sub2-account-create-title">
+            <div class="sub2-account-create-head">
+              <div>
+                <strong id="sub2-account-create-title" class="sub2-account-create-title">添加账号</strong>
+                <div class="sub2-account-create-subtitle">支持 OpenAI / GPT 与 Anthropic / Claude API Key 账号。</div>
+              </div>
+              <button type="button" class="sub2-account-create-close" title="关闭" aria-label="关闭添加账号">×</button>
+            </div>
+            <div class="sub2-account-create-body">
+              <div class="sub2-account-create-section sub2-account-create-input-section">
+                <label class="sub2-account-create-field">上游地址
+                  <input type="url" class="sub2-account-create-url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://api.example.com/v1" />
+                </label>
+                <label class="sub2-account-create-field">API Key
+                  <input type="password" class="sub2-account-create-key" autocomplete="new-password" spellcheck="false" />
+                </label>
+                <div class="sub2-account-create-boundary">识别只调用本机 sub2 Admin API；不会从浏览器直接请求该地址。</div>
+                <div class="sub2-account-create-message sub2-account-create-input-message"></div>
+                <div class="sub2-account-create-actions">
+                  <button type="button" class="sub2-btn sub2-account-create-cancel">取消</button>
+                  <button type="button" class="sub2-btn primary sub2-account-create-detect">识别</button>
+                </div>
+              </div>
+              <div class="sub2-account-create-section sub2-account-create-review-section" hidden>
+                <div class="sub2-account-create-facts">
+                  <div class="sub2-account-create-fact-label">平台</div><div class="sub2-account-create-fact-value sub2-account-create-platform-value"></div>
+                  <div class="sub2-account-create-fact-label">上游地址</div><div class="sub2-account-create-fact-value sub2-account-create-url-value"></div>
+                  <div class="sub2-account-create-fact-label">允许模型</div><div class="sub2-account-create-fact-value sub2-account-create-model-value"></div>
+                  <div class="sub2-account-create-fact-label">并发</div><div class="sub2-account-create-fact-value">1</div>
+                  <div class="sub2-account-create-fact-label">账号级优先级</div><div class="sub2-account-create-fact-value sub2-account-create-priority-value"></div>
+                </div>
+                <label class="sub2-account-create-field">账号名称
+                  <input type="text" class="sub2-account-create-name" autocomplete="off" maxlength="120" />
+                </label>
+                <label class="sub2-account-create-field">目标分组
+                  <select class="sub2-account-create-group"></select>
+                </label>
+                <div class="sub2-account-create-boundary">创建后以后端回读的组内优先级为准。</div>
+                <div class="sub2-account-create-message sub2-account-create-review-message"></div>
+                <div class="sub2-account-create-actions">
+                  <button type="button" class="sub2-btn sub2-account-create-back">返回</button>
+                  <button type="button" class="sub2-btn sub2-account-create-cancel">取消</button>
+                  <button type="button" class="sub2-btn primary sub2-account-create-submit">创建</button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
         <div class="sub2-model-overlay" hidden>
           <section class="sub2-model-drawer" role="dialog" aria-modal="true" aria-labelledby="sub2-model-title">
             <div class="sub2-model-head">
@@ -4640,6 +5091,14 @@
       this.eventsBodyElement = this.root.querySelector('.sub2-events-body');
       this.auditOverlayElement = this.root.querySelector('.sub2-audit-overlay');
       this.auditBodyElement = this.root.querySelector('.sub2-audit-body');
+      this.accountCreateOverlayElement = this.root.querySelector('.sub2-account-create-overlay');
+      this.accountCreateInputSectionElement = this.root.querySelector('.sub2-account-create-input-section');
+      this.accountCreateReviewSectionElement = this.root.querySelector('.sub2-account-create-review-section');
+      this.accountCreateUrlElement = this.root.querySelector('.sub2-account-create-url');
+      this.accountCreateKeyElement = this.root.querySelector('.sub2-account-create-key');
+      this.accountCreateNameElement = this.root.querySelector('.sub2-account-create-name');
+      this.accountCreateGroupElement = this.root.querySelector('.sub2-account-create-group');
+      this.accountCreateMessageElement = this.root.querySelector('.sub2-account-create-input-message');
 
       // 重建列表时浏览器也会派发 scroll（清空 DOM 会把 scrollTop 归零），
       // 那不是用户操作，不能覆盖已保存的位置、也不该延长滚动静默期。
@@ -4653,6 +5112,7 @@
       this.viewElement.value = this.viewMode;
       this.sortElement.value = this.sortMode;
       this.root.querySelector('.sub2-min').addEventListener('click', () => this.setMinimized(true));
+      this.root.querySelector('.sub2-account-add-open')?.addEventListener('click', (event) => this.openAccountCreateModal(event));
       this.root.querySelector('.sub2-audit-open')?.addEventListener('click', () => this.openAuditDrawer());
       this.root.querySelector('.sub2-events-open')?.addEventListener('click', () => this.openEventsDrawer());
       this.root.querySelector('.sub2-diagnostics-open')?.addEventListener('click', () => this.openDiagnosticsDrawer());
@@ -4699,6 +5159,21 @@
         }
       };
       document.addEventListener('click', this.outsideClickHandler);
+
+      this.root.querySelector('.sub2-account-create-close')?.addEventListener('click', () => this.closeAccountCreateModal());
+      this.root.querySelectorAll('.sub2-account-create-cancel').forEach((button) => {
+        button.addEventListener('click', () => this.closeAccountCreateModal());
+      });
+      this.accountCreateOverlayElement?.addEventListener('click', (event) => {
+        if (event.target === this.accountCreateOverlayElement) this.closeAccountCreateModal();
+      });
+      this.accountCreateUrlElement?.addEventListener('input', () => this.handleAccountCreateUrlInput());
+      this.accountCreateKeyElement?.addEventListener('input', () => this.handleAccountCreateKeyInput());
+      this.accountCreateNameElement?.addEventListener('input', () => this.handleAccountCreateReviewInput());
+      this.accountCreateGroupElement?.addEventListener('change', () => this.handleAccountCreateReviewInput(true));
+      this.root.querySelector('.sub2-account-create-detect')?.addEventListener('click', (event) => this.handleAccountCreateDetection(event));
+      this.root.querySelector('.sub2-account-create-back')?.addEventListener('click', () => this.returnToAccountCreateInput());
+      this.root.querySelector('.sub2-account-create-submit')?.addEventListener('click', (event) => this.handleAccountCreateSubmit(event));
 
       this.root.querySelector('.sub2-model-close')?.addEventListener('click', () => this.closeModelDrawer());
       this.modelOverlayElement?.addEventListener('click', (event) => {
@@ -4924,13 +5399,22 @@
       return this.quotaSaving
         || this.capacitySaving
         || this.balanceQueryingIds.size > 0
+        || this.accountCreateOpen
         || this.hasOpenQuotaEditor()
         || this.hasOpenCapacityEditor()
         || this.hasOpenBalanceEditor();
     }
 
+    isAccountCreateMutationPending() {
+      return this.accountCreateOpen
+        && this.accountCreatePending
+        && this.accountCreateOperation === 'create';
+    }
+
     setMinimized(minimized) {
+      if (minimized === true && this.isAccountCreateMutationPending()) return;
       this.minimized = minimized === true;
+      if (this.minimized) this.closeAccountCreateModal(false);
       sub2StorageSet('minimized', this.minimized);
       this.applyMinimized();
       if (!this.minimized) {
@@ -4942,6 +5426,508 @@
     applyMinimized() {
       if (!this.root) return;
       this.root.classList.toggle('sub2-hidden', this.minimized);
+    }
+
+    clearAccountCreateSecret() {
+      if (this.accountCreateKeyElement) this.accountCreateKeyElement.value = '';
+      this.accountCreateKeyBaseUrl = '';
+    }
+
+    invalidateAccountCreateAttempt() {
+      this.accountCreateIdempotencyKey = '';
+      this.accountCreateAttemptFingerprint = '';
+    }
+
+    openAccountCreateModal(event) {
+      if (!event || event.isTrusted !== true) return;
+      this.closeAuditDrawer();
+      this.closeEventsDrawer();
+      this.closeDiagnosticsDrawer();
+      this.closeModelDrawer();
+      this.discardActiveEditorDraft();
+      this.renderList({ captureEditorFocus: false });
+      this.accountCreateRequestSequence += 1;
+      this.accountCreateOpen = true;
+      this.accountCreatePhase = 'input';
+      this.accountCreatePending = false;
+      this.accountCreateOperation = '';
+      this.accountCreatePreview = null;
+      this.accountCreateError = '';
+      this.accountCreateMessage = '';
+      this.accountCreateResultMessage = '';
+      this.invalidateAccountCreateAttempt();
+      this.clearAccountCreateSecret();
+      if (this.accountCreateUrlElement) this.accountCreateUrlElement.value = '';
+      if (this.accountCreateNameElement) this.accountCreateNameElement.value = '';
+      if (this.accountCreateGroupElement) this.accountCreateGroupElement.textContent = '';
+      if (this.accountCreateOverlayElement) this.accountCreateOverlayElement.hidden = false;
+      this.renderAccountCreateModal();
+      this.renderStatus();
+      this.accountCreateUrlElement?.focus();
+    }
+
+    closeAccountCreateModal(refreshAfter = true, force = false) {
+      if (!force && this.isAccountCreateMutationPending()) return false;
+      const wasOpen = this.accountCreateOpen;
+      this.accountCreateRequestSequence += 1;
+      this.accountCreateOpen = false;
+      this.accountCreatePhase = 'input';
+      this.accountCreatePending = false;
+      this.accountCreateOperation = '';
+      this.accountCreatePreview = null;
+      this.accountCreateError = '';
+      this.accountCreateMessage = '';
+      this.invalidateAccountCreateAttempt();
+      this.clearAccountCreateSecret();
+      if (this.accountCreateUrlElement) this.accountCreateUrlElement.value = '';
+      if (this.accountCreateNameElement) this.accountCreateNameElement.value = '';
+      if (this.accountCreateGroupElement) this.accountCreateGroupElement.textContent = '';
+      if (this.accountCreateOverlayElement) this.accountCreateOverlayElement.hidden = true;
+      if (wasOpen && refreshAfter && !this.minimized) this.refresh();
+      return true;
+    }
+
+    handleAccountCreateUrlInput() {
+      if (!this.accountCreateOpen || !this.accountCreateUrlElement) return;
+      const normalizedUrl = sub2NormalizeAccountBaseUrl(this.accountCreateUrlElement.value);
+      const hasSecret = Boolean(this.accountCreateKeyElement?.value);
+      if (hasSecret && (!normalizedUrl.ok || this.accountCreateKeyBaseUrl !== normalizedUrl.baseUrl)) {
+        this.clearAccountCreateSecret();
+        this.accountCreateMessage = '上游地址已变化，请重新输入 API Key。';
+      }
+      this.accountCreatePreview = null;
+      this.accountCreateError = '';
+      this.invalidateAccountCreateAttempt();
+      this.renderAccountCreateModal();
+    }
+
+    handleAccountCreateKeyInput() {
+      if (!this.accountCreateOpen) return;
+      const normalizedUrl = sub2NormalizeAccountBaseUrl(this.accountCreateUrlElement?.value);
+      this.accountCreateKeyBaseUrl = this.accountCreateKeyElement?.value
+        ? normalizedUrl.ok ? normalizedUrl.baseUrl : ''
+        : '';
+      this.accountCreatePreview = null;
+      this.accountCreateError = '';
+      this.accountCreateMessage = '';
+      this.invalidateAccountCreateAttempt();
+      this.renderAccountCreateModal();
+    }
+
+    returnToAccountCreateInput() {
+      if (!this.accountCreateOpen || this.accountCreatePending) return;
+      this.accountCreateRequestSequence += 1;
+      this.accountCreatePhase = 'input';
+      this.accountCreatePreview = null;
+      this.accountCreateError = '';
+      this.accountCreateMessage = '';
+      this.invalidateAccountCreateAttempt();
+      this.renderAccountCreateModal();
+      this.accountCreateUrlElement?.focus();
+    }
+
+    handleAccountCreateReviewInput(groupChanged = false) {
+      const preview = this.accountCreatePreview;
+      if (!this.accountCreateOpen || this.accountCreatePhase !== 'review' || !preview) return;
+      preview.name = String(this.accountCreateNameElement?.value || '').trim();
+      if (groupChanged) {
+        const selectedGroupId = Number(this.accountCreateGroupElement?.value);
+        preview.selectedGroupId = preview.compatibleGroups.some((group) => group.id === selectedGroupId)
+          ? selectedGroupId
+          : null;
+      }
+      preview.priority = sub2ComputeAccountCreatePriority(
+        this.accounts,
+        preview.selectedGroupId,
+        this.groupsById,
+      );
+      this.accountCreateError = '';
+      this.accountCreateMessage = '';
+      this.invalidateAccountCreateAttempt();
+      this.renderAccountCreateModal();
+    }
+
+    async handleAccountCreateDetection(event) {
+      if (!event || event.isTrusted !== true || !this.accountCreateOpen || this.accountCreatePending) return;
+      const normalizedUrl = sub2NormalizeAccountBaseUrl(this.accountCreateUrlElement?.value);
+      if (!normalizedUrl.ok) {
+        this.clearAccountCreateSecret();
+        this.accountCreateMessage = '';
+        this.accountCreateError = '请输入 HTTPS 地址；本机 localhost、127.0.0.1 或 [::1] 可使用 HTTP。';
+        this.renderAccountCreateModal();
+        return;
+      }
+      const apiKey = String(this.accountCreateKeyElement?.value || '').trim();
+      if (!apiKey) {
+        this.accountCreateError = '请输入 API Key。';
+        this.renderAccountCreateModal();
+        return;
+      }
+      if (this.accountCreateKeyBaseUrl !== normalizedUrl.baseUrl) {
+        this.clearAccountCreateSecret();
+        this.accountCreateError = 'API Key 与当前上游地址不匹配，请重新输入。';
+        this.renderAccountCreateModal();
+        return;
+      }
+
+      const requestSequence = ++this.accountCreateRequestSequence;
+      this.accountCreatePending = true;
+      this.accountCreateOperation = 'detect';
+      this.accountCreateError = '';
+      this.accountCreateMessage = '正在识别平台与模型…';
+      this.accountCreatePreview = null;
+      this.invalidateAccountCreateAttempt();
+      this.renderAccountCreateModal();
+      const requestIsCurrent = () => this.accountCreateOpen
+        && requestSequence === this.accountCreateRequestSequence;
+
+      try {
+        const [accounts, groups, settledCandidates] = await Promise.all([
+          sub2FetchAllAccounts(),
+          sub2FetchGroups(),
+          Promise.allSettled(SUB2_MODEL_SYNC_PLATFORMS.map((platform) => (
+            sub2PreviewAccountModels(platform, normalizedUrl.baseUrl, apiKey)
+          ))),
+        ]);
+        if (!requestIsCurrent()) return;
+        const detection = sub2EvaluateAccountPreviewCandidates(settledCandidates);
+        if (!detection.ok) {
+          this.clearAccountCreateSecret();
+          this.accountCreateMessage = '';
+          this.accountCreateError = detection.reason === 'ambiguous-platform'
+            ? '两个协议都返回了匹配模型，无法安全判断平台；未创建账号。'
+            : '未识别到可用的 GPT/OpenAI 或 Claude/Anthropic 协议；未创建账号。';
+          return;
+        }
+
+        const nextGroupsById = sub2BuildGroupIndex(groups);
+        const compatibleGroups = sub2CollectCompatibleAccountGroups(nextGroupsById, detection.candidate.platform);
+        const groupSelection = sub2ResolveAccountCreateGroupSelection(compatibleGroups, this.groupFilter);
+        if (groupSelection.blocked) {
+          this.groupsById = nextGroupsById;
+          this.clearAccountCreateSecret();
+          this.accountCreateMessage = '';
+          this.accountCreateError = '没有启用中的兼容分组；未创建账号。';
+          return;
+        }
+
+        this.accounts = accounts;
+        this.groupsById = nextGroupsById;
+        const generatedName = sub2BuildUniqueAccountName(
+          normalizedUrl.baseUrl,
+          detection.candidate.platform,
+          accounts,
+        );
+        this.accountCreatePreview = {
+          baseUrl: normalizedUrl.baseUrl,
+          platform: detection.candidate.platform,
+          fetchedModels: detection.candidate.fetched,
+          allowedModels: detection.candidate.allowedModels,
+          excludedModels: detection.candidate.excluded,
+          counts: detection.candidate.counts,
+          compatibleGroups,
+          selectedGroupId: groupSelection.selectedGroupId,
+          selectionReason: groupSelection.reason,
+          name: generatedName,
+          priority: groupSelection.selectedGroupId
+            ? sub2ComputeAccountCreatePriority(accounts, groupSelection.selectedGroupId, nextGroupsById)
+            : null,
+        };
+        this.accountCreatePhase = 'review';
+        this.accountCreateMessage = groupSelection.requiresSelection
+          ? '检测完成，请选择目标分组。'
+          : '检测完成，请核对后创建。';
+        this.accountCreateError = '';
+      } catch {
+        if (!requestIsCurrent()) return;
+        this.clearAccountCreateSecret();
+        this.accountCreateMessage = '';
+        this.accountCreateError = '识别失败；请检查地址、凭据和本机 sub2 状态后重试。';
+      } finally {
+        if (requestIsCurrent()) {
+          this.accountCreatePending = false;
+          this.accountCreateOperation = '';
+          this.renderAccountCreateModal();
+        }
+      }
+    }
+
+    async refreshCreatedAccountEvidence(input) {
+      const createdId = Number(input?.createdId);
+      const createdName = String(input?.createdName || '').trim();
+      const groupId = Number(input?.groupId);
+      const groupName = String(input?.groupName || '').trim();
+      const proposedPriority = Number(input?.priority);
+      const readbackSequence = Number(input?.readbackSequence);
+      const accountRefreshSequence = ++this.refreshRequestSequence;
+
+      try {
+        const createdAccountRequest = Number.isInteger(createdId) && createdId > 0
+          ? sub2FetchAccount(createdId).catch(() => null)
+          : Promise.resolve(null);
+        const [accounts, groups, createdAccountDetail] = await Promise.all([
+          sub2FetchAccounts(),
+          sub2FetchGroups(),
+          createdAccountRequest,
+        ]);
+        const nextGroupsById = sub2BuildGroupIndex(groups);
+        const listedAccount = accounts.find((account) => Number.isInteger(createdId) && Number(account?.id) === createdId)
+          || accounts.find((account) => String(account?.name || '').trim() === createdName);
+        const createdAccount = createdAccountDetail || listedAccount;
+        const evidenceAccounts = [createdAccountDetail, listedAccount].filter(Boolean);
+        const targetMemberships = evidenceAccounts
+          .flatMap((account) => sub2GetGroupMemberships(account, nextGroupsById))
+          .filter((candidateMembership) => candidateMembership.groupId === groupId);
+        const membership = targetMemberships.find((candidateMembership) => (
+          candidateMembership.priority !== null && candidateMembership.priority !== undefined
+        )) || targetMemberships[0] || null;
+        const membershipPriority = membership?.priority;
+        const accountPriority = evidenceAccounts
+          .map((account) => Number(account?.priority))
+          .find(Number.isFinite);
+        const refreshedAccounts = createdAccountDetail && !listedAccount
+          ? [...accounts, createdAccountDetail]
+          : accounts;
+
+        if (readbackSequence !== this.accountCreateRequestSequence) return;
+        if (accountRefreshSequence === this.refreshRequestSequence && !this.isAccountInteractionActive()) {
+          this.accounts = refreshedAccounts;
+          this.groupsById = nextGroupsById;
+          this.latestHit = sub2ResolveLatestHit(
+            this.accounts,
+            this.routingRequestsAvailable ? this.recentRequest : null,
+            !this.routingRequestsAvailable,
+          );
+          this.lastError = '';
+          this.lastUpdatedAt = Date.now();
+          this.render();
+          this.refreshRoutingActivity(accountRefreshSequence);
+        }
+        this.accountCreateResultMessage = createdAccount
+          ? `已添加 ${createdName} · ${groupName} 组内优先级 ${membershipPriority === null || membershipPriority === undefined ? '未返回' : membershipPriority}`
+            + ` · 账号级 P${Number.isFinite(accountPriority) ? accountPriority : proposedPriority}`
+          : `已提交创建 ${createdName}，但刷新后尚未找到该账号。`;
+        this.renderStatus();
+      } catch {
+        if (readbackSequence !== this.accountCreateRequestSequence) return;
+        this.accountCreateResultMessage = `已创建 ${createdName}，但账号或分组回读失败；请手动刷新确认。`;
+        this.renderStatus();
+      }
+    }
+
+    async handleAccountCreateSubmit(event) {
+      let preview = this.accountCreatePreview;
+      if (!event
+        || event.isTrusted !== true
+        || !this.accountCreateOpen
+        || this.accountCreatePhase !== 'review'
+        || this.accountCreatePending
+        || !preview) {
+        return;
+      }
+
+      let apiKey = String(this.accountCreateKeyElement?.value || '').trim();
+      if (!apiKey || this.accountCreateKeyBaseUrl !== preview.baseUrl) {
+        this.clearAccountCreateSecret();
+        this.accountCreateError = '凭据已失效，请返回并重新识别。';
+        this.renderAccountCreateModal();
+        return;
+      }
+      const accountName = String(this.accountCreateNameElement?.value || '').trim();
+      if (!sub2IsAccountNameAvailable(accountName, this.accounts)) {
+        this.accountCreateError = accountName ? '账号名称已存在，请换一个名称。' : '请输入账号名称。';
+        this.renderAccountCreateModal();
+        return;
+      }
+      const groupId = Number(this.accountCreateGroupElement?.value);
+      const selectedGroup = preview.compatibleGroups.find((group) => group.id === groupId);
+      if (!selectedGroup) {
+        this.accountCreateError = '请选择兼容的目标分组。';
+        this.renderAccountCreateModal();
+        return;
+      }
+      const priority = sub2ComputeAccountCreatePriority(this.accounts, groupId, this.groupsById);
+      let payload;
+      try {
+        payload = sub2BuildCreateAccountPayload({
+          name: accountName,
+          platform: preview.platform,
+          baseUrl: preview.baseUrl,
+          apiKey,
+          groupId,
+          priority,
+          allowedModelIds: preview.allowedModels,
+        });
+      } catch {
+        this.clearAccountCreateSecret();
+        this.invalidateAccountCreateAttempt();
+        this.accountCreatePhase = 'input';
+        this.accountCreatePreview = null;
+        this.accountCreateMessage = '';
+        this.accountCreateError = '创建参数已失效，请重新识别。';
+        this.renderAccountCreateModal();
+        return;
+      }
+
+      let fingerprint = sub2BuildAccountCreateAttemptFingerprint(payload);
+      if (!this.accountCreateIdempotencyKey || this.accountCreateAttemptFingerprint !== fingerprint) {
+        this.accountCreateIdempotencyKey = sub2GenerateIdempotencyKey();
+        this.accountCreateAttemptFingerprint = fingerprint;
+      }
+      let idempotencyKey = this.accountCreateIdempotencyKey;
+      const requestSequence = ++this.accountCreateRequestSequence;
+      this.accountCreatePending = true;
+      this.accountCreateOperation = 'create';
+      this.accountCreateError = '';
+      this.accountCreateMessage = '正在创建账号…';
+      this.renderAccountCreateModal();
+      const requestIsCurrent = () => this.accountCreateOpen
+        && requestSequence === this.accountCreateRequestSequence;
+
+      let created;
+      try {
+        created = await sub2CreateAccount(payload, idempotencyKey);
+      } catch (error) {
+        if (!requestIsCurrent()) return;
+        const status = Number(error?.status);
+        const retryable = sub2IsRetryableAccountCreateError(error);
+        this.accountCreateMessage = '';
+        this.accountCreateError = retryable
+          ? `创建暂未完成${Number.isFinite(status) ? `（HTTP ${status}）` : ''}，可重试当前确认内容。`
+          : `创建被拒绝${Number.isFinite(status) ? `（HTTP ${status}）` : ''}，凭据已清除，请重新识别。`;
+        if (!retryable) {
+          payload.credentials.api_key = '';
+          payload = null;
+          apiKey = '';
+          idempotencyKey = '';
+          fingerprint = '';
+          this.clearAccountCreateSecret();
+          this.invalidateAccountCreateAttempt();
+          this.accountCreatePhase = 'input';
+          this.accountCreatePreview = null;
+        }
+        this.accountCreatePending = false;
+        this.accountCreateOperation = '';
+        this.renderAccountCreateModal();
+        return;
+      }
+
+      if (!requestIsCurrent()) return;
+      const createdId = Number(created?.id ?? created?.account?.id);
+      const createdName = accountName;
+      const groupName = selectedGroup.name;
+      payload.credentials.api_key = '';
+      payload = null;
+      apiKey = '';
+      idempotencyKey = '';
+      fingerprint = '';
+      created = null;
+      preview = null;
+      this.accountCreateResultMessage = `已创建 ${createdName}，正在回读实际分组优先级…`;
+      this.closeAccountCreateModal(false, true);
+      const readbackSequence = this.accountCreateRequestSequence;
+      this.refreshCreatedAccountEvidence({
+        createdId,
+        createdName,
+        groupId,
+        groupName,
+        priority,
+        readbackSequence,
+      });
+    }
+
+    renderAccountCreateModal() {
+      if (!this.accountCreateOpen || !this.accountCreateOverlayElement) return;
+      this.accountCreateOverlayElement.hidden = false;
+      const reviewing = this.accountCreatePhase === 'review' && Boolean(this.accountCreatePreview);
+      const mutationPending = this.isAccountCreateMutationPending();
+      const closeButton = this.root?.querySelector('.sub2-account-create-close');
+      if (closeButton) closeButton.disabled = mutationPending;
+      this.root?.querySelectorAll('.sub2-account-create-cancel').forEach((button) => {
+        button.disabled = mutationPending;
+      });
+      if (this.accountCreateInputSectionElement) this.accountCreateInputSectionElement.hidden = reviewing;
+      if (this.accountCreateReviewSectionElement) this.accountCreateReviewSectionElement.hidden = !reviewing;
+
+      const detectButton = this.root?.querySelector('.sub2-account-create-detect');
+      if (this.accountCreateUrlElement) this.accountCreateUrlElement.disabled = this.accountCreatePending;
+      if (this.accountCreateKeyElement) this.accountCreateKeyElement.disabled = this.accountCreatePending;
+      if (detectButton) {
+        detectButton.disabled = this.accountCreatePending;
+        detectButton.textContent = this.accountCreateOperation === 'detect' ? '识别中…' : '识别';
+      }
+      const inputMessage = this.root?.querySelector('.sub2-account-create-input-message');
+      if (inputMessage) {
+        inputMessage.classList.toggle('error', Boolean(this.accountCreateError));
+        inputMessage.textContent = reviewing ? '' : this.accountCreateError || this.accountCreateMessage;
+      }
+      if (!reviewing) return;
+
+      const preview = this.accountCreatePreview;
+      const platformLabel = preview.platform === 'anthropic' ? 'Anthropic / Claude' : 'OpenAI / GPT';
+      const platformValue = this.root?.querySelector('.sub2-account-create-platform-value');
+      const urlValue = this.root?.querySelector('.sub2-account-create-url-value');
+      const modelValue = this.root?.querySelector('.sub2-account-create-model-value');
+      const priorityValue = this.root?.querySelector('.sub2-account-create-priority-value');
+      if (platformValue) platformValue.textContent = platformLabel;
+      if (urlValue) urlValue.textContent = preview.baseUrl;
+      if (modelValue) modelValue.textContent = `${preview.counts.allowed} 个（排除 ${preview.counts.excluded} 个）`;
+      if (this.accountCreateNameElement && this.accountCreateNameElement.value !== preview.name) {
+        this.accountCreateNameElement.value = preview.name;
+      }
+
+      if (this.accountCreateGroupElement) {
+        const selectedValue = preview.selectedGroupId ? String(preview.selectedGroupId) : '';
+        this.accountCreateGroupElement.textContent = '';
+        if (!preview.selectedGroupId) {
+          const placeholder = document.createElement('option');
+          placeholder.value = '';
+          placeholder.textContent = '请选择分组';
+          this.accountCreateGroupElement.appendChild(placeholder);
+        }
+        for (const group of preview.compatibleGroups) {
+          const option = document.createElement('option');
+          option.value = String(group.id);
+          option.textContent = group.name;
+          this.accountCreateGroupElement.appendChild(option);
+        }
+        this.accountCreateGroupElement.value = selectedValue;
+        this.accountCreateGroupElement.disabled = this.accountCreatePending;
+      }
+      const nameAvailable = sub2IsAccountNameAvailable(preview.name, this.accounts);
+      const groupSelected = preview.compatibleGroups.some((group) => group.id === preview.selectedGroupId);
+      preview.priority = groupSelected
+        ? sub2ComputeAccountCreatePriority(this.accounts, preview.selectedGroupId, this.groupsById)
+        : null;
+      if (priorityValue) {
+        priorityValue.textContent = groupSelected ? `P${preview.priority}（账号级）` : '选择分组后计算';
+      }
+      const keyAvailable = Boolean(this.accountCreateKeyElement?.value)
+        && this.accountCreateKeyBaseUrl === preview.baseUrl;
+      const reviewMessage = this.root?.querySelector('.sub2-account-create-review-message');
+      const validationError = !preview.name
+        ? '请输入账号名称。'
+        : !nameAvailable
+          ? '账号名称已存在，请换一个名称。'
+          : !groupSelected
+            ? '请选择目标分组。'
+            : !keyAvailable
+              ? '凭据已失效，请返回并重新识别。'
+              : '';
+      if (reviewMessage) {
+        const messageIsError = Boolean(this.accountCreateError || validationError);
+        reviewMessage.classList.toggle('error', messageIsError);
+        reviewMessage.textContent = this.accountCreateError
+          || (this.accountCreatePending ? this.accountCreateMessage : validationError || this.accountCreateMessage);
+      }
+      if (this.accountCreateNameElement) this.accountCreateNameElement.disabled = this.accountCreatePending;
+      const backButton = this.root?.querySelector('.sub2-account-create-back');
+      if (backButton) backButton.disabled = this.accountCreatePending;
+      const submitButton = this.root?.querySelector('.sub2-account-create-submit');
+      if (submitButton) {
+        submitButton.disabled = this.accountCreatePending || Boolean(validationError);
+        submitButton.textContent = this.accountCreateOperation === 'create' ? '创建中…' : '创建';
+      }
     }
 
     async refresh() {
@@ -6240,6 +7226,7 @@
     }
 
     openEventsDrawer() {
+      if (!this.closeAccountCreateModal(false)) return;
       this.closeDiagnosticsDrawer();
       this.closeModelDrawer();
       this.eventsOpen = true;
@@ -6255,6 +7242,7 @@
     }
 
     openAuditDrawer() {
+      if (!this.closeAccountCreateModal(false)) return;
       this.closeDiagnosticsDrawer();
       this.closeEventsDrawer();
       this.closeModelDrawer();
@@ -6866,6 +7854,7 @@
     }
 
     openDiagnosticsDrawer() {
+      if (!this.closeAccountCreateModal(false)) return;
       this.closeEventsDrawer();
       this.routeReplayRequestSequence += 1;
       this.selectedDiagnosticsRequestKey = '';
@@ -7151,6 +8140,7 @@
     }
 
     async openModelDrawer(account) {
+      if (!this.closeAccountCreateModal(false)) return;
       this.closeEventsDrawer();
       this.closeDiagnosticsDrawer();
       const requestSequence = ++this.modelRequestSequence;
@@ -7381,12 +8371,15 @@
       if (!this.statusElement) return;
       this.statusElement.classList.toggle('error', Boolean(this.lastError));
       if (this.lastError) {
-        this.statusElement.textContent = this.lastError;
+        this.statusElement.textContent = this.accountCreateResultMessage
+          ? `${this.accountCreateResultMessage}；${this.lastError}`
+          : this.lastError;
         return;
       }
       const when = this.lastUpdatedAt ? sub2FormatRelative(this.lastUpdatedAt, Date.now()) : '刚刚';
       const groupCount = sub2CountDistinctGroups(this.accounts, this.groupsById);
-      this.statusElement.textContent = `v${SUB2_SCRIPT_VERSION} · ${groupCount} 个分组 / ${this.accounts.length} 个账号 · 更新于 ${when} · 每 ${SUB2_POLL_SECONDS}s 刷新（后台/最小化/账号编辑暂停，不测活）`;
+      const accountCreatePrefix = this.accountCreateResultMessage ? `${this.accountCreateResultMessage} · ` : '';
+      this.statusElement.textContent = `${accountCreatePrefix}v${SUB2_SCRIPT_VERSION} · ${groupCount} 个分组 / ${this.accounts.length} 个账号 · 更新于 ${when} · 每 ${SUB2_POLL_SECONDS}s 刷新（后台/最小化/账号编辑暂停，不测活）`;
     }
 
     setBusy(accountId, busy) {
@@ -7667,6 +8660,18 @@
     sub2BuildModelMappingBulkUpdatePayload,
     sub2FormatModelSyncCounts,
     sub2ResolveModelSyncPlatform,
+    sub2NormalizeAccountBaseUrl,
+    sub2EvaluateAccountPreviewCandidates,
+    sub2CollectCompatibleAccountGroups,
+    sub2ResolveAccountCreateGroupSelection,
+    sub2BuildUniqueAccountName,
+    sub2IsAccountNameAvailable,
+    sub2ComputeAccountCreatePriority,
+    sub2BuildIdentityModelMapping,
+    sub2BuildCreateAccountPayload,
+    sub2BuildAccountCreateAttemptFingerprint,
+    sub2GenerateIdempotencyKey,
+    sub2IsRetryableAccountCreateError,
     sub2ModelPatternMatches,
     sub2NormalizeRequestedModelForLookup,
     sub2EvaluateModelSupport,
