@@ -105,6 +105,7 @@
   // 最后一次滚动后多久才允许自动重建账号列表。
   const SUB2_LIST_SCROLL_IDLE_MS = 1500;
   const SUB2_CAPACITY_MAX = 10000;
+  const SUB2_ACCOUNT_EDITOR_KINDS = Object.freeze(['balance', 'capacity', 'quota']);
   const SUB2_AUDIT_SEVERITY_RANK = Object.freeze({ critical: 2, warning: 1, info: 0 });
   const SUB2_AUDIT_SEVERITY_LABELS = Object.freeze({ critical: '严重', warning: '注意', info: '提示' });
   const SUB2_CAPACITY_ADVICE_WINDOW_HOURS = 24;
@@ -1026,6 +1027,26 @@
       return { value: null, error: `容量不能超过 ${maximumCapacity}。` };
     }
     return { value: numericCapacity, error: '' };
+  }
+
+  function sub2BuildAccountEditorKey(accountId, kind) {
+    const normalizedAccountId = Number(accountId);
+    const normalizedKind = String(kind || '').trim().toLocaleLowerCase();
+    if (!Number.isInteger(normalizedAccountId) || normalizedAccountId <= 0) return '';
+    if (!SUB2_ACCOUNT_EDITOR_KINDS.includes(normalizedKind)) return '';
+    return `${normalizedAccountId}:${normalizedKind}`;
+  }
+
+  function sub2TransitionAccountEditor(currentEditor, accountId, kind) {
+    const key = sub2BuildAccountEditorKey(accountId, kind);
+    if (!key) return currentEditor || null;
+    const currentKey = sub2BuildAccountEditorKey(currentEditor?.accountId, currentEditor?.kind);
+    if (currentKey === key) return null;
+    return {
+      accountId: Number(accountId),
+      kind: String(kind).trim().toLocaleLowerCase(),
+      key,
+    };
   }
 
   function sub2ExtractRoutingStatusCode(errorItem) {
@@ -2453,17 +2474,36 @@
     return groupsById[groupId] || groupsById[String(groupId)] || {};
   }
 
+  function sub2GetFirstReadableText(...values) {
+    for (const value of values) {
+      if (typeof value !== 'string' && typeof value !== 'number') continue;
+      const normalizedValue = String(value).trim();
+      if (normalizedValue) return normalizedValue;
+    }
+    return '';
+  }
+
   function sub2GetGroupMemberships(account, groupsById = null) {
     const accountGroups = Array.isArray(account?.account_groups) ? account.account_groups : [];
     const memberships = [];
     const seenGroupKeys = new Set();
 
     for (const accountGroup of accountGroups) {
-      const inlineGroup = accountGroup?.group && typeof accountGroup.group === 'object' ? accountGroup.group : {};
-      const numericGroupId = Number(accountGroup?.group_id ?? inlineGroup.id);
+      const accountGroupObject = accountGroup && typeof accountGroup === 'object' ? accountGroup : {};
+      const rawInlineGroup = accountGroupObject.group;
+      const inlineGroup = rawInlineGroup && typeof rawInlineGroup === 'object' ? rawInlineGroup : {};
+      const numericGroupId = Number(
+        accountGroupObject.group_id ?? inlineGroup.id ?? accountGroupObject.id ?? rawInlineGroup ?? accountGroup,
+      );
       const groupId = Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null;
       const indexedGroup = sub2GetIndexedGroup(groupsById, groupId);
-      const groupName = String(inlineGroup.name || indexedGroup.name || (groupId ? `分组 ${groupId}` : '未命名分组')).trim();
+      const primitiveGroupName = groupId ? '' : sub2GetFirstReadableText(rawInlineGroup, accountGroup);
+      const groupName = sub2GetFirstReadableText(
+        inlineGroup.name,
+        accountGroupObject.name,
+        primitiveGroupName,
+        indexedGroup.name,
+      ) || (groupId ? `分组 ${groupId}` : '未命名分组');
       const groupKey = groupId ? `id:${groupId}` : `name:${groupName.toLocaleLowerCase()}`;
       if (seenGroupKeys.has(groupKey)) continue;
       seenGroupKeys.add(groupKey);
@@ -2472,19 +2512,27 @@
         groupId,
         groupKey,
         name: groupName,
-        platform: String(inlineGroup.platform || indexedGroup.platform || account?.platform || '').trim(),
-        priority: sub2NormalizeOptionalPriority(accountGroup?.priority),
-        status: String(inlineGroup.status || indexedGroup.status || '').trim(),
+        platform: sub2GetFirstReadableText(
+          inlineGroup.platform,
+          accountGroupObject.platform,
+          indexedGroup.platform,
+          account?.platform,
+        ),
+        priority: sub2NormalizeOptionalPriority(accountGroupObject.priority),
+        status: sub2GetFirstReadableText(inlineGroup.status, accountGroupObject.status, indexedGroup.status),
       });
     }
 
     // 兼容只返回 groups、没有 account_groups 的旧版接口。
     if (!memberships.length && Array.isArray(account?.groups)) {
       for (const group of account.groups) {
-        const numericGroupId = Number(group?.id);
+        const groupObject = group && typeof group === 'object' ? group : {};
+        const numericGroupId = Number(groupObject.id ?? group);
         const groupId = Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null;
         const indexedGroup = sub2GetIndexedGroup(groupsById, groupId);
-        const groupName = String(group?.name || indexedGroup.name || (groupId ? `分组 ${groupId}` : '未命名分组')).trim();
+        const primitiveGroupName = typeof group === 'string' && !groupId ? group : '';
+        const groupName = sub2GetFirstReadableText(groupObject.name, primitiveGroupName, indexedGroup.name)
+          || (groupId ? `分组 ${groupId}` : '未命名分组');
         const groupKey = groupId ? `id:${groupId}` : `name:${groupName.toLocaleLowerCase()}`;
         if (seenGroupKeys.has(groupKey)) continue;
         seenGroupKeys.add(groupKey);
@@ -2492,9 +2540,9 @@
           groupId,
           groupKey,
           name: groupName,
-          platform: String(group?.platform || indexedGroup.platform || account?.platform || '').trim(),
+          platform: sub2GetFirstReadableText(groupObject.platform, indexedGroup.platform, account?.platform),
           priority: null,
-          status: String(group?.status || indexedGroup.status || '').trim(),
+          status: sub2GetFirstReadableText(groupObject.status, indexedGroup.status),
         });
       }
     }
@@ -2511,10 +2559,10 @@
         memberships.push({
           groupId: numericGroupId,
           groupKey,
-          name: String(indexedGroup.name || `分组 ${numericGroupId}`).trim(),
-          platform: String(indexedGroup.platform || account?.platform || '').trim(),
+          name: sub2GetFirstReadableText(indexedGroup.name) || `分组 ${numericGroupId}`,
+          platform: sub2GetFirstReadableText(indexedGroup.platform, account?.platform),
           priority: null,
-          status: String(indexedGroup.status || '').trim(),
+          status: sub2GetFirstReadableText(indexedGroup.status),
         });
       }
     }
@@ -3538,7 +3586,14 @@
     #${SUB2_PANEL_ID} .sub2-audit-severity.warning{background:#f59e0b;color:#fff;}
     #${SUB2_PANEL_ID} .sub2-audit-severity.info{background:#3b82f6;color:#fff;}
     #${SUB2_PANEL_ID} .sub2-audit-message{flex:1;min-width:0;color:#0f172a;font-size:10px;font-weight:700;}
+    #${SUB2_PANEL_ID} .sub2-audit-category{color:#64748b;font-size:8px;font-weight:700;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-audit-detail{margin-top:3px;color:#64748b;font-size:9px;line-height:1.45;overflow-wrap:anywhere;}
+    #${SUB2_PANEL_ID} .sub2-audit-evidence{margin-top:3px;color:#94a3b8;font-size:8px;line-height:1.35;}
+    #${SUB2_PANEL_ID} .sub2-capacity-advice-list{display:flex;flex-direction:column;gap:6px;}
+    #${SUB2_PANEL_ID} .sub2-capacity-advice-item{padding:7px 8px;border:1px solid #e2e8f0;border-radius:7px;background:#f8fafc;}
+    #${SUB2_PANEL_ID} .sub2-capacity-advice-head{display:flex;align-items:center;justify-content:space-between;gap:8px;}
+    #${SUB2_PANEL_ID} .sub2-capacity-advice-name{min-width:0;color:#0f172a;font-size:10px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-capacity-advice-confidence{color:#64748b;font-size:8px;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-audit-action{margin-top:5px;padding:4px 7px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;
       color:#334155;font-size:9px;cursor:pointer;display:inline-block;}
     #${SUB2_PANEL_ID} .sub2-audit-action:hover{background:#f1f5f9;}
@@ -3612,6 +3667,8 @@
       this.refreshRequestSequence = 0;
       this.quotaSaving = false;
       this.capacitySaving = false;
+      this.activeEditor = null;
+      this.activeEditorRendered = false;
       this.listScrollHandler = null;
       this.lastListScrollAt = 0;
       // 保存用户真实滚动位置。重建期间浏览器会把 scrollTop 夹到临时内容高度内，
@@ -3933,16 +3990,192 @@
       return Date.now() - this.lastListScrollAt < SUB2_LIST_SCROLL_IDLE_MS;
     }
 
+    createAccountEditorDraft(account, kind, options = {}) {
+      const accountId = Number(account?.id);
+      if (kind === 'balance') {
+        const currentConfig = this.getBalanceConfig(accountId);
+        return {
+          accountId,
+          type: currentConfig?.type || 'sub2api',
+          baseUrl: currentConfig?.baseUrl || sub2GetUpstreamWebsiteUrl(account).replace(/\/$/, ''),
+          lowBalanceThreshold: currentConfig?.lowBalanceThreshold === null
+            || currentConfig?.lowBalanceThreshold === undefined
+            ? ''
+            : String(currentConfig.lowBalanceThreshold),
+          apiKey: '',
+          accessToken: '',
+          userId: '',
+          credentialContexts: { apiKey: '', accessToken: '', userId: '' },
+        };
+      }
+      if (kind === 'capacity') {
+        const configuredCapacity = Number.isInteger(Number(account?.concurrency))
+          ? Number(account.concurrency)
+          : 0;
+        const requestedValue = options.value === undefined ? Math.max(1, configuredCapacity) : options.value;
+        const parsedValue = sub2ParseCapacityInput(requestedValue);
+        return {
+          accountId,
+          value: String(parsedValue.error ? Math.max(1, configuredCapacity) : parsedValue.value),
+        };
+      }
+      const dailyLimit = sub2GetNumericAccountField(account, 'quota_daily_limit');
+      return { accountId, value: dailyLimit > 0 ? String(dailyLimit) : '' };
+    }
+
+    discardActiveEditorDraft() {
+      if (!this.activeEditor) return;
+      for (const inputElement of this.root?.querySelectorAll('[data-sub2-editor-active="true"] input') || []) {
+        inputElement.value = '';
+      }
+      if (this.activeEditor.kind === 'balance' && this.activeEditor.draft) {
+        this.activeEditor.draft.apiKey = '';
+        this.activeEditor.draft.accessToken = '';
+        this.activeEditor.draft.userId = '';
+        this.activeEditor.draft.credentialContexts = { apiKey: '', accessToken: '', userId: '' };
+      }
+      this.activeEditor.draft = null;
+      this.activeEditor = null;
+      this.activeEditorRendered = false;
+    }
+
+    toggleAccountEditor(account, kind, options = {}) {
+      if (!sub2BuildAccountEditorKey(account?.id, kind)) return false;
+      const target = options.force === true
+        ? sub2TransitionAccountEditor(null, account?.id, kind)
+        : sub2TransitionAccountEditor(this.activeEditor, account?.id, kind);
+      if (!target) {
+        this.discardActiveEditorDraft();
+        this.renderList({ captureEditorFocus: false });
+        this.refresh();
+        return false;
+      }
+
+      this.discardActiveEditorDraft();
+      const draft = this.createAccountEditorDraft(account, target.kind, options);
+      const focusField = target.kind === 'balance' ? 'provider' : 'value';
+      this.activeEditor = {
+        ...target,
+        draft,
+        message: '',
+        focusField,
+        selectionStart: target.kind === 'balance' ? null : 0,
+        selectionEnd: target.kind === 'balance' ? null : String(draft.value || '').length,
+      };
+      this.refreshRequestSequence += 1;
+      this.pendingRefresh = false;
+      this.renderList({ captureEditorFocus: false });
+      return true;
+    }
+
+    openCapacityEditor(account, suggestedCapacity) {
+      const memberships = sub2GetGroupMemberships(account, this.groupsById);
+      const matchesCurrentFilters = sub2AccountMatchesActiveFilters(account, memberships, {
+        groupFilter: this.groupFilter,
+        platformFilter: this.platformFilter,
+        healthFilter: this.healthFilter,
+        filterText: this.filterText,
+      });
+      if (!matchesCurrentFilters) {
+        this.groupFilter = '';
+        this.platformFilter = '';
+        this.healthFilter = '';
+        this.filterText = '';
+        sub2StorageSet('groupFilter', '');
+        sub2StorageSet('platformFilter', '');
+        sub2StorageSet('healthFilter', '');
+        if (this.searchElement) this.searchElement.value = '';
+        if (this.platformFilterEl) this.platformFilterEl.value = 'all';
+        if (this.healthFilterEl) this.healthFilterEl.value = 'all';
+        this.renderFilters();
+      }
+      this.toggleAccountEditor(account, 'capacity', { force: true, value: suggestedCapacity });
+    }
+
+    isAccountEditorActive(accountId, kind) {
+      const key = sub2BuildAccountEditorKey(accountId, kind);
+      return Boolean(key && this.activeEditor?.key === key);
+    }
+
+    claimActiveEditor(accountId, kind) {
+      if (this.activeEditorRendered || !this.isAccountEditorActive(accountId, kind)) return false;
+      this.activeEditorRendered = true;
+      return true;
+    }
+
+    captureActiveEditorFocus() {
+      if (!this.activeEditor || typeof document === 'undefined') return;
+      const activeElement = document.activeElement;
+      const editorElement = activeElement?.closest?.('[data-sub2-editor-active="true"]');
+      const fieldName = String(activeElement?.dataset?.sub2EditorField || '');
+      if (!editorElement || editorElement.dataset.sub2EditorKey !== this.activeEditor.key || !fieldName) {
+        this.activeEditor.focusField = '';
+        this.activeEditor.selectionStart = null;
+        this.activeEditor.selectionEnd = null;
+        return;
+      }
+      this.activeEditor.focusField = fieldName;
+      this.activeEditor.selectionStart = Number.isInteger(activeElement.selectionStart)
+        ? activeElement.selectionStart
+        : null;
+      this.activeEditor.selectionEnd = Number.isInteger(activeElement.selectionEnd)
+        ? activeElement.selectionEnd
+        : null;
+    }
+
+    restoreActiveEditorFocus() {
+      if (!this.activeEditor?.focusField || !this.root) return;
+      const editorElement = this.root.querySelector('[data-sub2-editor-active="true"]');
+      if (!editorElement || editorElement.dataset.sub2EditorKey !== this.activeEditor.key) return;
+      const fieldElement = [...editorElement.querySelectorAll('[data-sub2-editor-field]')]
+        .find((element) => element.dataset.sub2EditorField === this.activeEditor.focusField);
+      if (!fieldElement) return;
+      try {
+        fieldElement.focus({ preventScroll: true });
+        if (Number.isInteger(this.activeEditor.selectionStart)
+          && Number.isInteger(this.activeEditor.selectionEnd)
+          && typeof fieldElement.setSelectionRange === 'function') {
+          fieldElement.setSelectionRange(this.activeEditor.selectionStart, this.activeEditor.selectionEnd);
+        }
+      } catch {
+        // Some input types do not expose selection ranges.
+      }
+    }
+
+    trackAccountEditorField(fieldElement, fieldName) {
+      if (!fieldElement) return;
+      fieldElement.dataset.sub2EditorField = fieldName;
+      const captureSelection = () => {
+        if (!this.activeEditor) return;
+        this.activeEditor.focusField = fieldName;
+        this.activeEditor.selectionStart = Number.isInteger(fieldElement.selectionStart)
+          ? fieldElement.selectionStart
+          : null;
+        this.activeEditor.selectionEnd = Number.isInteger(fieldElement.selectionEnd)
+          ? fieldElement.selectionEnd
+          : null;
+      };
+      fieldElement.addEventListener('focus', captureSelection);
+      fieldElement.addEventListener('select', captureSelection);
+      fieldElement.addEventListener('keyup', captureSelection);
+      fieldElement.addEventListener('click', captureSelection);
+    }
+
+    setActiveEditorMessage(message, messageElement = null) {
+      if (this.activeEditor) this.activeEditor.message = String(message || '');
+      if (messageElement) messageElement.textContent = String(message || '');
+    }
+
     hasOpenQuotaEditor() {
-      return Boolean(this.root?.querySelector('.sub2-quota-editor:not([hidden])'));
+      return this.activeEditor?.kind === 'quota';
     }
 
     hasOpenCapacityEditor() {
-      return Boolean(this.root?.querySelector('.sub2-capacity-editor:not([hidden])'));
+      return this.activeEditor?.kind === 'capacity';
     }
 
     hasOpenBalanceEditor() {
-      return Boolean(this.root?.querySelector('.sub2-balance-editor:not([hidden])'));
+      return this.activeEditor?.kind === 'balance';
     }
 
     isAccountInteractionActive() {
@@ -4205,10 +4438,9 @@
       `;
     }
 
-    renderList() {
+    renderList(options = {}) {
       if (!this.listElement) return;
-      // 余额草稿含敏感输入；编辑期间延后筛选等触发的列表重建，避免无提示丢失草稿。
-      if (this.hasOpenBalanceEditor()) return;
+      if (options.captureEditorFocus !== false) this.captureActiveEditorFocus();
       this.listElement.classList.toggle('sub2-flat-list', this.viewMode === 'flat');
       // 重建会清空 DOM，浏览器随即把 scrollTop 夹到新内容高度内。直接读当前
       // scrollTop 会拿到被夹小的值，所以优先使用滚动事件里记录的真实位置。
@@ -4226,7 +4458,13 @@
         filters,
         now,
       ));
+      if (this.activeEditor && !visibleAccounts.some(
+        (account) => Number(account?.id) === this.activeEditor.accountId,
+      )) {
+        this.discardActiveEditorDraft();
+      }
       this.renderListCount(visibleAccounts.length);
+      this.activeEditorRendered = false;
 
       // 重建期间产生的 scroll 事件不代表用户操作，不能覆盖已保存的位置。
       this.isRebuildingList = true;
@@ -4243,27 +4481,31 @@
           }
           if (!sections.length) {
             this.listElement.appendChild(this.buildEmptyListNotice('没有匹配的账号或分组。'));
-            return;
+          } else {
+            for (const section of sections) {
+              this.listElement.appendChild(this.buildGroupSection(section, now));
+            }
+            this.restoreListScrollTop(targetScrollTop);
           }
-          for (const section of sections) {
-            this.listElement.appendChild(this.buildGroupSection(section, now));
+        } else {
+          const rows = sub2SortAccounts(visibleAccounts, this.statsById, this.sortMode, now);
+          if (!rows.length) {
+            this.listElement.appendChild(this.buildEmptyListNotice('没有匹配的账号。'));
+          } else {
+            for (const account of rows) {
+              this.listElement.appendChild(this.buildRow(account, now));
+            }
+            this.restoreListScrollTop(targetScrollTop);
           }
-          this.restoreListScrollTop(targetScrollTop);
-          return;
         }
-
-        const rows = sub2SortAccounts(visibleAccounts, this.statsById, this.sortMode, now);
-        if (!rows.length) {
-          this.listElement.appendChild(this.buildEmptyListNotice('没有匹配的账号。'));
-          return;
-        }
-        for (const account of rows) {
-          this.listElement.appendChild(this.buildRow(account, now));
-        }
-        this.restoreListScrollTop(targetScrollTop);
       } finally {
         this.isRebuildingList = false;
       }
+      // The account can remain visible while a capability disappears after refresh
+      // (for example, daily quota support). Do not leave a non-renderable editor
+      // holding a draft and permanently pausing background refresh.
+      if (this.activeEditor && !this.activeEditorRendered) this.discardActiveEditorDraft();
+      this.restoreActiveEditorFocus();
     }
 
     buildEmptyListNotice(message) {
@@ -4439,6 +4681,11 @@
     buildBalanceControls(account, busy) {
       const accountId = Number(account.id);
       const currentConfig = this.getBalanceConfig(accountId);
+      const activeBalanceDraft = this.isAccountEditorActive(accountId, 'balance')
+        ? this.activeEditor.draft
+        : null;
+      const balanceDraft = activeBalanceDraft || this.createAccountEditorDraft(account, 'balance');
+      const showBalanceEditor = this.claimActiveEditor(accountId, 'balance');
       const balanceQuerying = this.balanceQueryingIds.has(accountId);
       const actionButtons = [];
 
@@ -4464,7 +4711,9 @@
 
       const editor = document.createElement('div');
       editor.className = 'sub2-balance-editor';
-      editor.hidden = true;
+      editor.hidden = !showBalanceEditor;
+      editor.dataset.sub2EditorKey = sub2BuildAccountEditorKey(accountId, 'balance');
+      if (showBalanceEditor) editor.dataset.sub2EditorActive = 'true';
 
       const editorTitle = document.createElement('div');
       editorTitle.className = 'sub2-balance-editor-title';
@@ -4487,7 +4736,8 @@
       newapiOption.value = 'newapi';
       newapiOption.textContent = 'newapi';
       providerSelect.append(sub2apiOption, newapiOption);
-      providerSelect.value = currentConfig?.type || 'sub2api';
+      providerSelect.value = balanceDraft.type || 'sub2api';
+      this.trackAccountEditorField(providerSelect, 'provider');
       const providerField = createBalanceField('来源类型', providerSelect);
 
       const thresholdInput = document.createElement('input');
@@ -4495,10 +4745,8 @@
       thresholdInput.min = '0';
       thresholdInput.step = '0.01';
       thresholdInput.placeholder = '留空不报警';
-      thresholdInput.value = currentConfig?.lowBalanceThreshold === null
-        || currentConfig?.lowBalanceThreshold === undefined
-        ? ''
-        : String(currentConfig.lowBalanceThreshold);
+      thresholdInput.value = String(balanceDraft.lowBalanceThreshold ?? '');
+      this.trackAccountEditorField(thresholdInput, 'threshold');
       const thresholdField = createBalanceField('低余额阈值（余额单位）', thresholdInput);
 
       const baseUrlInput = document.createElement('input');
@@ -4506,7 +4754,8 @@
       baseUrlInput.placeholder = 'https://example.com';
       baseUrlInput.autocomplete = 'off';
       baseUrlInput.spellcheck = false;
-      baseUrlInput.value = currentConfig?.baseUrl || sub2GetUpstreamWebsiteUrl(account).replace(/\/$/, '');
+      baseUrlInput.value = balanceDraft.baseUrl || '';
+      this.trackAccountEditorField(baseUrlInput, 'baseUrl');
       const baseUrlField = createBalanceField('HTTPS 上游站点根地址', baseUrlInput, true);
 
       const apiKeyInput = document.createElement('input');
@@ -4516,6 +4765,8 @@
         : 'sub2api API Key';
       apiKeyInput.autocomplete = 'new-password';
       apiKeyInput.spellcheck = false;
+      apiKeyInput.value = activeBalanceDraft?.apiKey || '';
+      this.trackAccountEditorField(apiKeyInput, 'apiKey');
       const apiKeyField = createBalanceField('API Key', apiKeyInput, true);
 
       const accessTokenInput = document.createElement('input');
@@ -4525,6 +4776,8 @@
         : 'newapi Access Token（不是 sub2 API Key）';
       accessTokenInput.autocomplete = 'new-password';
       accessTokenInput.spellcheck = false;
+      accessTokenInput.value = activeBalanceDraft?.accessToken || '';
+      this.trackAccountEditorField(accessTokenInput, 'accessToken');
       const accessTokenField = createBalanceField('Access Token', accessTokenInput, true);
 
       const userIdInput = document.createElement('input');
@@ -4534,6 +4787,8 @@
         ? '已保存；留空保持不变'
         : 'newapi User ID';
       userIdInput.autocomplete = 'off';
+      userIdInput.value = activeBalanceDraft?.userId || '';
+      this.trackAccountEditorField(userIdInput, 'userId');
       const userIdField = createBalanceField('User ID', userIdInput, true);
 
       const editorActions = document.createElement('div');
@@ -4562,9 +4817,11 @@
       securityNotice.textContent = '凭据以未加密形式保存在 Tampermonkey 的脚本存储中，已保存值不会回填到页面 DOM，也不写入网页 localStorage、sub2 或日志；仅点击查询时发送到所填白名单 HTTPS 域名。';
       const editorMessage = document.createElement('div');
       editorMessage.className = 'sub2-balance-message';
+      editorMessage.textContent = showBalanceEditor ? this.activeEditor?.message || '' : '';
 
       const credentialInputs = { apiKey: apiKeyInput, accessToken: accessTokenInput, userId: userIdInput };
-      const credentialDraftContexts = { apiKey: '', accessToken: '', userId: '' };
+      const credentialDraftContexts = activeBalanceDraft?.credentialContexts
+        || { apiKey: '', accessToken: '', userId: '' };
       const getCurrentCredentialContext = () => sub2BuildBalanceCredentialContext(
         providerSelect.value,
         baseUrlInput.value,
@@ -4579,8 +4836,11 @@
             clearedCredential = true;
           }
           if (!inputElement.value) credentialDraftContexts[credentialName] = '';
+          if (activeBalanceDraft) activeBalanceDraft[credentialName] = inputElement.value;
         }
-        if (clearedCredential) editorMessage.textContent = '余额来源已变更，请重新输入对应凭据。';
+        if (clearedCredential) {
+          this.setActiveEditorMessage('余额来源已变更，请重新输入对应凭据。', editorMessage);
+        }
       };
       const updateProviderFields = () => {
         const usesSub2api = providerSelect.value === 'sub2api';
@@ -4588,28 +4848,21 @@
         accessTokenField.hidden = usesSub2api;
         userIdField.hidden = usesSub2api;
       };
-      const openEditor = () => {
-        for (const openEditorElement of this.root?.querySelectorAll('.sub2-balance-editor:not([hidden])') || []) {
-          openEditorElement.hidden = true;
-        }
-        this.refreshRequestSequence += 1;
-        this.pendingRefresh = false;
-        editor.hidden = false;
-        editorMessage.textContent = '';
-        updateProviderFields();
-        providerSelect.focus();
-      };
+      const openEditor = () => this.toggleAccountEditor(account, 'balance');
       const collectDraftConfig = () => {
-        const selectedProviderType = providerSelect.value;
+        if (!this.isAccountEditorActive(accountId, 'balance')) return null;
+        const draft = this.activeEditor.draft;
+        if (Number(draft?.accountId) !== accountId) return null;
+        const selectedProviderType = draft.type;
         const latestPersistedConfig = sub2LoadBalanceConfig(accountId);
-        const finalCredentialContext = getCurrentCredentialContext();
+        const finalCredentialContext = sub2BuildBalanceCredentialContext(draft.type, draft.baseUrl);
         const persistedCredentialContext = latestPersistedConfig
           ? sub2BuildBalanceCredentialContext(latestPersistedConfig.type, latestPersistedConfig.baseUrl)
           : '';
         const canReuseStoredCredentials = Boolean(finalCredentialContext)
           && persistedCredentialContext === finalCredentialContext;
         const getBoundDraftCredential = (credentialName) => {
-          const inputValue = credentialInputs[credentialName].value;
+          const inputValue = draft[credentialName];
           return inputValue
             && finalCredentialContext
             && credentialDraftContexts[credentialName] === finalCredentialContext
@@ -4618,8 +4871,8 @@
         };
         return {
           type: selectedProviderType,
-          baseUrl: baseUrlInput.value,
-          lowBalanceThreshold: thresholdInput.value,
+          baseUrl: draft.baseUrl,
+          lowBalanceThreshold: draft.lowBalanceThreshold,
           apiKey: getBoundDraftCredential('apiKey')
             || (canReuseStoredCredentials ? latestPersistedConfig?.apiKey : ''),
           accessToken: getBoundDraftCredential('accessToken')
@@ -4630,15 +4883,17 @@
       };
       const saveDraftConfig = (queryAfterSave, userEvent) => {
         if (!userEvent?.isTrusted) return;
-        const saveResult = this.saveBalanceConfig(accountId, collectDraftConfig());
+        const draftConfig = collectDraftConfig();
+        if (!draftConfig) return;
+        const saveResult = this.saveBalanceConfig(accountId, draftConfig);
         if (saveResult.error) {
-          editorMessage.textContent = saveResult.error;
+          this.setActiveEditorMessage(saveResult.error, editorMessage);
           return;
         }
-        editor.hidden = true;
+        this.discardActiveEditorDraft();
         this.lastError = '';
         this.renderStatus();
-        this.renderList();
+        this.renderList({ captureEditorFocus: false });
         if (queryAfterSave) this.handleBalanceQuery(account, true);
       };
 
@@ -4647,13 +4902,30 @@
           credentialDraftContexts[credentialName] = inputElement.value
             ? getCurrentCredentialContext()
             : '';
+          if (this.isAccountEditorActive(accountId, 'balance')) {
+            this.activeEditor.draft[credentialName] = inputElement.value;
+            this.activeEditor.draft.credentialContexts = credentialDraftContexts;
+          }
         });
       }
       providerSelect.addEventListener('change', () => {
+        if (this.isAccountEditorActive(accountId, 'balance')) {
+          this.activeEditor.draft.type = providerSelect.value;
+        }
         clearMismatchedCredentialDrafts(true);
         updateProviderFields();
       });
-      baseUrlInput.addEventListener('input', () => clearMismatchedCredentialDrafts());
+      baseUrlInput.addEventListener('input', () => {
+        if (this.isAccountEditorActive(accountId, 'balance')) {
+          this.activeEditor.draft.baseUrl = baseUrlInput.value;
+        }
+        clearMismatchedCredentialDrafts();
+      });
+      thresholdInput.addEventListener('input', () => {
+        if (this.isAccountEditorActive(accountId, 'balance')) {
+          this.activeEditor.draft.lowBalanceThreshold = thresholdInput.value;
+        }
+      });
       queryButton.addEventListener('click', (event) => {
         if (!event.isTrusted) return;
         if (currentConfig) this.handleBalanceQuery(account, true);
@@ -4670,15 +4942,16 @@
         if (!window.confirm(`确定清除“${accountName}”保存在 Tampermonkey 中的余额凭据吗？`)) return;
         const clearError = this.clearBalanceConfig(accountId);
         if (clearError) {
-          editorMessage.textContent = clearError;
+          this.setActiveEditorMessage(clearError, editorMessage);
           return;
         }
-        editor.hidden = true;
-        this.renderList();
+        this.discardActiveEditorDraft();
+        this.renderList({ captureEditorFocus: false });
       });
       cancelButton.addEventListener('click', (event) => {
         if (!event.isTrusted) return;
-        editor.hidden = true;
+        this.discardActiveEditorDraft();
+        this.renderList({ captureEditorFocus: false });
         this.refresh();
       });
       updateProviderFields();
@@ -4897,6 +5170,10 @@
       const configuredCapacity = Number.isInteger(Number(account.concurrency))
         ? Number(account.concurrency)
         : 0;
+      const activeCapacityDraft = this.isAccountEditorActive(account.id, 'capacity')
+        ? this.activeEditor.draft
+        : null;
+      const showCapacityEditor = this.claimActiveEditor(account.id, 'capacity');
       const currentCapacityUsage = displayConcurrency?.currentInUse ?? 0;
       const capacityBtn = document.createElement('button');
       capacityBtn.className = 'sub2-btn primary';
@@ -4907,7 +5184,9 @@
 
       const capacityEditor = document.createElement('div');
       capacityEditor.className = 'sub2-capacity-editor';
-      capacityEditor.hidden = true;
+      capacityEditor.hidden = !showCapacityEditor;
+      capacityEditor.dataset.sub2EditorKey = sub2BuildAccountEditorKey(account.id, 'capacity');
+      if (showCapacityEditor) capacityEditor.dataset.sub2EditorActive = 'true';
       const decreaseCapacityButton = document.createElement('button');
       decreaseCapacityButton.type = 'button';
       decreaseCapacityButton.className = 'sub2-capacity-step';
@@ -4919,8 +5198,9 @@
       capacityInput.min = '1';
       capacityInput.max = String(SUB2_CAPACITY_MAX);
       capacityInput.step = '1';
-      capacityInput.value = String(Math.max(1, configuredCapacity));
+      capacityInput.value = activeCapacityDraft?.value || String(Math.max(1, configuredCapacity));
       capacityInput.setAttribute('aria-label', '账号并发容量');
+      this.trackAccountEditorField(capacityInput, 'value');
       const increaseCapacityButton = document.createElement('button');
       increaseCapacityButton.type = 'button';
       increaseCapacityButton.className = 'sub2-capacity-step';
@@ -4955,15 +5235,24 @@
         const parsedCapacity = sub2ParseCapacityInput(capacityInput.value);
         const currentInputValue = parsedCapacity.error ? Math.max(1, configuredCapacity) : parsedCapacity.value;
         capacityInput.value = String(Math.min(SUB2_CAPACITY_MAX, Math.max(1, currentInputValue + delta)));
+        if (this.isAccountEditorActive(account.id, 'capacity')) {
+          this.activeEditor.draft.value = capacityInput.value;
+        }
         updateCapacityWarning();
       };
       decreaseCapacityButton.addEventListener('click', () => stepCapacityInput(-1));
       increaseCapacityButton.addEventListener('click', () => stepCapacityInput(1));
-      capacityInput.addEventListener('input', updateCapacityWarning);
+      capacityInput.addEventListener('input', () => {
+        if (this.isAccountEditorActive(account.id, 'capacity')) {
+          this.activeEditor.draft.value = capacityInput.value;
+        }
+        updateCapacityWarning();
+      });
       capacityInput.addEventListener('keydown', (event) => {
         if (event.key === 'Enter') this.handleCapacity(account, capacityInput.value);
       });
       applyCapacityButton.addEventListener('click', () => this.handleCapacity(account, capacityInput.value));
+      if (showCapacityEditor) updateCapacityWarning();
       capacityEditor.append(
         decreaseCapacityButton,
         capacityInput,
@@ -4973,21 +5262,16 @@
         capacityWarning,
       );
       capacityBtn.addEventListener('click', () => {
-        const editorWillOpen = capacityEditor.hidden;
-        capacityEditor.hidden = !editorWillOpen;
-        if (editorWillOpen) {
-          this.refreshRequestSequence += 1;
-          updateCapacityWarning();
-          capacityInput.focus();
-          capacityInput.select();
-        } else {
-          this.refresh();
-        }
+        this.toggleAccountEditor(account, 'capacity');
       });
 
       let quotaEditor = null;
       let quotaInput = null;
       if (supportsDailyQuota) {
+        const activeQuotaDraft = this.isAccountEditorActive(account.id, 'quota')
+          ? this.activeEditor.draft
+          : null;
+        const showQuotaEditor = this.claimActiveEditor(account.id, 'quota');
         const quotaBtn = document.createElement('button');
         quotaBtn.className = 'sub2-btn primary';
         quotaBtn.textContent = '日配额';
@@ -4997,7 +5281,9 @@
 
         quotaEditor = document.createElement('div');
         quotaEditor.className = 'sub2-quota-editor';
-        quotaEditor.hidden = true;
+        quotaEditor.hidden = !showQuotaEditor;
+        quotaEditor.dataset.sub2EditorKey = sub2BuildAccountEditorKey(account.id, 'quota');
+        if (showQuotaEditor) quotaEditor.dataset.sub2EditorActive = 'true';
         const inputWrap = document.createElement('label');
         inputWrap.className = 'sub2-quota-input-wrap';
         const prefix = document.createElement('span');
@@ -5009,7 +5295,8 @@
         quotaInput.min = '0.01';
         quotaInput.step = '0.01';
         quotaInput.placeholder = '每日上限';
-        quotaInput.value = dailyLimit > 0 ? String(dailyLimit) : '';
+        quotaInput.value = activeQuotaDraft?.value ?? (dailyLimit > 0 ? String(dailyLimit) : '');
+        this.trackAccountEditorField(quotaInput, 'value');
         inputWrap.append(prefix, quotaInput);
 
         const saveQuotaBtn = document.createElement('button');
@@ -5029,14 +5316,11 @@
         quotaHelp.textContent = '单位：美元；达到限额后暂停调度，默认滚动 24 小时重置。';
         quotaEditor.append(inputWrap, saveQuotaBtn, clearQuotaBtn, quotaHelp);
         quotaBtn.addEventListener('click', () => {
-          const editorWillOpen = quotaEditor.hidden;
-          quotaEditor.hidden = !editorWillOpen;
-          if (editorWillOpen) {
-            // 使已经发出的自动刷新失效，避免响应回来后重建列表并清空正在输入的金额。
-            this.refreshRequestSequence += 1;
-            quotaInput.focus();
-          } else {
-            this.refresh();
+          this.toggleAccountEditor(account, 'quota');
+        });
+        quotaInput.addEventListener('input', () => {
+          if (this.isAccountEditorActive(account.id, 'quota')) {
+            this.activeEditor.draft.value = quotaInput.value;
           }
         });
         quotaInput.addEventListener('keydown', (event) => {
@@ -5382,102 +5666,18 @@
       const savedScrollTop = this.auditBodyElement.scrollTop;
       const now = Date.now();
       this.auditBodyElement.textContent = '';
-
-      const auditFindings = [];
-
-      const schedulableAccounts = this.accounts.filter((account) => account.schedulable !== false);
-      const accountsByGroupId = new Map();
-      for (const account of schedulableAccounts) {
-        const groupIds = Array.isArray(account.groups) ? account.groups : [];
-        for (const groupId of groupIds) {
-          if (!accountsByGroupId.has(groupId)) accountsByGroupId.set(groupId, []);
-          accountsByGroupId.get(groupId).push(account);
-        }
-      }
-
-      for (const [groupId, groupAccounts] of accountsByGroupId) {
-        if (groupAccounts.length === 1) {
-          const group = sub2GetIndexedGroup(this.groupsById, groupId);
-          auditFindings.push({
-            severity: 'critical',
-            category: 'single-point',
-            message: `分组"${group?.name || groupId}"只有 1 个可调度账号`,
-            detail: `分组"${group?.name || groupId}"仅包含账号 ${this.getAccountDisplayName(groupAccounts[0].id)}。如果该账号受限或失败，分组将完全不可用。`,
-            accountId: groupAccounts[0].id,
-          });
-        }
-      }
-
-      const accountsByPlatform = new Map();
-      for (const account of schedulableAccounts) {
-        const platform = account.platform || 'unknown';
-        if (!accountsByPlatform.has(platform)) accountsByPlatform.set(platform, []);
-        accountsByPlatform.get(platform).push(account);
-      }
-
-      for (const account of this.accounts) {
-        const health = sub2ComputeHealth(account, now);
-        if (health.tone === 'down' && account.schedulable !== false) {
-          auditFindings.push({
-            severity: 'warning',
-            category: 'account-down',
-            message: `账号 ${this.getAccountDisplayName(account.id)} 当前不可用`,
-            detail: health.reason || '账号当前处于不可用状态，已从调度池排除。',
-            accountId: account.id,
-          });
-        }
-
-        const configuredCapacity = sub2GetNumericAccountField(account, 'concurrency_capacity');
-        if (configuredCapacity > 0) {
-          const currentOccupied = account.concurrency_occupied || 0;
-          const currentQueued = account.concurrency_queued || 0;
-          const reliabilityStats = this.reliabilitySnapshot?.accountStats?.[account.id];
-          const status429Count = reliabilityStats?.status429 || 0;
-          const totalRequests = reliabilityStats?.requests || 0;
-          const rateLimitRatio = totalRequests > 0 ? status429Count / totalRequests : 0;
-
-          if (rateLimitRatio > SUB2_CAPACITY_RATE_LIMIT_RATIO) {
-            auditFindings.push({
-              severity: 'warning',
-              category: 'capacity-high',
-              message: `账号 ${this.getAccountDisplayName(account.id)} 近 24 小时 429 占比 ${(rateLimitRatio * 100).toFixed(1)}%`,
-              detail: `当前容量配置 ${configuredCapacity}，近 24 小时触发 ${status429Count} 次 429，占 ${totalRequests} 次请求的 ${(rateLimitRatio * 100).toFixed(1)}%。建议降低容量至 ${Math.max(1, Math.floor(configuredCapacity * 0.7))} 左右。`,
-              accountId: account.id,
-              suggestedCapacity: Math.max(1, Math.floor(configuredCapacity * 0.7)),
-            });
-          } else if (currentOccupied >= configuredCapacity * SUB2_CAPACITY_HIGH_LOAD_RATIO && currentQueued > 0) {
-            auditFindings.push({
-              severity: 'info',
-              category: 'capacity-low',
-              message: `账号 ${this.getAccountDisplayName(account.id)} 当前高负载 ${currentOccupied}/${configuredCapacity}`,
-              detail: `当前占用 ${currentOccupied}，排队 ${currentQueued}，达到容量配置 ${configuredCapacity} 的 ${((currentOccupied / configuredCapacity) * 100).toFixed(0)}%。如果未触发 429，可考虑提升容量至 ${configuredCapacity + Math.ceil(configuredCapacity * 0.3)}。`,
-              accountId: account.id,
-              suggestedCapacity: configuredCapacity + Math.ceil(configuredCapacity * 0.3),
-            });
-          }
-        }
-
-        if (account.platform === 'openai-oauth' && account.models && Array.isArray(account.models)) {
-          const foreignModels = account.models.filter((modelName) =>
-            SUB2_OPENAI_OAUTH_FOREIGN_MODEL_PREFIXES.some((prefix) => modelName.startsWith(prefix)),
-          );
-          if (foreignModels.length > 0) {
-            auditFindings.push({
-              severity: 'warning',
-              category: 'platform-config',
-              message: `账号 ${this.getAccountDisplayName(account.id)} 包含非 OpenAI 模型`,
-              detail: `平台 openai-oauth 下检测到 ${foreignModels.length} 个非 OpenAI 模型（${foreignModels.slice(0, 3).join(', ')}${foreignModels.length > 3 ? '...' : ''}），可能导致路由异常。`,
-              accountId: account.id,
-            });
-          }
-        }
-      }
-
-      auditFindings.sort((left, right) => {
-        const severityDiff = SUB2_AUDIT_SEVERITY_RANK[right.severity] - SUB2_AUDIT_SEVERITY_RANK[left.severity];
-        if (severityDiff !== 0) return severityDiff;
-        return (left.message || '').localeCompare(right.message || '');
-      });
+      const auditSnapshot = sub2BuildConfigAudit({
+        accounts: this.accounts,
+        groupsById: this.groupsById,
+      }, now);
+      const capacityAdvice = sub2BuildCapacityAdvice({
+        accounts: this.accounts,
+        concurrencyByAccountId: this.concurrencyByAccountId,
+        concurrencyRecordsByAccountId: this.concurrencyRecordsByAccountId,
+        concurrencyAvailable: this.concurrencyAvailable,
+        concurrencyEnabled: this.concurrencyEnabled,
+        reliabilitySnapshot: this.reliabilitySnapshot,
+      }, now);
 
       const summaryCard = document.createElement('section');
       summaryCard.className = 'sub2-audit-card';
@@ -5485,23 +5685,21 @@
       summaryTitle.textContent = '审计摘要';
       const summaryDetail = document.createElement('div');
       summaryDetail.className = 'sub2-diagnostics-note';
-      const criticalCount = auditFindings.filter((finding) => finding.severity === 'critical').length;
-      const warningCount = auditFindings.filter((finding) => finding.severity === 'warning').length;
-      const infoCount = auditFindings.filter((finding) => finding.severity === 'info').length;
-      summaryDetail.textContent = auditFindings.length
-        ? `共发现 ${auditFindings.length} 项：${criticalCount} 严重、${warningCount} 注意、${infoCount} 提示。`
-        : '当前配置未发现明显风险。持续关注单点故障、平台配置异常和容量建议。';
+      const { critical: criticalCount, warning: warningCount, info: infoCount } = auditSnapshot.severityCounts;
+      summaryDetail.textContent = auditSnapshot.findings.length
+        ? `共发现 ${auditSnapshot.findings.length} 项：${criticalCount} 严重、${warningCount} 注意、${infoCount} 提示。`
+        : '标准配置审计当前未发现明显风险。容量建议在下方单独展示，不计入发现项。';
       summaryCard.append(summaryTitle, summaryDetail);
       this.auditBodyElement.appendChild(summaryCard);
 
-      if (auditFindings.length > 0) {
+      if (auditSnapshot.findings.length > 0) {
         const findingsCard = document.createElement('section');
         findingsCard.className = 'sub2-audit-card';
         const findingsTitle = document.createElement('h3');
         findingsTitle.textContent = '发现项';
         findingsCard.appendChild(findingsTitle);
 
-        for (const finding of auditFindings) {
+        for (const finding of auditSnapshot.findings) {
           const findingItem = document.createElement('div');
           findingItem.className = `sub2-audit-item ${finding.severity}`;
           const findingHead = document.createElement('div');
@@ -5511,33 +5709,95 @@
           severityBadge.textContent = SUB2_AUDIT_SEVERITY_LABELS[finding.severity] || finding.severity;
           const findingMessage = document.createElement('span');
           findingMessage.className = 'sub2-audit-message';
-          findingMessage.textContent = finding.message;
-          findingHead.append(severityBadge, findingMessage);
+          findingMessage.textContent = finding.title;
+          const findingCategory = document.createElement('span');
+          findingCategory.className = 'sub2-audit-category';
+          findingCategory.textContent = finding.category;
+          findingHead.append(severityBadge, findingMessage, findingCategory);
           const findingDetail = document.createElement('div');
           findingDetail.className = 'sub2-audit-detail';
           findingDetail.textContent = finding.detail;
-          findingItem.append(findingHead, findingDetail);
-
-          if (finding.suggestedCapacity && finding.accountId) {
-            const actionButton = document.createElement('button');
-            actionButton.type = 'button';
-            actionButton.className = 'sub2-audit-action';
-            actionButton.textContent = `调整容量至 ${finding.suggestedCapacity}`;
-            actionButton.addEventListener('click', () => {
-              const targetAccount = this.accounts.find((account) => account.id === finding.accountId);
-              if (targetAccount) {
-                this.openCapacityEditor(targetAccount, finding.suggestedCapacity);
-                this.closeAuditDrawer();
-              }
-            });
-            findingItem.appendChild(actionButton);
-          }
+          const findingEvidence = document.createElement('div');
+          findingEvidence.className = 'sub2-audit-evidence';
+          findingEvidence.textContent = `依据：${finding.evidence}`;
+          findingItem.append(findingHead, findingDetail, findingEvidence);
 
           findingsCard.appendChild(findingItem);
         }
 
         this.auditBodyElement.appendChild(findingsCard);
       }
+
+      const capacityCard = document.createElement('section');
+      capacityCard.className = 'sub2-audit-card';
+      const capacityTitle = document.createElement('h3');
+      capacityTitle.textContent = '容量建议（单独参考）';
+      const capacityCoverage = document.createElement('div');
+      capacityCoverage.className = 'sub2-diagnostics-note';
+      capacityCoverage.textContent = capacityAdvice.historyAvailable
+        ? capacityAdvice.historyComplete
+          ? `结合近 ${capacityAdvice.windowHours} 小时完整读取范围与当前并发快照。`
+          : `近 ${capacityAdvice.windowHours} 小时请求超过读取上限，以下仅代表已读取样本。`
+        : '尚无 24 小时请求证据，以下主要依据当前容量快照。';
+      capacityCard.append(capacityTitle, capacityCoverage);
+
+      const actionableSuggestions = capacityAdvice.suggestions.filter(
+        (suggestion) => suggestion.direction !== 'keep',
+      );
+      if (!actionableSuggestions.length) {
+        const emptyCapacityAdvice = document.createElement('div');
+        emptyCapacityAdvice.className = 'sub2-audit-detail';
+        emptyCapacityAdvice.textContent = '当前没有需要调整的容量建议。';
+        capacityCard.appendChild(emptyCapacityAdvice);
+      } else {
+        const capacityList = document.createElement('div');
+        capacityList.className = 'sub2-capacity-advice-list';
+        for (const suggestion of actionableSuggestions) {
+          const capacityItem = document.createElement('div');
+          capacityItem.className = 'sub2-capacity-advice-item';
+          const capacityHead = document.createElement('div');
+          capacityHead.className = 'sub2-capacity-advice-head';
+          const capacityName = document.createElement('span');
+          capacityName.className = 'sub2-capacity-advice-name';
+          capacityName.textContent = suggestion.accountName;
+          const capacityConfidence = document.createElement('span');
+          capacityConfidence.className = 'sub2-capacity-advice-confidence';
+          capacityConfidence.textContent = suggestion.confidence;
+          capacityHead.append(capacityName, capacityConfidence);
+          const capacityDetail = document.createElement('div');
+          capacityDetail.className = 'sub2-audit-detail';
+          capacityDetail.textContent = suggestion.reasons.join('；');
+          capacityItem.append(capacityHead, capacityDetail);
+
+          let suggestedCapacity = null;
+          if (suggestion.direction === 'decrease' && suggestion.configuredCapacity > 1) {
+            suggestedCapacity = Math.max(1, Math.floor(suggestion.configuredCapacity * 0.7));
+          } else if (suggestion.direction === 'increase' && suggestion.configuredCapacity > 0) {
+            suggestedCapacity = Math.min(
+              SUB2_CAPACITY_MAX,
+              suggestion.configuredCapacity + Math.max(1, Math.ceil(suggestion.configuredCapacity * 0.3)),
+            );
+          }
+          if (suggestedCapacity && suggestedCapacity !== suggestion.configuredCapacity) {
+            const actionButton = document.createElement('button');
+            actionButton.type = 'button';
+            actionButton.className = 'sub2-audit-action';
+            actionButton.textContent = `打开容量 ${suggestedCapacity}`;
+            actionButton.addEventListener('click', () => {
+              const targetAccount = this.accounts.find(
+                (account) => Number(account?.id) === suggestion.accountId,
+              );
+              if (!targetAccount) return;
+              this.closeAuditDrawer();
+              this.openCapacityEditor(targetAccount, suggestedCapacity);
+            });
+            capacityItem.appendChild(actionButton);
+          }
+          capacityList.appendChild(capacityItem);
+        }
+        capacityCard.appendChild(capacityList);
+      }
+      this.auditBodyElement.appendChild(capacityCard);
 
       this.auditBodyElement.scrollTop = savedScrollTop;
     }
@@ -6312,6 +6572,9 @@
 
     async handleCapacity(account, rawCapacity) {
       if (this.capacitySaving || this.quotaSaving) return;
+      const submittedEditor = this.isAccountEditorActive(account?.id, 'capacity')
+        ? this.activeEditor
+        : null;
       const parsedCapacity = sub2ParseCapacityInput(rawCapacity);
       if (parsedCapacity.error) {
         this.lastError = parsedCapacity.error;
@@ -6323,6 +6586,11 @@
       if (parsedCapacity.value === currentCapacity) {
         this.lastError = '';
         this.renderStatus();
+        if (submittedEditor && this.activeEditor === submittedEditor) {
+          this.discardActiveEditorDraft();
+          this.renderList({ captureEditorFocus: false });
+        }
+        this.refresh();
         return;
       }
 
@@ -6341,7 +6609,10 @@
         this.capacitySaving = false;
         if (updateSucceeded) {
           // 成功后刷新账号配置和 Ops 快照；失败时保留编辑器及输入值以便重试。
-          this.renderList();
+          if (submittedEditor && this.activeEditor === submittedEditor) {
+            this.discardActiveEditorDraft();
+            this.renderList({ captureEditorFocus: false });
+          }
           await this.refresh();
         }
       }
@@ -6349,6 +6620,9 @@
 
     async handleDailyQuota(account, rawDailyLimit) {
       if (this.quotaSaving || this.capacitySaving) return;
+      const submittedEditor = this.isAccountEditorActive(account?.id, 'quota')
+        ? this.activeEditor
+        : null;
       let dailyLimit = null;
       if (rawDailyLimit !== null) {
         const normalizedValue = String(rawDailyLimit || '').trim();
@@ -6386,7 +6660,10 @@
         this.quotaSaving = false;
         if (updateSucceeded) {
           // 成功后才关闭编辑器并刷新；失败时保留原输入，便于直接修正或重试。
-          this.renderList();
+          if (submittedEditor && this.activeEditor === submittedEditor) {
+            this.discardActiveEditorDraft();
+            this.renderList({ captureEditorFocus: false });
+          }
           await this.refresh();
         }
       }
@@ -6427,6 +6704,8 @@
     sub2AnnotateRequestHistory,
     sub2NormalizeRecentRequest,
     sub2ParseCapacityInput,
+    sub2BuildAccountEditorKey,
+    sub2TransitionAccountEditor,
     sub2ExtractRoutingStatusCode,
     sub2NormalizeRoutingError,
     sub2GetCorrelatedRoutingErrors,
@@ -6448,6 +6727,7 @@
     sub2AuditPrimaryAccountAvailability,
     sub2BuildConfigAudit,
     sub2BuildCapacityAdvice,
+    sub2GetGroupMemberships,
     sub2BuildRouteChain,
     sub2BuildRecentRoutingErrorIndex,
     sub2MergeRouteFailuresIntoErrorIndex,
