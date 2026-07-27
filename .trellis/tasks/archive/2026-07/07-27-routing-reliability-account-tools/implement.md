@@ -32,8 +32,8 @@
 - [x] Run a final full-scope `trellis-check` after all children are integrated.
 - [x] Review whether the editor-state, route-scope, credential-merge, or transient-key contracts should be promoted into `.trellis/spec/`.
 - [x] Present the Trellis commit plan, excluding the nine pre-existing unrelated Trellis/Codex configuration modifications.
-- [ ] Commit the reviewed product/task changes in coherent batches and push `main` to the existing remote under the user's standing publication request.
-- [ ] Archive completed child tasks and the parent only after the push is verified, then record the session journal.
+- [x] Commit the reviewed product/task changes in coherent batches and push `main` to the existing remote under the user's standing publication request.
+- [x] Archive completed child tasks and the parent only after the push is verified, then record the session journal.
 
 ## Risk and Rollback Points
 
