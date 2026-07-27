@@ -2,36 +2,36 @@
 
 ## 1. Implement Child Deliverables
 
-- [ ] Start, implement, verify, and finish `07-27-fix-controls-audit`.
-- [ ] Start, implement, verify, and finish `07-27-routing-events-ttft`.
-- [ ] Start, implement, verify, and finish `07-27-group-aware-model-sync`.
-- [ ] Start, implement, verify, and finish `07-27-one-click-account-create` after the shared family helpers exist.
-- [ ] Keep the parent in planning/integration ownership while child work is active; do not mix unrelated Trellis/Codex configuration changes into child commits.
+- [x] Start, implement, verify, and finish `07-27-fix-controls-audit`.
+- [x] Start, implement, verify, and finish `07-27-routing-events-ttft`.
+- [x] Start, implement, verify, and finish `07-27-group-aware-model-sync`.
+- [x] Start, implement, verify, and finish `07-27-one-click-account-create` after the shared family helpers exist.
+- [x] Keep the parent in planning/integration ownership while child work is active; do not mix unrelated Trellis/Codex configuration changes into child commits.
 
 ## 2. Integrate the Release
 
-- [ ] Run a full regression assertion pass across every exported helper and previously covered balance, routing, audit, capacity, quota, and reliability behavior.
-- [ ] Verify that all write boundaries remain reachable only from trusted user actions and that no TTFT path references scheduler writes.
-- [ ] Verify that API keys never reach GM storage, page storage, DOM output, logs, diagnostics, errors, clipboard paths, task artifacts, or README examples.
-- [ ] Update userscript metadata/runtime fallback to `2.6.0`.
-- [ ] Update README current-version notes, feature behavior, API boundaries, security boundaries, evidence limits, and validation coverage.
-- [ ] Review the final diff against parent R1-R13 and all child acceptance criteria.
+- [x] Run a full regression assertion pass across every exported helper and previously covered balance, routing, audit, capacity, quota, and reliability behavior.
+- [x] Verify that all write boundaries remain reachable only from trusted user actions and that no TTFT path references scheduler writes.
+- [x] Verify that API keys never reach GM storage, page storage, DOM output, logs, diagnostics, errors, clipboard paths, task artifacts, or README examples.
+- [x] Update userscript metadata/runtime fallback to `2.6.0`.
+- [x] Update README current-version notes, feature behavior, API boundaries, security boundaries, evidence limits, and validation coverage.
+- [x] Review the final diff against parent R1-R13 and all child acceptance criteria.
 
 ## 3. Validation Commands
 
-- [ ] Create a temporary Node assertion file outside the tracked product surface, execute it, and remove it after success.
-- [ ] Run `node --check sub2-smart-group.user.js`.
-- [ ] Run the focused Node assertions covering editor transitions, canonical audit rendering data, route scope, TTFT normalization/percentiles, model policy/reconciliation, URL validation, platform detection, group resolution, account payloads, and the established regression baseline.
-- [ ] Run static searches proving preview/create/model-sync calls have no timer/startup/visibility path and TTFT has no scheduler-write path.
-- [ ] Run secret-pattern and repository-artifact scans.
-- [ ] Run `git diff --check` and inspect the complete intended diff.
-- [ ] Run `py -3 ./.trellis/scripts/task.py validate` for each active child and the parent as appropriate.
+- [x] Create a temporary Node assertion file outside the tracked product surface, execute it, and remove it after success.
+- [x] Run `node --check sub2-smart-group.user.js`.
+- [x] Run the focused Node assertions covering editor transitions, canonical audit rendering data, route scope, TTFT normalization/percentiles, model policy/reconciliation, URL validation, platform detection, group resolution, account payloads, and the established regression baseline.
+- [x] Run static searches proving preview/create/model-sync calls have no timer/startup/visibility path and TTFT has no scheduler-write path.
+- [x] Run secret-pattern and repository-artifact scans.
+- [x] Run `git diff --check` and inspect the complete intended diff.
+- [x] Run `py -3 ./.trellis/scripts/task.py validate` for each active child and the parent as appropriate.
 
 ## 4. Publish
 
-- [ ] Run a final full-scope `trellis-check` after all children are integrated.
-- [ ] Review whether the editor-state, route-scope, credential-merge, or transient-key contracts should be promoted into `.trellis/spec/`.
-- [ ] Present the Trellis commit plan, excluding the nine pre-existing unrelated Trellis/Codex configuration modifications.
+- [x] Run a final full-scope `trellis-check` after all children are integrated.
+- [x] Review whether the editor-state, route-scope, credential-merge, or transient-key contracts should be promoted into `.trellis/spec/`.
+- [x] Present the Trellis commit plan, excluding the nine pre-existing unrelated Trellis/Codex configuration modifications.
 - [ ] Commit the reviewed product/task changes in coherent batches and push `main` to the existing remote under the user's standing publication request.
 - [ ] Archive completed child tasks and the parent only after the push is verified, then record the session journal.
 

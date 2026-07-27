@@ -18,13 +18,13 @@ Persist only the upstream model family that can belong to the account's target g
 
 ## Acceptance Criteria
 
-- [ ] GPT/OpenAI synchronization persists no Claude/Gemini/other-family IDs.
-- [ ] Claude/Anthropic synchronization persists no GPT/OpenAI/Gemini/other-family IDs.
-- [ ] Missing, conflicting, unsupported, or account-mismatched group platforms produce an explanation and no upstream or update request.
-- [ ] Stale and wrong-family identity mappings are removed, current allowed identity mappings are added, and existing manual non-identity mappings remain unchanged even when their source key conflicts with a fetched model.
-- [ ] A successful update preserves every unrelated credential field and rereads the saved model state.
-- [ ] Empty allowed results require explicit handling and never silently erase configuration.
-- [ ] Pure-function tests cover case normalization, accepted model families, excluded near-matches, conflicting groups, and credential-preserving payload construction.
+- [x] GPT/OpenAI synchronization persists no Claude/Gemini/other-family IDs.
+- [x] Claude/Anthropic synchronization persists no GPT/OpenAI/Gemini/other-family IDs.
+- [x] Missing, conflicting, unsupported, or account-mismatched group platforms produce an explanation and no upstream or update request.
+- [x] Stale and wrong-family identity mappings are removed, current allowed identity mappings are added, and existing manual non-identity mappings remain unchanged even when their source key conflicts with a fetched model.
+- [x] A successful update preserves every unrelated credential field and rereads the saved model state.
+- [x] Empty allowed results require explicit handling and never silently erase configuration.
+- [x] Pure-function tests cover case normalization, accepted model families, excluded near-matches, conflicting groups, and credential-preserving payload construction.
 
 ## Out of Scope
 

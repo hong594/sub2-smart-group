@@ -15,12 +15,12 @@ Restore predictable account-card editing and make configuration audit findings r
 
 ## Acceptance Criteria
 
-- [ ] Same-control close, cross-control switch, and cross-account switch each leave zero or one visible editor as intended.
-- [ ] Group/platform/health/text/sort changes update the visible list with an editor open.
-- [ ] Balance provider/origin/account draft isolation remains covered by regression assertions.
-- [ ] Audit findings use readable canonical group names and contain no object-string labels or duplicate object-identity groups.
-- [ ] Existing audit severity/count behavior is derived from the canonical builder.
-- [ ] Capacity advice remains available without being counted twice as audit findings.
+- [x] Same-control close, cross-control switch, and cross-account switch each leave zero or one visible editor as intended.
+- [x] Group/platform/health/text/sort changes update the visible list with an editor open.
+- [x] Balance provider/origin/account draft isolation remains covered by regression assertions.
+- [x] Audit findings use readable canonical group names and contain no object-string labels or duplicate object-identity groups.
+- [x] Existing audit severity/count behavior is derived from the canonical builder.
+- [x] Capacity advice remains available without being counted twice as audit findings.
 
 ## Out of Scope
 

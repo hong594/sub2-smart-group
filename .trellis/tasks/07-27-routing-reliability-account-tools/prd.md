@@ -43,19 +43,19 @@ Make the userscript reliable enough for daily account operations: account contro
 
 ## Acceptance Criteria
 
-- [ ] Clicking Balance, Capacity, or Quota on the same account opens, closes, and switches exactly one editor; switching accounts also leaves only one editor visible.
-- [ ] All filters and sorting continue to change the rendered account set while an editor is open, without credential-context reuse or draft loss for the still-active editor.
-- [ ] Audit output contains canonical readable group names and no `[object Object]` or duplicate object-identity groups.
-- [ ] `百倍 -> Ark-GPT` and every other cross-group/cross-model pair produce no hit-change event; a same-scope account change still produces one.
-- [ ] Interleaving a different route between two observations of one route neither creates a cross-route event nor suppresses the legitimate later same-route account change.
-- [ ] Request history displays available `first_token_ms`; account summaries show rolling 24-hour P90, P50, latest value, and sample count, and never imply TTFT exists for non-streaming or missing samples.
-- [ ] No TTFT code path writes scheduler state. Manual schedulable controls continue to work unchanged.
-- [ ] A supported URL/key can be previewed and created once with the detected API-key platform and a platform-compatible group: a compatible concrete filter is preselected, a sole compatible group is automatic, multiple groups require an explicit selection, and zero compatible groups creates nothing.
-- [ ] Creation uses concurrency `1`, shows the proposed account-level priority before submission, and shows the actual group membership after refresh without claiming an unsupported guaranteed group-level fallback position.
-- [ ] A GPT/OpenAI model pull reconciles identity mappings to the approved OpenAI family, and a Claude/Anthropic pull reconciles identity mappings to the approved Claude family; stale/wrong-family identity entries are removed while manual non-identity mappings, base URL, API key, header overrides, and all unrelated credentials are preserved.
-- [ ] Focused pure-function assertions cover editor transitions, audit group normalization, route-scope comparison, TTFT aggregation/evidence states, platform detection, group resolution, model-family filtering, and credential-preserving update construction.
-- [ ] `node --check sub2-smart-group.user.js`, focused Node assertions, and `git diff --check` pass; no real credentials, external source clones, or temporary assertion artifacts enter the repository diff.
-- [ ] README, metadata version, runtime fallback version, and user-visible release notes agree before commit and push.
+- [x] Clicking Balance, Capacity, or Quota on the same account opens, closes, and switches exactly one editor; switching accounts also leaves only one editor visible.
+- [x] All filters and sorting continue to change the rendered account set while an editor is open, without credential-context reuse or draft loss for the still-active editor.
+- [x] Audit output contains canonical readable group names and no `[object Object]` or duplicate object-identity groups.
+- [x] `百倍 -> Ark-GPT` and every other cross-group/cross-model pair produce no hit-change event; a same-scope account change still produces one.
+- [x] Interleaving a different route between two observations of one route neither creates a cross-route event nor suppresses the legitimate later same-route account change.
+- [x] Request history displays available `first_token_ms`; account summaries show rolling 24-hour P90, P50, latest value, and sample count, and never imply TTFT exists for non-streaming or missing samples.
+- [x] No TTFT code path writes scheduler state. Manual schedulable controls continue to work unchanged.
+- [x] A supported URL/key can be previewed and created once with the detected API-key platform and a platform-compatible group: a compatible concrete filter is preselected, a sole compatible group is automatic, multiple groups require an explicit selection, and zero compatible groups creates nothing.
+- [x] Creation uses concurrency `1`, shows the proposed account-level priority before submission, and shows the actual group membership after refresh without claiming an unsupported guaranteed group-level fallback position.
+- [x] A GPT/OpenAI model pull reconciles identity mappings to the approved OpenAI family, and a Claude/Anthropic model pull reconciles identity mappings to the approved Claude family; stale/wrong-family identity entries are removed while manual non-identity mappings, base URL, API key, header overrides, and all unrelated credentials are preserved.
+- [x] Focused pure-function assertions cover editor transitions, audit group normalization, route-scope comparison, TTFT aggregation/evidence states, platform detection, group resolution, model-family filtering, and credential-preserving update construction.
+- [x] `node --check sub2-smart-group.user.js`, focused Node assertions, and `git diff --check` pass; no real credentials, external source clones, or temporary assertion artifacts enter the repository diff.
+- [x] README, metadata version, runtime fallback version, and user-visible release notes agree before commit and push.
 
 ## Out of Scope
 

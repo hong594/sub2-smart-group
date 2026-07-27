@@ -3,7 +3,7 @@
   "name": "routing-reliability-account-tools",
   "title": "Routing reliability and account tools",
   "description": "Fix account editor, audit, and cross-group event defects; add TTFT observability, one-click account creation, and group-aware model synchronization.",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,
