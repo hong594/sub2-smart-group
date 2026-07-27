@@ -67,7 +67,8 @@
   //   PUT  /api/v1/admin/accounts/:id                  仅调整账号优先级 / 并发容量
   //   GET  /api/v1/admin/accounts/:id/models           查看 sub2 已保存的模型
   //   POST /api/v1/admin/accounts/:id/models/sync-upstream
-  //                                                        用户点击后拉取并同步上游模型
+  //                                                        用户点击后只拉取上游模型
+  //   POST /api/v1/admin/accounts/bulk-update           仅合并写入过滤后的 model_mapping
   // 外部余额查询（凭据由用户逐账号保存在 Tampermonkey，仅点击时发送）：
   //   GET  <allowlisted-origin>/v1/usage                 sub2api 余额
   //   GET  <allowlisted-origin>/api/user/self            newapi 余额
@@ -133,6 +134,8 @@
     'minimax-', 'gemini-', 'gemma-', 'grok-', 'doubao-', 'hunyuan-', 'llama-', 'llama2-',
     'llama3-', 'meta-llama', 'mistral-', 'mixtral-', 'baichuan-', 'ernie-', 'step-', 'seed-', 'yi-',
   ]);
+  const SUB2_MODEL_SYNC_PLATFORMS = Object.freeze(['openai', 'anthropic']);
+  const SUB2_OPENAI_NON_TEXT_MODEL_MARKER = /(?:^|[-_.])(?:image|images|audio|realtime|transcribe|transcription|speech|tts|embedding|embeddings)(?:$|[-_.])/;
 
   function sub2StorageGet(key, fallback) {
     try {
@@ -2480,6 +2483,259 @@
     };
   }
 
+  function sub2NormalizeModelPlatform(platform) {
+    return String(platform || '').trim().toLowerCase();
+  }
+
+  function sub2NormalizeFetchedModelIds(models) {
+    if (!Array.isArray(models)) return [];
+    const seenModelIds = new Set();
+    const modelIds = [];
+    for (const model of models) {
+      const modelId = String(
+        typeof model === 'string'
+          ? model
+          : model?.id ?? model?.model ?? model?.name ?? '',
+      ).trim();
+      if (!modelId || seenModelIds.has(modelId)) continue;
+      seenModelIds.add(modelId);
+      modelIds.push(modelId);
+    }
+    return modelIds.sort((leftModel, rightModel) => (
+      leftModel < rightModel ? -1 : leftModel > rightModel ? 1 : 0
+    ));
+  }
+
+  function sub2ClassifyModelForPlatform(modelId, targetPlatform) {
+    const normalizedModelId = String(modelId || '').trim();
+    const normalizedPlatform = sub2NormalizeModelPlatform(targetPlatform);
+    const finalModelSegment = normalizedModelId.split('/').pop().trim().toLowerCase();
+    if (!normalizedModelId || !finalModelSegment) {
+      return { allowed: false, family: null, reason: 'empty-model' };
+    }
+
+    const isClaudeFamily = /^claude-[^\s/]+$/.test(finalModelSegment);
+    const isOpenAIFamily = /^(?:gpt|chatgpt)-[^\s/]+$/.test(finalModelSegment)
+      || /^o(?:1|3|4)(?:$|-[^\s/]+)$/.test(finalModelSegment)
+      || /^codex-[^\s/]+$/.test(finalModelSegment);
+    const family = isClaudeFamily ? 'anthropic' : isOpenAIFamily ? 'openai' : null;
+
+    if (!SUB2_MODEL_SYNC_PLATFORMS.includes(normalizedPlatform)) {
+      return { allowed: false, family, reason: 'unsupported-platform' };
+    }
+    if (!family) return { allowed: false, family: null, reason: 'unsupported-family' };
+    if (family === 'openai' && SUB2_OPENAI_NON_TEXT_MODEL_MARKER.test(finalModelSegment)) {
+      return { allowed: false, family, reason: 'endpoint-specific' };
+    }
+    if (family !== normalizedPlatform) {
+      return { allowed: false, family, reason: 'family-mismatch' };
+    }
+    return { allowed: true, family, reason: 'allowed' };
+  }
+
+  function sub2FilterModelsForPlatform(models, targetPlatform) {
+    const platform = sub2NormalizeModelPlatform(targetPlatform);
+    const fetched = sub2NormalizeFetchedModelIds(models);
+    const allowed = [];
+    const excluded = [];
+    for (const modelId of fetched) {
+      const policy = sub2ClassifyModelForPlatform(modelId, platform);
+      if (policy.allowed) allowed.push(modelId);
+      else excluded.push({ id: modelId, family: policy.family, reason: policy.reason });
+    }
+    return {
+      platform,
+      fetched,
+      allowed,
+      excluded,
+      counts: {
+        fetched: fetched.length,
+        allowed: allowed.length,
+        excluded: excluded.length,
+      },
+    };
+  }
+
+  function sub2GetVisibleModelMappingState(account) {
+    const credentials = account?.credentials;
+    if (!credentials || typeof credentials !== 'object' || Array.isArray(credentials)) {
+      return { known: false, modelMapping: null };
+    }
+    const rawMapping = credentials.model_mapping;
+    if (rawMapping === undefined || rawMapping === null) {
+      return { known: true, modelMapping: {} };
+    }
+    if (typeof rawMapping !== 'object' || Array.isArray(rawMapping)) {
+      return { known: false, modelMapping: null };
+    }
+    return { known: true, modelMapping: rawMapping };
+  }
+
+  function sub2IsSystemOwnedModelMappingEntry(sourceModel, targetModel) {
+    return typeof sourceModel === 'string'
+      && typeof targetModel === 'string'
+      && sourceModel.trim() === targetModel.trim();
+  }
+
+  function sub2ModelMappingValuesEqual(leftValue, rightValue) {
+    if (Object.is(leftValue, rightValue)) return true;
+    if (Array.isArray(leftValue) || Array.isArray(rightValue)) {
+      return Array.isArray(leftValue)
+        && Array.isArray(rightValue)
+        && leftValue.length === rightValue.length
+        && leftValue.every((value, index) => sub2ModelMappingValuesEqual(value, rightValue[index]));
+    }
+    if (!leftValue || !rightValue || typeof leftValue !== 'object' || typeof rightValue !== 'object') {
+      return false;
+    }
+    const leftKeys = Object.keys(leftValue);
+    const rightKeys = Object.keys(rightValue);
+    return leftKeys.length === rightKeys.length
+      && leftKeys.every((key) => Object.prototype.hasOwnProperty.call(rightValue, key)
+        && sub2ModelMappingValuesEqual(leftValue[key], rightValue[key]));
+  }
+
+  function sub2ModelMappingsEqual(leftMapping, rightMapping) {
+    if (!leftMapping || typeof leftMapping !== 'object' || Array.isArray(leftMapping)) return false;
+    if (!rightMapping || typeof rightMapping !== 'object' || Array.isArray(rightMapping)) return false;
+    const leftKeys = Object.keys(leftMapping);
+    const rightKeys = Object.keys(rightMapping);
+    if (leftKeys.length !== rightKeys.length) return false;
+    return leftKeys.every((key) => Object.prototype.hasOwnProperty.call(rightMapping, key)
+      && sub2ModelMappingValuesEqual(leftMapping[key], rightMapping[key]));
+  }
+
+  function sub2ReconcileModelMapping(currentMapping, allowedModelIds) {
+    const sourceMapping = currentMapping && typeof currentMapping === 'object' && !Array.isArray(currentMapping)
+      ? currentMapping
+      : {};
+    const allowed = sub2NormalizeFetchedModelIds(allowedModelIds);
+    const manualEntries = [];
+    const identityEntries = [];
+    for (const [sourceModel, targetModel] of Object.entries(sourceMapping)) {
+      if (sub2IsSystemOwnedModelMappingEntry(sourceModel, targetModel)) {
+        identityEntries.push([sourceModel, targetModel]);
+      } else {
+        manualEntries.push([sourceModel, targetModel]);
+      }
+    }
+
+    const preserved = manualEntries
+      .map(([sourceModel]) => sourceModel)
+      .sort((leftModel, rightModel) => (leftModel < rightModel ? -1 : leftModel > rightModel ? 1 : 0));
+    if (!allowed.length) {
+      return {
+        blocked: true,
+        reason: 'empty-allowed-models',
+        modelMapping: null,
+        allowed,
+        persisted: [],
+        added: [],
+        removed: [],
+        preserved,
+        conflicts: [],
+        changed: false,
+        counts: {
+          allowed: 0,
+          persisted: 0,
+          added: 0,
+          removed: 0,
+          preserved: preserved.length,
+          conflicts: 0,
+        },
+      };
+    }
+
+    const manualSourceModels = new Set(manualEntries.map(([sourceModel]) => sourceModel));
+    const conflicts = allowed.filter((modelId) => manualSourceModels.has(modelId));
+    const persisted = allowed.filter((modelId) => !manualSourceModels.has(modelId));
+    const modelMapping = Object.fromEntries([
+      ...manualEntries,
+      ...persisted.map((modelId) => [modelId, modelId]),
+    ]);
+    const added = persisted.filter((modelId) => !identityEntries.some(
+      ([sourceModel, targetModel]) => sourceModel === modelId && targetModel === modelId,
+    ));
+    const removed = identityEntries
+      .filter(([sourceModel, targetModel]) => (
+        !Object.prototype.hasOwnProperty.call(modelMapping, sourceModel)
+        || modelMapping[sourceModel] !== targetModel
+      ))
+      .map(([sourceModel]) => sourceModel)
+      .sort((leftModel, rightModel) => (leftModel < rightModel ? -1 : leftModel > rightModel ? 1 : 0));
+
+    return {
+      blocked: false,
+      reason: '',
+      modelMapping,
+      allowed,
+      persisted,
+      added,
+      removed,
+      preserved,
+      conflicts,
+      changed: !sub2ModelMappingsEqual(sourceMapping, modelMapping),
+      counts: {
+        allowed: allowed.length,
+        persisted: persisted.length,
+        added: added.length,
+        removed: removed.length,
+        preserved: preserved.length,
+        conflicts: conflicts.length,
+      },
+    };
+  }
+
+  function sub2BuildModelSyncPlan(currentMapping, fetchedModels, targetPlatform) {
+    const filtered = sub2FilterModelsForPlatform(fetchedModels, targetPlatform);
+    const reconciled = sub2ReconcileModelMapping(currentMapping, filtered.allowed);
+    return {
+      platform: filtered.platform,
+      fetched: filtered.fetched,
+      allowed: filtered.allowed,
+      excluded: filtered.excluded,
+      modelMapping: reconciled.modelMapping,
+      persisted: reconciled.persisted,
+      added: reconciled.added,
+      removed: reconciled.removed,
+      preserved: reconciled.preserved,
+      conflicts: reconciled.conflicts,
+      blocked: reconciled.blocked,
+      reason: reconciled.reason,
+      changed: reconciled.changed,
+      counts: {
+        fetched: filtered.counts.fetched,
+        allowed: filtered.counts.allowed,
+        excluded: filtered.counts.excluded,
+        persisted: reconciled.counts.persisted,
+        added: reconciled.counts.added,
+        removed: reconciled.counts.removed,
+        preserved: reconciled.counts.preserved,
+        conflicts: reconciled.counts.conflicts,
+      },
+    };
+  }
+
+  function sub2BuildModelMappingBulkUpdatePayload(accountId, modelMapping) {
+    const numericAccountId = Number(accountId);
+    if (!Number.isInteger(numericAccountId) || numericAccountId <= 0) {
+      throw new TypeError('A positive account ID is required.');
+    }
+    if (!modelMapping || typeof modelMapping !== 'object' || Array.isArray(modelMapping)) {
+      throw new TypeError('A complete model mapping object is required.');
+    }
+    return {
+      account_ids: [numericAccountId],
+      credentials: {
+        model_mapping: Object.fromEntries(Object.entries(modelMapping)),
+      },
+    };
+  }
+
+  function sub2FormatModelSyncCounts(counts) {
+    return `抓取 ${Number(counts?.fetched) || 0} 个，允许 ${Number(counts?.allowed) || 0} 个，排除 ${Number(counts?.excluded) || 0} 个，持久化 ${Number(counts?.persisted) || 0} 个`;
+  }
+
   function sub2NormalizeModels(payload) {
     const candidateCollections = [
       payload,
@@ -2792,7 +3048,27 @@
     return '';
   }
 
-  function sub2GetGroupMemberships(account, groupsById = null) {
+  function sub2GetStrictGroupPlatforms(...values) {
+    const platforms = [];
+    for (const value of values) {
+      const platform = sub2NormalizeModelPlatform(value);
+      if (platform && !platforms.includes(platform)) platforms.push(platform);
+    }
+    return platforms.sort((leftPlatform, rightPlatform) => (
+      leftPlatform < rightPlatform ? -1 : leftPlatform > rightPlatform ? 1 : 0
+    ));
+  }
+
+  function sub2MergeMembershipStrictPlatforms(memberships, groupKey, strictPlatforms) {
+    const existingMembership = memberships.find((membership) => membership.groupKey === groupKey);
+    if (!existingMembership) return;
+    existingMembership.strictPlatforms = sub2GetStrictGroupPlatforms(
+      ...(existingMembership.strictPlatforms || []),
+      ...strictPlatforms,
+    );
+  }
+
+  function sub2GetGroupMemberships(account, groupsById = null, includeStrictPlatforms = false) {
     const accountGroups = Array.isArray(account?.account_groups) ? account.account_groups : [];
     const memberships = [];
     const seenGroupKeys = new Set();
@@ -2814,7 +3090,21 @@
         indexedGroup.name,
       ) || (groupId ? `分组 ${groupId}` : '未命名分组');
       const groupKey = groupId ? `id:${groupId}` : `name:${groupName.toLocaleLowerCase()}`;
-      if (seenGroupKeys.has(groupKey)) continue;
+      const directInlineGroup = rawInlineGroup && typeof rawInlineGroup === 'object'
+        ? inlineGroup
+        : accountGroupObject.group_id === undefined
+          ? accountGroupObject
+          : {};
+      const strictPlatforms = sub2GetStrictGroupPlatforms(
+        directInlineGroup.platform,
+        indexedGroup.platform,
+      );
+      if (seenGroupKeys.has(groupKey)) {
+        if (includeStrictPlatforms) {
+          sub2MergeMembershipStrictPlatforms(memberships, groupKey, strictPlatforms);
+        }
+        continue;
+      }
       seenGroupKeys.add(groupKey);
 
       memberships.push({
@@ -2827,13 +3117,15 @@
           indexedGroup.platform,
           account?.platform,
         ),
+        ...(includeStrictPlatforms ? { strictPlatforms } : {}),
         priority: sub2NormalizeOptionalPriority(accountGroupObject.priority),
         status: sub2GetFirstReadableText(inlineGroup.status, accountGroupObject.status, indexedGroup.status),
       });
     }
 
-    // 兼容只返回 groups、没有 account_groups 的旧版接口。
-    if (!memberships.length && Array.isArray(account?.groups)) {
+    // 兼容只返回 groups 的旧版接口；严格解析时也合并同一分组的内联 platform 证据。
+    const hasAccountGroupMemberships = memberships.length > 0;
+    if ((!hasAccountGroupMemberships || includeStrictPlatforms) && Array.isArray(account?.groups)) {
       for (const group of account.groups) {
         const groupObject = group && typeof group === 'object' ? group : {};
         const numericGroupId = Number(groupObject.id ?? group);
@@ -2843,13 +3135,21 @@
         const groupName = sub2GetFirstReadableText(groupObject.name, primitiveGroupName, indexedGroup.name)
           || (groupId ? `分组 ${groupId}` : '未命名分组');
         const groupKey = groupId ? `id:${groupId}` : `name:${groupName.toLocaleLowerCase()}`;
-        if (seenGroupKeys.has(groupKey)) continue;
+        const strictPlatforms = sub2GetStrictGroupPlatforms(groupObject.platform, indexedGroup.platform);
+        if (seenGroupKeys.has(groupKey)) {
+          if (includeStrictPlatforms) {
+            sub2MergeMembershipStrictPlatforms(memberships, groupKey, strictPlatforms);
+          }
+          continue;
+        }
+        if (hasAccountGroupMemberships) continue;
         seenGroupKeys.add(groupKey);
         memberships.push({
           groupId,
           groupKey,
           name: groupName,
           platform: sub2GetFirstReadableText(groupObject.platform, indexedGroup.platform, account?.platform),
+          ...(includeStrictPlatforms ? { strictPlatforms } : {}),
           priority: null,
           status: sub2GetFirstReadableText(groupObject.status, indexedGroup.status),
         });
@@ -2863,13 +3163,20 @@
         if (!Number.isInteger(numericGroupId) || numericGroupId <= 0) continue;
         const indexedGroup = sub2GetIndexedGroup(groupsById, numericGroupId);
         const groupKey = `id:${numericGroupId}`;
-        if (seenGroupKeys.has(groupKey)) continue;
+        const strictPlatforms = sub2GetStrictGroupPlatforms(indexedGroup.platform);
+        if (seenGroupKeys.has(groupKey)) {
+          if (includeStrictPlatforms) {
+            sub2MergeMembershipStrictPlatforms(memberships, groupKey, strictPlatforms);
+          }
+          continue;
+        }
         seenGroupKeys.add(groupKey);
         memberships.push({
           groupId: numericGroupId,
           groupKey,
           name: sub2GetFirstReadableText(indexedGroup.name) || `分组 ${numericGroupId}`,
           platform: sub2GetFirstReadableText(indexedGroup.platform, account?.platform),
+          ...(includeStrictPlatforms ? { strictPlatforms } : {}),
           priority: null,
           status: sub2GetFirstReadableText(indexedGroup.status),
         });
@@ -2877,6 +3184,77 @@
     }
 
     return memberships;
+  }
+
+  function sub2ResolveModelSyncPlatform(account, groupsById = null) {
+    const memberships = sub2GetGroupMemberships(account, groupsById, true);
+    const accountPlatform = sub2NormalizeModelPlatform(account?.platform);
+    const baseResult = {
+      ok: false,
+      platform: '',
+      accountPlatform,
+      platforms: [],
+      memberships,
+    };
+    if (!memberships.length) {
+      return {
+        ...baseResult,
+        reason: 'missing-membership',
+        message: '账号没有可解析的分组成员关系。',
+      };
+    }
+
+    const missingMembership = memberships.find(
+      (membership) => !Array.isArray(membership.strictPlatforms) || !membership.strictPlatforms.length,
+    );
+    if (missingMembership) {
+      return {
+        ...baseResult,
+        reason: 'missing-group-platform',
+        message: `分组 ${missingMembership.groupKey} 缺少真实 platform。`,
+      };
+    }
+
+    const platforms = sub2GetStrictGroupPlatforms(
+      ...memberships.flatMap((membership) => membership.strictPlatforms),
+    );
+    const membershipConflict = memberships.some((membership) => membership.strictPlatforms.length !== 1);
+    if (membershipConflict || platforms.length !== 1) {
+      return {
+        ...baseResult,
+        platforms,
+        reason: 'conflicting-group-platforms',
+        message: `分组 platform 冲突：${platforms.join('、') || '无法解析'}。`,
+      };
+    }
+
+    const platform = platforms[0];
+    if (!SUB2_MODEL_SYNC_PLATFORMS.includes(platform)) {
+      return {
+        ...baseResult,
+        platform,
+        platforms,
+        reason: 'unsupported-group-platform',
+        message: `不支持分组 platform ${platform}。`,
+      };
+    }
+    if (accountPlatform !== platform) {
+      return {
+        ...baseResult,
+        platform,
+        platforms,
+        reason: 'account-platform-mismatch',
+        message: `分组 platform ${platform} 与账号 platform ${accountPlatform || '缺失'} 不一致。`,
+      };
+    }
+    return {
+      ...baseResult,
+      ok: true,
+      platform,
+      platforms,
+      reason: 'resolved',
+      message: '',
+    };
   }
 
   function sub2GetEffectivePriority(account, requestGroupId = null, groupsById = null) {
@@ -3597,9 +3975,17 @@
   }
 
   async function sub2SyncAccountModels(accountId) {
-    // 该 POST 会访问上游并同步账号模型配置，只能由模型抽屉里的手动按钮触发。
-    await sub2ApiRequest('POST', `/admin/accounts/${accountId}/models/sync-upstream`);
-    return sub2FetchAccountModels(accountId);
+    // 该 POST 只拉取上游模型；持久化由分组策略过滤后的 bulk-update 边界完成。
+    const data = await sub2ApiRequest('POST', `/admin/accounts/${accountId}/models/sync-upstream`);
+    if (!data || !Array.isArray(data.models)) {
+      throw new Error('上游模型响应缺少 models 数组。');
+    }
+    return data.models;
+  }
+
+  async function sub2PersistAccountModelMapping(accountId, modelMapping) {
+    const payload = sub2BuildModelMappingBulkUpdatePayload(accountId, modelMapping);
+    return sub2ApiRequest('POST', '/admin/accounts/bulk-update', payload);
   }
 
   async function sub2SetSchedulable(accountId, schedulable) {
@@ -4183,7 +4569,7 @@
               <input type="text" class="sub2-model-search" placeholder="搜索模型…" />
               <button type="button" class="sub2-btn primary sub2-model-sync">拉取并同步上游</button>
             </div>
-            <div class="sub2-model-notice">“拉取并同步上游”会真实访问一次该账号的模型接口，并由 sub2 更新账号保存的模型配置；脚本不会自动执行。</div>
+            <div class="sub2-model-notice">“拉取并同步上游”会真实访问一次该账号的模型接口，只保存与目标分组平台匹配的模型；脚本不会自动执行。</div>
             <div class="sub2-model-state">正在读取已保存模型…</div>
             <div class="sub2-model-list"></div>
           </section>
@@ -4322,7 +4708,7 @@
         this.modelFilterText = this.modelSearchElement.value.trim().toLocaleLowerCase();
         this.renderModelDrawer();
       });
-      this.modelSyncButtonElement?.addEventListener('click', () => this.handleSyncModels());
+      this.modelSyncButtonElement?.addEventListener('click', () => this.handleSyncModels(true));
       this.root.querySelector('.sub2-diagnostics-close')?.addEventListener('click', () => this.closeDiagnosticsDrawer());
       this.diagnosticsOverlayElement?.addEventListener('click', (event) => {
         if (event.target === this.diagnosticsOverlayElement) this.closeDiagnosticsDrawer();
@@ -6831,7 +7217,7 @@
       if (this.modelStateElement) {
         this.modelStateElement.classList.toggle('error', Boolean(this.modelError));
         if (this.modelSyncing) {
-          this.modelStateElement.textContent = '正在访问上游模型接口并同步，请稍候…';
+          this.modelStateElement.textContent = '正在读取最新账号、校验分组并处理上游模型，请稍候…';
         } else if (this.modelLoading) {
           this.modelStateElement.textContent = '正在读取 sub2 已保存的模型，不访问上游…';
         } else if (this.modelError) {
@@ -6890,26 +7276,101 @@
       }
     }
 
-    async handleSyncModels() {
-      if (!this.modelAccount || this.modelLoading || this.modelSyncing) return;
-      const account = this.modelAccount;
+    async handleSyncModels(userInitiated = false) {
+      if (userInitiated !== true || !this.modelAccount || this.modelLoading || this.modelSyncing) return;
+      const accountId = Number(this.modelAccount.id);
+      if (!Number.isInteger(accountId) || accountId <= 0) return;
       const requestSequence = ++this.modelRequestSequence;
       this.modelSyncing = true;
       this.modelMessage = '';
       this.modelError = '';
       this.renderModelDrawer();
 
+      const requestIsCurrent = () => requestSequence === this.modelRequestSequence
+        && Number(this.modelAccount?.id) === accountId;
+      let upstreamFetched = false;
+      let writeCompleted = false;
+
       try {
-        const models = await sub2SyncAccountModels(account.id);
-        if (requestSequence !== this.modelRequestSequence || this.modelAccount?.id !== account.id) return;
+        const latestAccount = await sub2FetchAccount(accountId);
+        if (!requestIsCurrent()) return;
+        if (!latestAccount || Number(latestAccount.id) !== accountId) {
+          throw new Error('最新账号详情无效。');
+        }
+
+        const platformResolution = sub2ResolveModelSyncPlatform(latestAccount, this.groupsById);
+        if (!platformResolution.ok) {
+          this.modelError = `未同步：${platformResolution.message}`;
+          return;
+        }
+        const mappingState = sub2GetVisibleModelMappingState(latestAccount);
+        if (!mappingState.known) {
+          this.modelError = '未同步：最新账号详情没有可安全读取的 model_mapping。';
+          return;
+        }
+
+        const upstreamModels = await sub2SyncAccountModels(accountId);
+        upstreamFetched = true;
+        if (!requestIsCurrent()) return;
+        const plan = sub2BuildModelSyncPlan(
+          mappingState.modelMapping,
+          upstreamModels,
+          platformResolution.platform,
+        );
+        const countText = sub2FormatModelSyncCounts(plan.counts);
+        if (plan.blocked) {
+          this.modelError = `未更新：${countText}；没有可保存的目标模型，现有映射保持不变。`;
+          return;
+        }
+
+        if (plan.counts.removed > 0) {
+          const confirmed = window.confirm(
+            `${countText}。将移除 ${plan.counts.removed} 个系统维护的旧模型映射，`
+            + `保留 ${plan.counts.preserved} 个手动映射；确定继续吗？`,
+          );
+          if (!requestIsCurrent()) return;
+          if (!confirmed) {
+            this.modelMessage = `${countText}；已取消移除，现有映射保持不变。`;
+            return;
+          }
+        }
+
+        if (plan.changed) {
+          await sub2PersistAccountModelMapping(accountId, plan.modelMapping);
+          writeCompleted = true;
+          if (!requestIsCurrent()) return;
+        }
+
+        const [savedAccount, models] = await Promise.all([
+          sub2FetchAccount(accountId),
+          sub2FetchAccountModels(accountId),
+        ]);
+        if (!requestIsCurrent()) return;
+        const savedMappingState = sub2GetVisibleModelMappingState(savedAccount);
+        if (!savedMappingState.known
+          || !sub2ModelMappingsEqual(savedMappingState.modelMapping, plan.modelMapping)) {
+          throw new Error('回读的 model_mapping 与预期结果不一致。');
+        }
+
+        this.modelAccount = savedAccount;
+        this.accounts = this.accounts.map((account) => (
+          Number(account?.id) === accountId ? savedAccount : account
+        ));
         this.models = models;
-        this.savedModelsByAccountId.set(Number(account.id), { status: 'loaded', models });
-        this.modelMessage = `已从上游拉取并同步 ${models.length} 个模型。`;
+        this.savedModelsByAccountId.set(accountId, { status: 'loaded', models });
+        this.modelMessage = `${countText}；新增 ${plan.counts.added} 个，移除 ${plan.counts.removed} 个，`
+          + `保留手动 ${plan.counts.preserved} 个，手动冲突 ${plan.counts.conflicts} 个；`
+          + `${plan.changed ? '已保存并回读确认' : '当前映射已一致，无需写入'}。`;
       } catch (error) {
-        if (requestSequence !== this.modelRequestSequence || this.modelAccount?.id !== account.id) return;
-        this.modelError = `上游模型同步失败：${error?.message || error}`;
+        if (!requestIsCurrent()) return;
+        const prefix = writeCompleted
+          ? '模型映射已提交，但回读校验失败'
+          : upstreamFetched
+            ? '上游模型处理失败'
+            : '模型同步未执行';
+        this.modelError = `${prefix}：${error?.message || error}`;
       } finally {
-        if (requestSequence === this.modelRequestSequence && this.modelAccount?.id === account.id) {
+        if (requestIsCurrent()) {
           this.modelSyncing = false;
           this.renderModelDrawer();
         }
@@ -7195,6 +7656,17 @@
     sub2ResolveLatestHit,
     sub2BuildRoutingExplanation,
     sub2GetEffectivePriority,
+    sub2NormalizeModelPlatform,
+    sub2NormalizeFetchedModelIds,
+    sub2ClassifyModelForPlatform,
+    sub2FilterModelsForPlatform,
+    sub2GetVisibleModelMappingState,
+    sub2ModelMappingsEqual,
+    sub2ReconcileModelMapping,
+    sub2BuildModelSyncPlan,
+    sub2BuildModelMappingBulkUpdatePayload,
+    sub2FormatModelSyncCounts,
+    sub2ResolveModelSyncPlatform,
     sub2ModelPatternMatches,
     sub2NormalizeRequestedModelForLookup,
     sub2EvaluateModelSupport,

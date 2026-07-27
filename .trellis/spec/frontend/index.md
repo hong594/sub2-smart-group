@@ -23,6 +23,7 @@ This directory contains guidelines for frontend development. Fill in each file w
 | [Manual Balance Monitoring](./manual-balance-monitoring.md) | Userscript request, credential, response, and evidence contracts | Active |
 | [Account Editors and Audit](./account-editors-and-audit.md) | Exclusive account-editor state and canonical audit rendering contracts | Active |
 | [Routing Events and TTFT](./routing-events-and-ttft.md) | Exact route-scope transitions and read-only TTFT evidence contracts | Active |
+| [Model Policy and Synchronization](./model-policy-and-sync.md) | Strict group-platform evidence, shared model-family policy, and credential-safe mapping persistence | Active |
 
 ---
 

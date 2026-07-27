@@ -1,0 +1,2 @@
+{"file":".trellis/spec/frontend/index.md","reason":"Load the active frontend userscript contracts and related guideline pointers."}
+{"file":".trellis/spec/frontend/model-policy-and-sync.md","reason":"Follow the executable strict-platform, model-family, reconciliation, and persistence contract."}

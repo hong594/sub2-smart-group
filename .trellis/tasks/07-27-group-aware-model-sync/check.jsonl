@@ -1,0 +1,2 @@
+{"file":".trellis/spec/frontend/index.md","reason":"Check the change against all active userscript frontend contracts."}
+{"file":".trellis/spec/frontend/model-policy-and-sync.md","reason":"Verify every strict-platform, filtering, mapping ownership, confirmation, and persistence requirement."}
