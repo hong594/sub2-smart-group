@@ -2,7 +2,7 @@
 // @name         Sub2 Smart Group
 // @name:zh-CN   Sub2 智能分组
 // @namespace    local.sub2.smart-group
-// @version      2.4.0
+// @version      2.4.1
 // @description  Sub2 account health, route history, reliability events, protected controls, and manual model sync (no active probing).
 // @description:zh-CN 为 sub2api 提供账号健康度、路由历史、可靠性事件、受保护控制与手动模型同步（不主动测活）
 // @license      MIT
@@ -73,6 +73,8 @@
   const SUB2_DEFAULT_EVENT_RETENTION_DAYS = 7;
   const SUB2_LOCAL_EVENT_LIMIT = 500;
   const SUB2_RELIABILITY_REFRESH_MS = 60 * 1000;
+  // 最后一次滚动后多久才允许自动重建账号列表。
+  const SUB2_LIST_SCROLL_IDLE_MS = 1500;
   const SUB2_CAPACITY_MAX = 10000;
   const SUB2_AUDIT_SEVERITY_RANK = Object.freeze({ critical: 2, warning: 1, info: 0 });
   const SUB2_AUDIT_SEVERITY_LABELS = Object.freeze({ critical: '严重', warning: '注意', info: '提示' });
@@ -83,7 +85,7 @@
   const SUB2_CAPACITY_HIGH_LOAD_RATIO = 0.8;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '2.4.0';
+    : '2.4.1';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -2712,7 +2714,7 @@
       background:#2563eb;color:#fff;border:none;box-shadow:0 6px 18px rgba(37,99,235,.4);cursor:pointer;font-size:13px;font-weight:700;}
     #${SUB2_TOGGLE_ID}:hover{background:#1d4ed8;}
     #${SUB2_PANEL_ID}{position:fixed;right:18px;bottom:74px;z-index:2147483000;width:430px;max-width:calc(100vw - 36px);
-      height:clamp(680px,80vh,820px);max-height:calc(100vh - 110px);display:flex;flex-direction:column;background:#fff;color:#0f172a;border:1px solid #e2e8f0;
+      height:clamp(680px,88vh,1000px);max-height:calc(100vh - 96px);display:flex;flex-direction:column;background:#fff;color:#0f172a;border:1px solid #e2e8f0;
       border-radius:12px;box-shadow:0 12px 40px rgba(15,23,42,.22);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
       font-size:13px;overflow:hidden;isolation:isolate;}
     #${SUB2_PANEL_ID}.sub2-hidden{display:none;}
@@ -2763,7 +2765,17 @@
     #${SUB2_PANEL_ID} .sub2-refresh{height:30px;background:#2563eb;color:#fff;border:none;border-radius:8px;padding:0 12px;
       cursor:pointer;font-size:12px;font-weight:650;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-refresh:hover{background:#1d4ed8;}
-    #${SUB2_PANEL_ID} .sub2-list{flex:1 1 auto;min-height:0;overflow-y:auto;padding:6px 8px;display:flex;flex-direction:column;gap:6px;}
+    #${SUB2_PANEL_ID} .sub2-list-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;
+      padding:5px 12px;border-bottom:1px solid #f1f5f9;background:#fcfdff;}
+    #${SUB2_PANEL_ID} .sub2-list-count{color:#64748b;font-size:10px;}
+    #${SUB2_PANEL_ID} .sub2-list-count.filtered{color:#b45309;font-weight:700;}
+    #${SUB2_PANEL_ID} .sub2-clear-filters{border:1px solid #fdba74;border-radius:999px;padding:2px 9px;background:#fff7ed;
+      color:#c2410c;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-clear-filters:hover{background:#ffedd5;}
+    #${SUB2_PANEL_ID} .sub2-clear-filters[hidden]{display:none;}
+    #${SUB2_PANEL_ID} .sub2-empty-notice{padding:10px;}
+    #${SUB2_PANEL_ID} .sub2-list{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;
+      padding:6px 8px;display:flex;flex-direction:column;gap:6px;}
     #${SUB2_PANEL_ID} .sub2-list.sub2-flat-list{display:flex;flex-direction:column;}
     #${SUB2_PANEL_ID} .sub2-group{border:1px solid #cbd5e1;border-radius:9px;background:#f8fafc;overflow:hidden;}
     #${SUB2_PANEL_ID} .sub2-group-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;padding:8px 9px;
@@ -3044,6 +3056,11 @@
       this.refreshRequestSequence = 0;
       this.quotaSaving = false;
       this.capacitySaving = false;
+      this.listScrollHandler = null;
+      this.lastListScrollAt = 0;
+      // 保存用户真实滚动位置。重建期间浏览器会把 scrollTop 夹到临时内容高度内，
+      // 直接回读会逐次把位置拽回顶部，表现为“滚不到底、只能看到部分账号”。
+      this.preservedListScrollTop = 0;
       this.busyIds = new Set();
       this.filterText = '';
       this.viewMode = String(sub2StorageGet('viewMode', 'group')) === 'flat' ? 'flat' : 'group';
@@ -3104,6 +3121,7 @@
       // 避免无谓的每秒全量重建把滚动位置顶掉（会表现为面板每秒自己往下滚）。
       this.tickTimer = window.setInterval(() => {
         if (this.minimized || !this.accounts.length || this.isAccountInteractionActive()) return;
+        if (this.isListScrollActive()) return;
         const now = Date.now();
         const hasCountdown = this.accounts.some((account) => sub2ComputeHealth(account, now).coolingUntil > now);
         if (hasCountdown) this.renderList();
@@ -3175,6 +3193,10 @@
             </select>
           </div>
         </div>
+        <div class="sub2-list-meta">
+          <span class="sub2-list-count"></span>
+          <button type="button" class="sub2-clear-filters" hidden>清除筛选</button>
+        </div>
         <div class="sub2-list"></div>
         <div class="sub2-status">加载中…</div>
         <div class="sub2-model-overlay" hidden>
@@ -3236,6 +3258,8 @@
 
       this.summaryElement = this.root.querySelector('.sub2-summary');
       this.listElement = this.root.querySelector('.sub2-list');
+      this.listCountElement = this.root.querySelector('.sub2-list-count');
+      this.clearFiltersButtonElement = this.root.querySelector('.sub2-clear-filters');
       this.statusElement = this.root.querySelector('.sub2-status');
       this.searchElement = this.root.querySelector('.sub2-account-search');
       this.viewElement = this.root.querySelector('.sub2-view');
@@ -3260,6 +3284,15 @@
       this.auditOverlayElement = this.root.querySelector('.sub2-audit-overlay');
       this.auditBodyElement = this.root.querySelector('.sub2-audit-body');
 
+      // 重建列表时浏览器也会派发 scroll（清空 DOM 会把 scrollTop 归零），
+      // 那不是用户操作，不能覆盖已保存的位置、也不该延长滚动静默期。
+      this.listScrollHandler = () => {
+        if (this.isRebuildingList) return;
+        this.lastListScrollAt = Date.now();
+        this.preservedListScrollTop = this.listElement.scrollTop;
+      };
+      this.listElement.addEventListener('scroll', this.listScrollHandler, { passive: true });
+
       this.viewElement.value = this.viewMode;
       this.sortElement.value = this.sortMode;
       this.root.querySelector('.sub2-min').addEventListener('click', () => this.setMinimized(true));
@@ -3267,6 +3300,7 @@
       this.root.querySelector('.sub2-events-open')?.addEventListener('click', () => this.openEventsDrawer());
       this.root.querySelector('.sub2-diagnostics-open')?.addEventListener('click', () => this.openDiagnosticsDrawer());
       this.root.querySelector('.sub2-refresh').addEventListener('click', () => this.refresh());
+      this.clearFiltersButtonElement?.addEventListener('click', () => this.clearAllFilters());
       this.searchElement.addEventListener('input', () => {
         this.filterText = this.searchElement.value.trim().toLocaleLowerCase();
         this.renderList();
@@ -3332,6 +3366,13 @@
       });
 
       this.applyMinimized();
+    }
+
+    // 用户正在滚动账号列表时暂停自动重建。重建会清空并重新 append 全部行，
+    // 期间浏览器会把 scrollTop 夹到当时的内容高度内，夹小后的值又被下一次重建
+    // 当成“保存值”读走，表现为怎么滚都到不了列表底部。
+    isListScrollActive() {
+      return Date.now() - this.lastListScrollAt < SUB2_LIST_SCROLL_IDLE_MS;
     }
 
     hasOpenQuotaEditor() {
@@ -3586,8 +3627,9 @@
     renderList() {
       if (!this.listElement) return;
       this.listElement.classList.toggle('sub2-flat-list', this.viewMode === 'flat');
-      // 记录当前滚动位置，重建 DOM 后恢复，避免列表跳动。
-      const savedScrollTop = this.listElement.scrollTop;
+      // 重建会清空 DOM，浏览器随即把 scrollTop 夹到新内容高度内。直接读当前
+      // scrollTop 会拿到被夹小的值，所以优先使用滚动事件里记录的真实位置。
+      const targetScrollTop = Math.max(this.preservedListScrollTop, this.listElement.scrollTop);
       const now = Date.now();
       const filters = {
         groupFilter: this.groupFilter,
@@ -3601,37 +3643,91 @@
         filters,
         now,
       ));
+      this.renderListCount(visibleAccounts.length);
 
-      if (this.viewMode === 'group') {
-        let sections = sub2BuildGroupedSections(visibleAccounts, this.statsById, this.sortMode, '', now, this.groupsById);
-        // 指定具体分组时，只保留该分节（账号可能同时属于多个分组）。
-        if (this.groupFilter === 'ungrouped') {
-          sections = sections.filter((section) => section.ungrouped);
-        } else if (this.groupFilter) {
-          sections = sections.filter((section) => section.groupKey === this.groupFilter);
-        }
-        if (!sections.length) {
-          this.listElement.innerHTML = '<div class="sub2-reasons" style="padding:10px;">没有匹配的账号或分组。</div>';
+      // 重建期间产生的 scroll 事件不代表用户操作，不能覆盖已保存的位置。
+      this.isRebuildingList = true;
+      try {
+        this.listElement.textContent = '';
+
+        if (this.viewMode === 'group') {
+          let sections = sub2BuildGroupedSections(visibleAccounts, this.statsById, this.sortMode, '', now, this.groupsById);
+          // 指定具体分组时，只保留该分节（账号可能同时属于多个分组）。
+          if (this.groupFilter === 'ungrouped') {
+            sections = sections.filter((section) => section.ungrouped);
+          } else if (this.groupFilter) {
+            sections = sections.filter((section) => section.groupKey === this.groupFilter);
+          }
+          if (!sections.length) {
+            this.listElement.appendChild(this.buildEmptyListNotice('没有匹配的账号或分组。'));
+            return;
+          }
+          for (const section of sections) {
+            this.listElement.appendChild(this.buildGroupSection(section, now));
+          }
+          this.restoreListScrollTop(targetScrollTop);
           return;
         }
-        this.listElement.textContent = '';
-        for (const section of sections) {
-          this.listElement.appendChild(this.buildGroupSection(section, now));
-        }
-        this.listElement.scrollTop = savedScrollTop;
-        return;
-      }
 
-      const rows = sub2SortAccounts(visibleAccounts, this.statsById, this.sortMode, now);
-      if (!rows.length) {
-        this.listElement.innerHTML = '<div class="sub2-reasons" style="padding:10px;">没有匹配的账号。</div>';
-        return;
+        const rows = sub2SortAccounts(visibleAccounts, this.statsById, this.sortMode, now);
+        if (!rows.length) {
+          this.listElement.appendChild(this.buildEmptyListNotice('没有匹配的账号。'));
+          return;
+        }
+        for (const account of rows) {
+          this.listElement.appendChild(this.buildRow(account, now));
+        }
+        this.restoreListScrollTop(targetScrollTop);
+      } finally {
+        this.isRebuildingList = false;
       }
-      this.listElement.textContent = '';
-      for (const account of rows) {
-        this.listElement.appendChild(this.buildRow(account, now));
+    }
+
+    buildEmptyListNotice(message) {
+      const notice = document.createElement('div');
+      notice.className = 'sub2-reasons sub2-empty-notice';
+      notice.textContent = message;
+      this.preservedListScrollTop = 0;
+      return notice;
+    }
+
+    // 只在目标位置仍然可达时恢复，避免把列表顶到一个越界值。
+    restoreListScrollTop(targetScrollTop) {
+      const maxScrollTop = Math.max(0, this.listElement.scrollHeight - this.listElement.clientHeight);
+      const appliedScrollTop = Math.min(targetScrollTop, maxScrollTop);
+      this.listElement.scrollTop = appliedScrollTop;
+      this.preservedListScrollTop = appliedScrollTop;
+    }
+
+    renderListCount(visibleCount) {
+      if (!this.listCountElement) return;
+      const totalCount = this.accounts.length;
+      const hasActiveFilter = Boolean(
+        this.groupFilter || this.platformFilter || this.healthFilter || this.filterText,
+      );
+      this.listCountElement.textContent = hasActiveFilter
+        ? `显示 ${visibleCount} / 共 ${totalCount}`
+        : `共 ${totalCount} 个账号`;
+      this.listCountElement.classList.toggle('filtered', hasActiveFilter);
+      if (this.clearFiltersButtonElement) {
+        this.clearFiltersButtonElement.hidden = !hasActiveFilter;
       }
-      this.listElement.scrollTop = savedScrollTop;
+    }
+
+    clearAllFilters() {
+      this.groupFilter = '';
+      this.platformFilter = '';
+      this.healthFilter = '';
+      this.filterText = '';
+      sub2StorageSet('groupFilter', this.groupFilter);
+      sub2StorageSet('platformFilter', this.platformFilter);
+      sub2StorageSet('healthFilter', this.healthFilter);
+      if (this.searchElement) this.searchElement.value = '';
+      if (this.platformFilterEl) this.platformFilterEl.value = 'all';
+      if (this.healthFilterEl) this.healthFilterEl.value = 'all';
+      this.preservedListScrollTop = 0;
+      this.renderFilters();
+      this.renderList();
     }
 
     buildGroupSection(section, now) {
