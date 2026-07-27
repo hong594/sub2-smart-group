@@ -22,6 +22,7 @@ This directory contains guidelines for frontend development. Fill in each file w
 | [Type Safety](./type-safety.md) | Type patterns, validation | To fill |
 | [Manual Balance Monitoring](./manual-balance-monitoring.md) | Userscript request, credential, response, and evidence contracts | Active |
 | [Account Editors and Audit](./account-editors-and-audit.md) | Exclusive account-editor state and canonical audit rendering contracts | Active |
+| [Routing Events and TTFT](./routing-events-and-ttft.md) | Exact route-scope transitions and read-only TTFT evidence contracts | Active |
 
 ---
 

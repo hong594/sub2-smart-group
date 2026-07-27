@@ -60,6 +60,7 @@
   //   GET  /api/v1/admin/ops/requests                  最近真实请求
   //   GET  /api/v1/admin/ops/upstream-errors           真实上游故障摘要
   //   GET  /api/v1/admin/ops/upstream-errors/:id       故障转移事件详情
+  //   GET  /api/v1/admin/usage                         流式请求首字耗时样本
   // sub2 后台手动操作（不读取或提交账号 credentials 里的 API Key）：
   //   POST /api/v1/admin/accounts/:id/schedulable      摘出 / 挂回调度池
   //   POST /api/v1/admin/accounts/:id/recover-state    清除冷却 / 恢复
@@ -98,6 +99,9 @@
   const SUB2_ROUTING_LOOKBACK_MS = 30 * 60 * 1000;
   const SUB2_REQUEST_HISTORY_LIMIT = 30;
   const SUB2_RELIABILITY_HISTORY_LIMIT = 1000;
+  const SUB2_TTFT_HISTORY_LIMIT = 1000;
+  const SUB2_TTFT_REFRESH_MS = 60 * 1000;
+  const SUB2_OBSERVATION_SCOPE_LIMIT = 100;
   const SUB2_EVENT_RETENTION_OPTIONS = Object.freeze([1, 7, 30]);
   const SUB2_DEFAULT_EVENT_RETENTION_DAYS = 7;
   const SUB2_LOCAL_EVENT_LIMIT = 500;
@@ -954,6 +958,9 @@
       const numericGroupId = Number(requestItem?.group_id);
       const rawDurationMs = requestItem?.duration_ms;
       const numericDurationMs = Number(rawDurationMs);
+      const firstTokenMs = requestItem?.stream === false
+        ? null
+        : sub2NormalizeTTFTValue(requestItem?.first_token_ms);
       const numericStatusCode = Number(requestItem?.status_code);
       const numericErrorId = Number(requestItem?.error_id);
       const requestId = String(requestItem?.request_id || '').trim();
@@ -966,11 +973,12 @@
           && numericDurationMs >= 0
           ? numericDurationMs
           : null,
+        firstTokenMs,
         errorId: Number.isInteger(numericErrorId) && numericErrorId > 0 ? numericErrorId : null,
         groupId: Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null,
         kind,
         message: String(requestItem?.message || '').trim(),
-        model: String(requestItem?.model || '').trim(),
+        model: String(requestItem?.requested_model || requestItem?.model || '').trim(),
         phase: String(requestItem?.phase || '').trim(),
         platform: String(requestItem?.platform || '').trim(),
         requestId,
@@ -1012,6 +1020,218 @@
     return sub2NormalizeRequestHistory(payload).find(
       (requestItem) => requestItem.kind === 'success' && requestItem.accountId,
     ) || null;
+  }
+
+  function sub2NormalizeTTFTValue(rawValue) {
+    if (rawValue === null || rawValue === undefined || rawValue === '') return null;
+    if (typeof rawValue !== 'number' && typeof rawValue !== 'string') return null;
+    if (typeof rawValue === 'string' && !rawValue.trim()) return null;
+    const numericValue = Number(rawValue);
+    return Number.isFinite(numericValue) && numericValue >= 0 ? numericValue : null;
+  }
+
+  function sub2NormalizeTTFTUsageRow(rawRow) {
+    if (!rawRow || typeof rawRow !== 'object') return null;
+    const createdAt = Date.parse(rawRow.created_at);
+    if (!Number.isFinite(createdAt)) return null;
+    const numericAccountId = Number(rawRow.account_id);
+    const numericGroupId = Number(rawRow.group_id);
+    const stream = rawRow.stream === true;
+    return {
+      accountId: Number.isInteger(numericAccountId) && numericAccountId > 0 ? numericAccountId : null,
+      createdAt,
+      durationMs: sub2NormalizeTTFTValue(rawRow.duration_ms),
+      firstTokenMs: stream ? sub2NormalizeTTFTValue(rawRow.first_token_ms) : null,
+      groupId: Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null,
+      model: String(rawRow.requested_model || rawRow.model || '').trim(),
+      requestId: String(rawRow.request_id || '').trim(),
+      stream,
+    };
+  }
+
+  function sub2NearestRankPercentile(sortedValues, percentile) {
+    const values = (Array.isArray(sortedValues) ? sortedValues : [])
+      .map((value) => sub2NormalizeTTFTValue(value))
+      .filter((value) => value !== null)
+      .sort((leftValue, rightValue) => leftValue - rightValue);
+    if (!values.length) return null;
+    const normalizedPercentile = Math.min(1, Math.max(0, Number(percentile)));
+    if (!Number.isFinite(normalizedPercentile)) return null;
+    const index = Math.max(0, Math.ceil(normalizedPercentile * values.length) - 1);
+    return values[index];
+  }
+
+  function sub2BuildTTFTSnapshot(payload, now = Date.now(), fetchedAt = now) {
+    const sourceRows = sub2GetPaginatedItems(payload);
+    const rawRows = sourceRows.slice(0, SUB2_TTFT_HISTORY_LIMIT);
+    const windowStartAt = now - SUB2_DAY_MS;
+    const normalizedRows = rawRows
+      .map((rawRow) => sub2NormalizeTTFTUsageRow(rawRow))
+      .filter((row) => row && row.createdAt >= windowStartAt && row.createdAt <= now)
+      .sort((leftRow, rightRow) => rightRow.createdAt - leftRow.createdAt);
+    const requestTTFTById = new Map();
+    const seenRequestIds = new Set();
+    const accountSamples = new Map();
+    let sampleCount = 0;
+
+    for (const row of normalizedRows) {
+      if (row.requestId) {
+        if (seenRequestIds.has(row.requestId)) continue;
+        seenRequestIds.add(row.requestId);
+        requestTTFTById.set(row.requestId, row);
+      }
+      if (row.firstTokenMs === null || !row.accountId) continue;
+      if (!accountSamples.has(row.accountId)) accountSamples.set(row.accountId, []);
+      accountSamples.get(row.accountId).push(row);
+      sampleCount += 1;
+    }
+
+    const accountStats = {};
+    for (const [accountId, rows] of accountSamples) {
+      const sortedValues = rows.map((row) => row.firstTokenMs).sort((leftValue, rightValue) => leftValue - rightValue);
+      accountStats[accountId] = {
+        accountId,
+        count: rows.length,
+        latestAt: rows[0].createdAt,
+        latestFirstTokenMs: rows[0].firstTokenMs,
+        p50: sub2NearestRankPercentile(sortedValues, 0.5),
+        p90: sub2NearestRankPercentile(sortedValues, 0.9),
+      };
+    }
+
+    const rawTotal = payload?.total;
+    const numericTotal = (typeof rawTotal === 'number' || (typeof rawTotal === 'string' && rawTotal.trim()))
+      ? Number(rawTotal)
+      : null;
+    const totalIsKnown = Number.isFinite(numericTotal) && numericTotal >= 0;
+    const coverageComplete = totalIsKnown
+      ? numericTotal <= rawRows.length
+      : payload?.has_more !== true
+        && sourceRows.length < SUB2_TTFT_HISTORY_LIMIT;
+    const numericFetchedAt = Number(fetchedAt);
+    return {
+      available: true,
+      accountStats,
+      coverage: coverageComplete ? 'complete' : 'capped',
+      coverageComplete,
+      fetchedAt: Number.isFinite(numericFetchedAt) && numericFetchedAt > 0 ? numericFetchedAt : now,
+      generatedAt: now,
+      recordCount: normalizedRows.length,
+      requestTTFTById,
+      rowCount: rawRows.length,
+      sampleCount,
+      windowEndAt: now,
+      windowStartAt,
+    };
+  }
+
+  function sub2EnrichRequestHistoryWithTTFT(requestHistory, ttftSnapshot) {
+    const requestIndex = ttftSnapshot?.requestTTFTById instanceof Map
+      ? ttftSnapshot.requestTTFTById
+      : new Map();
+    return (Array.isArray(requestHistory) ? requestHistory : []).map((requestItem) => {
+      const directFirstTokenMs = requestItem?.ttftSource === 'usage'
+        ? null
+        : sub2NormalizeTTFTValue(requestItem?.firstTokenMs);
+      const requestId = String(requestItem?.requestId || '').trim();
+      const indexedFirstTokenMs = requestId
+        ? sub2NormalizeTTFTValue(requestIndex.get(requestId)?.firstTokenMs)
+        : null;
+      const firstTokenMs = directFirstTokenMs ?? indexedFirstTokenMs;
+      return {
+        ...requestItem,
+        firstTokenMs,
+        ttftSource: directFirstTokenMs !== null ? 'ops' : indexedFirstTokenMs !== null ? 'usage' : '',
+      };
+    });
+  }
+
+  function sub2BuildTTFTSnapshotEvidence(ttftSnapshot, state = {}, now = Date.now()) {
+    const snapshotAvailable = ttftSnapshot?.available === true;
+    const loading = state?.loading === true;
+    const error = String(state?.error || '').trim();
+    if (!snapshotAvailable) {
+      return {
+        available: false,
+        coverageComplete: false,
+        coverageLabel: '证据不可用',
+        freshnessLabel: loading ? '读取中' : error ? '读取失败' : '尚未读取',
+        stale: Boolean(error),
+        title: error || (loading ? '正在读取滚动 24 小时首字耗时样本。' : '尚未读取滚动 24 小时首字耗时样本。'),
+      };
+    }
+
+    const fetchedAt = Number(ttftSnapshot.fetchedAt);
+    const windowStartAt = Number(ttftSnapshot.windowStartAt);
+    const windowEndAt = Number(ttftSnapshot.windowEndAt);
+    const fetchedAtIsValid = Number.isFinite(fetchedAt) && fetchedAt > 0;
+    const staleByAge = !fetchedAtIsValid || now < fetchedAt || now - fetchedAt > SUB2_TTFT_REFRESH_MS;
+    const stale = Boolean(error) || staleByAge;
+    const coverageComplete = ttftSnapshot.coverageComplete === true;
+    const coverageLabel = coverageComplete
+      ? '分页覆盖完整'
+      : `最多读取最新 ${SUB2_TTFT_HISTORY_LIMIT} 条流式记录，仅代表已读取样本`;
+    const formatTimestamp = (timestamp) => Number.isFinite(timestamp) && timestamp > 0
+      ? new Date(timestamp).toLocaleString('zh-CN', { hour12: false })
+      : '时间未知';
+    const titleParts = [
+      `滚动窗口 ${formatTimestamp(windowStartAt)} 至 ${formatTimestamp(windowEndAt)}`,
+      coverageLabel,
+      fetchedAtIsValid ? `读取于 ${formatTimestamp(fetchedAt)}` : '读取时间未知',
+      stale ? '当前为陈旧证据' : '当前证据新鲜',
+    ];
+    if (error) titleParts.push(error);
+    return {
+      available: true,
+      coverageComplete,
+      coverageLabel,
+      freshnessLabel: stale ? '陈旧证据' : '新鲜证据',
+      stale,
+      title: `${titleParts.join('；')}。`,
+    };
+  }
+
+  function sub2BuildAccountTTFTEvidence(accountId, ttftSnapshot, state = {}, now = Date.now()) {
+    const snapshotEvidence = sub2BuildTTFTSnapshotEvidence(ttftSnapshot, state, now);
+    if (!snapshotEvidence.available) {
+      return {
+        ...snapshotEvidence,
+        text: state?.loading === true ? '首字样本读取中' : '首字证据不可用',
+        tone: 'muted',
+      };
+    }
+
+    const numericAccountId = Number(accountId);
+    const accountStats = Number.isInteger(numericAccountId) && numericAccountId > 0
+      ? ttftSnapshot.accountStats?.[numericAccountId] || null
+      : null;
+    const coverageShortLabel = snapshotEvidence.coverageComplete ? '完整覆盖' : '最新样本';
+    if (!accountStats || !Number.isInteger(accountStats.count) || accountStats.count <= 0) {
+      return {
+        ...snapshotEvidence,
+        accountStats: null,
+        text: `首字暂无样本 · ${coverageShortLabel}`,
+        tone: snapshotEvidence.stale ? 'stale' : 'muted',
+      };
+    }
+
+    const latestAt = Number(accountStats.latestAt);
+    const latestLabel = Number.isFinite(latestAt) && latestAt > 0
+      ? `；账号最新样本 ${new Date(latestAt).toLocaleString('zh-CN', { hour12: false })}`
+      : '';
+    return {
+      ...snapshotEvidence,
+      accountStats,
+      text: [
+        `首字 P90 ${sub2FormatDuration(accountStats.p90)}`,
+        `P50 ${sub2FormatDuration(accountStats.p50)}`,
+        `最新 ${sub2FormatDuration(accountStats.latestFirstTokenMs)}`,
+        `${accountStats.count} 个样本`,
+        coverageShortLabel,
+      ].join(' · '),
+      title: `${snapshotEvidence.title}${latestLabel}`,
+      tone: snapshotEvidence.stale ? 'stale' : '',
+    };
   }
 
   function sub2ParseCapacityInput(rawCapacity, maximumCapacity = SUB2_CAPACITY_MAX) {
@@ -1147,18 +1367,23 @@
     const eventId = String(rawEvent.id || '').trim();
     const occurredAt = Number(rawEvent.occurredAt);
     if (!eventId || !Number.isFinite(occurredAt) || occurredAt <= 0) return null;
+    const type = String(rawEvent.type || 'unknown').trim() || 'unknown';
+    const routeScope = type === 'hit-change' ? sub2NormalizeRouteScope(rawEvent) : null;
+    if (type === 'hit-change' && !routeScope.complete) return null;
     const numericAccountId = Number(rawEvent.accountId);
     const numericGroupId = Number(rawEvent.groupId);
     const numericStatusCode = Number(rawEvent.statusCode);
     return {
       id: eventId,
-      type: String(rawEvent.type || 'unknown').trim() || 'unknown',
+      type,
       tone: String(rawEvent.tone || 'info').trim() || 'info',
       occurredAt,
       accountId: Number.isInteger(numericAccountId) && numericAccountId > 0 ? numericAccountId : null,
       accountName: String(rawEvent.accountName || '').trim(),
-      groupId: Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null,
-      model: String(rawEvent.model || '').trim(),
+      groupId: routeScope?.groupId
+        ?? (Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null),
+      model: routeScope?.model ?? String(rawEvent.model || '').trim(),
+      platform: routeScope?.platform ?? String(rawEvent.platform || '').trim().toLowerCase(),
       requestId: String(rawEvent.requestId || '').trim(),
       statusCode: Number.isInteger(numericStatusCode) ? numericStatusCode : null,
       title: String(rawEvent.title || '').trim(),
@@ -1261,6 +1486,63 @@
     return statusEvents;
   }
 
+  function sub2NormalizeRouteScope(requestItem) {
+    const numericGroupId = Number(requestItem?.groupId ?? requestItem?.group_id);
+    const groupId = Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null;
+    const platform = String(requestItem?.platform || '').trim().toLowerCase();
+    const rawModel = requestItem?.requestedModel ?? requestItem?.requested_model ?? requestItem?.model;
+    const model = sub2NormalizeRequestedModelForLookup(platform, rawModel).trim().toLowerCase();
+    const complete = Boolean(groupId && platform && model);
+    return {
+      complete,
+      groupId,
+      key: complete ? JSON.stringify([groupId, platform, model]) : '',
+      model,
+      platform,
+    };
+  }
+
+  function sub2RouteScopesEqual(leftScope, rightScope) {
+    const normalizedLeftScope = sub2NormalizeRouteScope(leftScope);
+    const normalizedRightScope = sub2NormalizeRouteScope(rightScope);
+    return normalizedLeftScope.complete
+      && normalizedRightScope.complete
+      && normalizedLeftScope.key === normalizedRightScope.key;
+  }
+
+  function sub2NormalizeHitObservation(rawHit) {
+    if (!rawHit || typeof rawHit !== 'object') return null;
+    const numericAccountId = Number(rawHit.accountId ?? rawHit.account_id);
+    const scope = sub2NormalizeRouteScope(rawHit.scope && typeof rawHit.scope === 'object'
+      ? rawHit.scope
+      : rawHit);
+    return {
+      accountId: Number.isInteger(numericAccountId) && numericAccountId > 0 ? numericAccountId : null,
+      createdAt: Number(rawHit.createdAt ?? rawHit.created_at) || 0,
+      requestKey: String(rawHit.requestKey ?? rawHit.requestId ?? rawHit.request_id ?? '').trim(),
+      scope,
+    };
+  }
+
+  function sub2PruneLastHitsByScope(rawHits) {
+    const normalizedHits = [];
+    const values = Array.isArray(rawHits)
+      ? rawHits
+      : rawHits && typeof rawHits === 'object' ? Object.values(rawHits) : [];
+    for (const rawHit of values) {
+      const normalizedHit = sub2NormalizeHitObservation(rawHit);
+      if (!normalizedHit?.accountId || !normalizedHit.requestKey || !normalizedHit.scope.complete) continue;
+      normalizedHits.push(normalizedHit);
+    }
+    normalizedHits.sort((leftHit, rightHit) => rightHit.createdAt - leftHit.createdAt);
+    const hitsByScope = {};
+    for (const normalizedHit of normalizedHits) {
+      if (Object.keys(hitsByScope).length >= SUB2_OBSERVATION_SCOPE_LIMIT) break;
+      if (!hitsByScope[normalizedHit.scope.key]) hitsByScope[normalizedHit.scope.key] = normalizedHit;
+    }
+    return hitsByScope;
+  }
+
   function sub2NormalizeObservationSnapshot(rawSnapshot) {
     if (!rawSnapshot || typeof rawSnapshot !== 'object') return null;
     const capturedAt = Number(rawSnapshot.capturedAt);
@@ -1279,23 +1561,23 @@
         coolingKind: String(rawAccountState?.coolingKind || '').trim(),
       };
     }
-    const latestHitAccountId = Number(rawSnapshot.latestHit?.accountId);
+    const latestHit = sub2NormalizeHitObservation(rawSnapshot.latestHit);
+    const lastHitsByScope = sub2PruneLastHitsByScope(rawSnapshot.lastHitsByScope);
+    if (latestHit?.accountId && latestHit.requestKey && latestHit.scope.complete) {
+      const existingHit = lastHitsByScope[latestHit.scope.key];
+      if (!existingHit || latestHit.createdAt >= existingHit.createdAt) {
+        lastHitsByScope[latestHit.scope.key] = latestHit;
+      }
+    }
     return {
       capturedAt: Number.isFinite(capturedAt) && capturedAt > 0 ? capturedAt : 0,
       accounts: normalizedAccounts,
-      latestHit: rawSnapshot.latestHit && typeof rawSnapshot.latestHit === 'object'
-        ? {
-          accountId: Number.isInteger(latestHitAccountId) && latestHitAccountId > 0
-            ? latestHitAccountId
-            : null,
-          requestKey: String(rawSnapshot.latestHit.requestKey || '').trim(),
-          createdAt: Number(rawSnapshot.latestHit.createdAt) || 0,
-        }
-        : null,
+      lastHitsByScope: sub2PruneLastHitsByScope(lastHitsByScope),
+      latestHit,
     };
   }
 
-  function sub2BuildObservationSnapshot(accounts, recentRequest, now = Date.now()) {
+  function sub2BuildObservationSnapshot(accounts, recentRequest, now = Date.now(), previousSnapshot = null) {
     const accountStates = {};
     for (const account of Array.isArray(accounts) ? accounts : []) {
       const accountId = Number(account?.id);
@@ -1313,16 +1595,30 @@
         coolingKind: coolingCandidates[0]?.kind || '',
       };
     }
+    const previousState = sub2NormalizeObservationSnapshot(previousSnapshot);
+    const observedHit = recentRequest?.accountId
+      ? sub2NormalizeHitObservation({
+        accountId: recentRequest.accountId,
+        createdAt: Number(recentRequest.createdAt) || now,
+        requestKey: sub2GetRequestHistoryKey(recentRequest),
+        scope: sub2NormalizeRouteScope(recentRequest),
+      })
+      : null;
+    const latestHit = observedHit || previousState?.latestHit || null;
+    const lastHitsByScope = {
+      ...(previousState?.lastHitsByScope || {}),
+    };
+    if (observedHit?.accountId && observedHit.requestKey && observedHit.scope.complete) {
+      const previousScopeHit = lastHitsByScope[observedHit.scope.key];
+      if (!previousScopeHit || observedHit.createdAt >= previousScopeHit.createdAt) {
+        lastHitsByScope[observedHit.scope.key] = observedHit;
+      }
+    }
     return {
       capturedAt: now,
       accounts: accountStates,
-      latestHit: recentRequest?.accountId
-        ? {
-          accountId: Number(recentRequest.accountId),
-          requestKey: sub2GetRequestHistoryKey(recentRequest),
-          createdAt: Number(recentRequest.createdAt) || now,
-        }
-        : null,
+      lastHitsByScope: sub2PruneLastHitsByScope(lastHitsByScope),
+      latestHit,
     };
   }
 
@@ -1368,21 +1664,34 @@
       }
     }
 
-    const previousHit = previousState.latestHit;
     const currentHit = currentState.latestHit;
+    const currentScope = currentHit?.scope;
+    const previousHit = currentScope?.complete
+      ? previousState.lastHitsByScope[currentScope.key] || null
+      : null;
+    const currentScopeHit = currentScope?.complete
+      ? currentState.lastHitsByScope[currentScope.key] || null
+      : null;
     const hitAccountChanged = previousHit?.accountId && currentHit?.accountId
       && previousHit.accountId !== currentHit.accountId
-      && previousHit.requestKey !== currentHit.requestKey;
+      && previousHit.requestKey !== currentHit.requestKey
+      && currentHit.createdAt >= previousHit.createdAt
+      && currentScopeHit?.requestKey === currentHit.requestKey
+      && currentScopeHit.createdAt === currentHit.createdAt
+      && sub2RouteScopesEqual(previousHit.scope, currentScope);
     if (hitAccountChanged) {
       const previousAccountName = previousState.accounts[previousHit.accountId]?.accountName || `账号 ${previousHit.accountId}`;
       const currentAccountName = currentState.accounts[currentHit.accountId]?.accountName || `账号 ${currentHit.accountId}`;
       transitionEvents.push({
-        id: `hit-change:${currentHit.requestKey}:${previousHit.accountId}:${currentHit.accountId}`,
+        id: `hit-change:${encodeURIComponent(currentScope.key)}:${currentHit.requestKey}:${previousHit.accountId}:${currentHit.accountId}`,
         type: 'hit-change',
         tone: 'info',
         occurredAt: currentHit.createdAt || now,
         accountId: currentHit.accountId,
         accountName: currentAccountName,
+        groupId: currentScope.groupId,
+        model: currentScope.model,
+        platform: currentScope.platform,
         requestId: currentHit.requestKey,
         title: '最近命中账号变化',
         detail: `${previousAccountName} -> ${currentAccountName}`,
@@ -3200,6 +3509,44 @@
     );
   }
 
+  function sub2FormatLocalDate(timestamp) {
+    const date = new Date(timestamp);
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  function sub2BuildTTFTUsagePath(now = Date.now(), timezone = '') {
+    const endDate = new Date(now);
+    const startDate = new Date(now);
+    startDate.setDate(startDate.getDate() - 1);
+    const resolvedTimezone = String(timezone || '').trim()
+      || Intl.DateTimeFormat().resolvedOptions().timeZone
+      || 'UTC';
+    const query = new URLSearchParams({
+      end_date: sub2FormatLocalDate(endDate.getTime()),
+      page: '1',
+      page_size: String(SUB2_TTFT_HISTORY_LIMIT),
+      sort_by: 'created_at',
+      sort_order: 'desc',
+      start_date: sub2FormatLocalDate(startDate.getTime()),
+      stream: 'true',
+      timezone: resolvedTimezone,
+    });
+    return `/admin/usage?${query.toString()}`;
+  }
+
+  async function sub2FetchTTFTActivity(now = Date.now()) {
+    const payload = await sub2ApiRequestWithTimeout(
+      'GET',
+      sub2BuildTTFTUsagePath(now),
+      undefined,
+      8000,
+    );
+    return sub2BuildTTFTSnapshot(payload, now, Date.now());
+  }
+
   async function sub2FetchRouteReplay(requestItem) {
     const requestId = String(requestItem?.requestId || '').trim();
     if (!requestId) {
@@ -3393,6 +3740,10 @@
     #${SUB2_PANEL_ID} .sub2-balance-summary.warn{border-color:#fde68a;background:#fffbeb;color:#92400e;}
     #${SUB2_PANEL_ID} .sub2-balance-summary.low,#${SUB2_PANEL_ID} .sub2-balance-summary.error{
       border-color:#fecaca;background:#fef2f2;color:#b91c1c;}
+    #${SUB2_PANEL_ID} .sub2-ttft-summary{min-height:18px;padding:3px 7px;border:1px solid #bae6fd;border-radius:7px;
+      box-sizing:border-box;background:#f0f9ff;color:#075985;font-size:10px;font-weight:700;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:help;}
+    #${SUB2_PANEL_ID} .sub2-ttft-summary.muted{border-color:#e2e8f0;background:#f8fafc;color:#64748b;}
+    #${SUB2_PANEL_ID} .sub2-ttft-summary.stale{border-color:#fde68a;background:#fffbeb;color:#92400e;}
     #${SUB2_PANEL_ID} .sub2-quota-summary{font-weight:600;color:#0369a1;}
     #${SUB2_PANEL_ID} .sub2-quota-summary.warn{color:#b45309;}
     #${SUB2_PANEL_ID} .sub2-quota-summary.down{color:#b91c1c;}
@@ -3717,6 +4068,11 @@
       this.reliabilityError = '';
       this.reliabilityRequestSequence = 0;
       this.lastReliabilityRefreshAt = 0;
+      this.ttftSnapshot = null;
+      this.ttftLoading = false;
+      this.ttftError = '';
+      this.ttftRequestSequence = 0;
+      this.lastTTFTRefreshAt = 0;
     }
 
     start() {
@@ -4287,8 +4643,16 @@
       this.routingRequestsAvailable = routingActivity.requestsAvailable;
       this.routingErrorsAvailable = routingActivity.errorsAvailable;
       this.routingErrorsComplete = routingActivity.errorsComplete;
-      this.recentRequest = routingActivity.requestsAvailable ? routingActivity.recentRequest : null;
-      this.requestHistory = routingActivity.requestsAvailable ? routingActivity.requestHistory : [];
+      const rawRequestHistory = routingActivity.requestsAvailable ? routingActivity.requestHistory : [];
+      this.requestHistory = sub2EnrichRequestHistoryWithTTFT(rawRequestHistory, this.ttftSnapshot);
+      const recentRequestKey = routingActivity.recentRequest
+        ? sub2GetRequestHistoryKey(routingActivity.recentRequest)
+        : '';
+      this.recentRequest = recentRequestKey
+        ? this.requestHistory.find(
+          (requestItem) => sub2GetRequestHistoryKey(requestItem) === recentRequestKey,
+        ) || routingActivity.recentRequest
+        : null;
       if (
         this.selectedDiagnosticsRequestKey
         && !this.requestHistory.some(
@@ -4328,6 +4692,13 @@
         if (Date.now() - this.lastReliabilityRefreshAt >= SUB2_RELIABILITY_REFRESH_MS) {
           this.refreshReliabilityActivity();
         }
+      }
+      if (
+        !this.minimized
+        && document.visibilityState !== 'hidden'
+        && Date.now() - this.lastTTFTRefreshAt >= SUB2_TTFT_REFRESH_MS
+      ) {
+        this.refreshTTFTActivity();
       }
     }
 
@@ -4646,6 +5017,21 @@
       summaryElement.dataset.accountId = String(accountId);
       summaryElement.textContent = balanceSnapshot.text;
       summaryElement.title = balanceSnapshot.title;
+      return summaryElement;
+    }
+
+    buildTTFTSummaryElement(account, now) {
+      const ttftEvidence = sub2BuildAccountTTFTEvidence(
+        account?.id,
+        this.ttftSnapshot,
+        { error: this.ttftError, loading: this.ttftLoading },
+        now,
+      );
+      const summaryElement = document.createElement('div');
+      summaryElement.className = `sub2-ttft-summary${ttftEvidence.tone ? ` ${ttftEvidence.tone}` : ''}`;
+      summaryElement.dataset.accountId = String(Number(account?.id));
+      summaryElement.textContent = ttftEvidence.text;
+      summaryElement.title = ttftEvidence.title;
       return summaryElement;
     }
 
@@ -5041,6 +5427,7 @@
       meta.append(todayUsage, lastUsed);
 
       const balanceSummary = this.buildBalanceSummaryElement(account, stats, now);
+      const ttftSummary = this.buildTTFTSummaryElement(account, now);
 
       const displayConcurrency = sub2ResolveAccountConcurrency(
         account.id,
@@ -5360,7 +5747,7 @@
         actions.appendChild(recoverBtn);
       }
 
-      row.append(top, meta, balanceSummary, reasons);
+      row.append(top, meta, balanceSummary, ttftSummary, reasons);
       if (routingNote) row.appendChild(routingNote);
       row.appendChild(actions);
       row.appendChild(balanceControls.editor);
@@ -5375,10 +5762,8 @@
         this.accounts,
         routingActivity?.requestsAvailable ? routingActivity.recentRequest : null,
         now,
+        this.eventObservationSnapshot,
       );
-      if (!routingActivity?.requestsAvailable && this.eventObservationSnapshot?.latestHit) {
-        currentObservationSnapshot.latestHit = this.eventObservationSnapshot.latestHit;
-      }
       const transitionEvents = sub2BuildObservationTransitionEvents(
         this.eventObservationSnapshot,
         currentObservationSnapshot,
@@ -5431,6 +5816,39 @@
         if (requestSequence === this.reliabilityRequestSequence) {
           this.reliabilityLoading = false;
           if (this.eventsOpen) this.renderEventsDrawer();
+        }
+      }
+    }
+
+    async refreshTTFTActivity(force = false) {
+      const attemptIsFresh = Date.now() - this.lastTTFTRefreshAt < SUB2_TTFT_REFRESH_MS;
+      if (this.ttftLoading || (!force && attemptIsFresh)) return;
+
+      const requestSequence = ++this.ttftRequestSequence;
+      this.ttftLoading = true;
+      this.ttftError = '';
+      this.lastTTFTRefreshAt = Date.now();
+      try {
+        const snapshot = await sub2FetchTTFTActivity();
+        if (requestSequence !== this.ttftRequestSequence) return;
+        this.ttftSnapshot = snapshot;
+        this.lastTTFTRefreshAt = snapshot.fetchedAt;
+        this.requestHistory = sub2EnrichRequestHistoryWithTTFT(this.requestHistory, snapshot);
+        if (this.recentRequest) {
+          const recentRequestKey = sub2GetRequestHistoryKey(this.recentRequest);
+          this.recentRequest = this.requestHistory.find(
+            (requestItem) => sub2GetRequestHistoryKey(requestItem) === recentRequestKey,
+          ) || this.recentRequest;
+        }
+      } catch (error) {
+        if (requestSequence === this.ttftRequestSequence) {
+          this.ttftError = `首字耗时读取失败：${error?.message || error}`;
+        }
+      } finally {
+        if (requestSequence === this.ttftRequestSequence) {
+          this.ttftLoading = false;
+          if (!this.minimized && !this.isAccountInteractionActive()) this.renderList();
+          if (this.diagnosticsOpen) this.renderDiagnosticsDrawer();
         }
       }
     }
@@ -5633,8 +6051,16 @@
         eventDetail.textContent = localEvent.detail || '没有附加详情。';
         const eventMetadata = document.createElement('div');
         eventMetadata.className = 'sub2-event-meta';
+        const eventGroup = localEvent.groupId
+          ? sub2GetIndexedGroup(this.groupsById, localEvent.groupId)
+          : null;
+        const eventGroupName = localEvent.groupId
+          ? sub2GetFirstReadableText(eventGroup?.name) || String(localEvent.groupId)
+          : '';
         eventMetadata.textContent = [
           localEvent.statusCode ? `状态 ${localEvent.statusCode}` : '',
+          eventGroupName ? `分组 ${eventGroupName}` : '',
+          localEvent.platform ? `平台 ${localEvent.platform}` : '',
           localEvent.model ? `模型 ${localEvent.model}` : '',
           localEvent.requestId ? `请求 ${localEvent.requestId}` : '',
           `来源 ${localEvent.source}`,
@@ -5861,6 +6287,26 @@
       historyTitle.textContent = `真实请求历史（最近 ${this.requestHistory.length} 条 / 30 分钟）`;
       historyCard.appendChild(historyTitle);
 
+      const ttftCoverageNote = document.createElement('div');
+      ttftCoverageNote.className = 'sub2-diagnostics-note';
+      const ttftEvidence = sub2BuildTTFTSnapshotEvidence(
+        this.ttftSnapshot,
+        { error: this.ttftError, loading: this.ttftLoading },
+        now,
+      );
+      if (ttftEvidence.available) {
+        const sampleCount = Math.max(0, Number(this.ttftSnapshot?.sampleCount) || 0);
+        ttftCoverageNote.textContent = this.ttftError
+          ? `${this.ttftError}；继续显示上次成功读取的 ${sampleCount} 个有效流式样本（${ttftEvidence.coverageLabel}，陈旧证据）。`
+          : `首字耗时为滚动 24 小时证据：${sampleCount} 个有效流式样本，${ttftEvidence.coverageLabel}，${ttftEvidence.freshnessLabel}。`;
+        ttftCoverageNote.title = ttftEvidence.title;
+      } else {
+        ttftCoverageNote.textContent = this.ttftLoading
+          ? '正在读取滚动 24 小时流式首字耗时样本；请求历史和账号列表仍可正常使用。'
+          : this.ttftError || '滚动 24 小时首字耗时证据尚未读取。';
+      }
+      historyCard.appendChild(ttftCoverageNote);
+
       if (!this.requestHistory.length) {
         const historyEmpty = document.createElement('div');
         historyEmpty.className = 'sub2-diagnostics-note';
@@ -5954,6 +6400,9 @@
         requestMetadata.textContent = [
           sub2FormatRelative(requestItem.createdAt, now),
           sub2FormatDuration(requestItem.durationMs),
+          requestItem.firstTokenMs !== null && requestItem.firstTokenMs !== undefined
+            ? `首字 ${sub2FormatDuration(requestItem.firstTokenMs)}`
+            : '',
           group ? String(group.name || requestItem.groupId) : requestItem.groupId ? `分组 ${requestItem.groupId}` : '',
         ].filter(Boolean).join(' · ');
         requestMain.append(requestTitle, requestMetadata);
@@ -6097,6 +6546,9 @@
           : '',
         `时间 ${sub2FormatRelative(diagnosticsRequest.createdAt, now)}`,
         sub2FormatDuration(diagnosticsRequest.durationMs),
+        diagnosticsRequest.firstTokenMs !== null && diagnosticsRequest.firstTokenMs !== undefined
+          ? `首字 ${sub2FormatDuration(diagnosticsRequest.firstTokenMs)}`
+          : '',
         diagnosticsRequest.statusCode ? `状态 ${diagnosticsRequest.statusCode}` : '',
       ].filter(Boolean);
       for (const factValue of factValues) {
@@ -6703,6 +7155,13 @@
     sub2GetRequestHistoryKey,
     sub2AnnotateRequestHistory,
     sub2NormalizeRecentRequest,
+    sub2NormalizeTTFTValue,
+    sub2NormalizeTTFTUsageRow,
+    sub2NearestRankPercentile,
+    sub2BuildTTFTSnapshot,
+    sub2EnrichRequestHistoryWithTTFT,
+    sub2BuildTTFTSnapshotEvidence,
+    sub2BuildAccountTTFTEvidence,
     sub2ParseCapacityInput,
     sub2BuildAccountEditorKey,
     sub2TransitionAccountEditor,
@@ -6717,6 +7176,8 @@
     sub2PruneLocalEvents,
     sub2MergeLocalEvents,
     sub2BuildRequestStatusEvents,
+    sub2NormalizeRouteScope,
+    sub2RouteScopesEqual,
     sub2NormalizeObservationSnapshot,
     sub2BuildObservationSnapshot,
     sub2BuildObservationTransitionEvents,
@@ -6738,6 +7199,7 @@
     sub2NormalizeRequestedModelForLookup,
     sub2EvaluateModelSupport,
     sub2EvaluateCandidateEligibility,
+    sub2BuildTTFTUsagePath,
     start() {
       if (isSub2Host()) {
         new Sub2Controller().start();
