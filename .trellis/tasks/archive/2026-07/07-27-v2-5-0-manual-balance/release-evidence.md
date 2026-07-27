@@ -33,3 +33,10 @@ Captured during Trellis planning on 2026-07-27. This file contains no credential
 ## Release Authorization
 
 The standing project rule authorizes committing and pushing verified changes to the `hong594/sub2-smart-group` userscript so Tampermonkey can update. That authorization does not extend to backend account settings, scheduler settings, containers, credentials, or other infrastructure.
+
+## Publication
+
+- Feature commit: `7d4f1e3` (`feat(v2.5.0): add manual upstream balance monitoring`)
+- Trellis initialization commit: `ccf90a1` (`chore: initialize Trellis project workflow`)
+- Published branch: `origin/main`
+- Push result: `771b9c7..ccf90a1  main -> main`

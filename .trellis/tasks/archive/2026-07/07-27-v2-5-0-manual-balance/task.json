@@ -3,7 +3,7 @@
   "name": "v2-5-0-manual-balance",
   "title": "Release v2.5.0 manual upstream balance monitoring",
   "description": "Finish, verify, and publish the click-only upstream balance monitoring iteration.",
-  "status": "in_progress",
+  "status": "completed",
   "dev_type": null,
   "scope": "balance",
   "package": null,
@@ -11,16 +11,20 @@
   "creator": "hongye",
   "assignee": "hongye",
   "createdAt": "2026-07-27",
-  "completedAt": null,
-  "branch": null,
+  "completedAt": "2026-07-27",
+  "branch": "main",
   "base_branch": "main",
   "worktree_path": null,
-  "commit": null,
+  "commit": "ccf90a1",
   "pr_url": null,
   "subtasks": [],
   "children": [],
   "parent": null,
   "relatedFiles": [],
   "notes": "",
-  "meta": {}
+  "meta": {
+    "feature_commit": "7d4f1e3",
+    "workflow_commit": "ccf90a1",
+    "published_remote": "origin/main"
+  }
 }

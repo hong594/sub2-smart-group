@@ -30,9 +30,9 @@
 
 - [x] Run a final Trellis check against PRD acceptance criteria.
 - [x] Record relevant reusable conventions in Trellis specs if this task establishes them.
-- [ ] Commit the reviewed Trellis initialization and v2.5.0 iteration using repository-style commit messages.
-- [ ] Push the normal branch to the existing GitHub remote under the standing userscript publication authorization.
-- [ ] Archive the task only after push succeeds and record the final commit in task/session metadata.
+- [x] Commit the reviewed Trellis initialization and v2.5.0 iteration using repository-style commit messages.
+- [x] Push the normal branch to the existing GitHub remote under the standing userscript publication authorization.
+- [x] Archive the task only after push succeeds and record the final commit in task/session metadata.
 
 ## Rollback Points
 
