@@ -1,0 +1,6 @@
+{"file":".trellis/spec/frontend/index.md","reason":"Frontend spec routing and userscript scope."}
+{"file":".trellis/spec/frontend/manual-balance-monitoring.md","reason":"Balance request, credential, response, evidence, and trusted-click contracts."}
+{"file":".trellis/spec/frontend/account-editors-and-audit.md","reason":"Exclusive editor state and sensitive balance draft lifecycle."}
+{"file":".trellis/spec/frontend/component-guidelines.md","reason":"Existing userscript UI component and interaction conventions."}
+{"file":".trellis/spec/frontend/state-management.md","reason":"Controller state, refresh, and evidence ownership conventions."}
+{"file":".trellis/spec/frontend/quality-guidelines.md","reason":"Required frontend validation and regression standards."}
