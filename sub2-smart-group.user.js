@@ -2,7 +2,7 @@
 // @name         Sub2 Smart Group
 // @name:zh-CN   Sub2 智能分组
 // @namespace    local.sub2.smart-group
-// @version      2.6.0
+// @version      2.7.0
 // @description  Sub2 account health, route history, reliability events, manual upstream balance queries, and protected controls (no active probing).
 // @description:zh-CN 为 sub2api 提供账号健康度、路由历史、可靠性事件、手动上游余额查询与受保护控制（不主动测活）
 // @license      MIT
@@ -21,14 +21,35 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
-// @connect      api.aijws.com
-// @connect      api.ark717.com
+// @connect      ai.52ccl.cn
+// @connect      ai.centos.hk
+// @connect      ai.hubijun.vip
+// @connect      ai.venlacy.com
+// @connect      aihub.top
+// @connect      aitoken.forum
 // @connect      api.123nhh.com
-// @connect      sub.100xlabs.space
+// @connect      api.7x.hk
+// @connect      api.aijws.com
+// @connect      api.ambition.qzz.io
+// @connect      api.ark717.com
+// @connect      api.hlool.top
+// @connect      api.maoyulin.xyz
+// @connect      elysiver.h-e.top
+// @connect      free.lyclaude.site
+// @connect      gancaopu.com
+// @connect      icoe.pp.ua
+// @connect      jianzhile.vip
+// @connect      kuai.dmxcode.com
+// @connect      metapi.lilililwan.xyz
 // @connect      muyuan.do
-// @connect      welfare.0xpsyche.me
+// @connect      new.397710.xyz
+// @connect      new.ambition.qzz.io
+// @connect      ooioo.work
 // @connect      runanytime.hxi.me
-// @connect      new.ambition.qz.io
+// @connect      sub2.zmoon.top
+// @connect      welfare.0xpsyche.me
+// @connect      windhub.cc
+// @connect      x666.me
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -61,7 +82,7 @@
   //   GET  /api/v1/admin/ops/upstream-errors           真实上游故障摘要
   //   GET  /api/v1/admin/ops/upstream-errors/:id       故障转移事件详情
   //   GET  /api/v1/admin/usage                         流式请求首字耗时样本
-  // sub2 后台手动操作（不读取已有账号 credentials 里的 API Key；添加账号只提交用户当次输入）：
+  // sub2 后台手动操作（余额查询仅在用户点击后单账号临时读取已有 API Key；添加账号只提交用户当次输入）：
   //   POST /api/v1/admin/accounts/:id/schedulable      摘出 / 挂回调度池
   //   POST /api/v1/admin/accounts/:id/recover-state    清除冷却 / 恢复
   //   PUT  /api/v1/admin/accounts/:id                  仅调整账号优先级 / 并发容量
@@ -72,9 +93,13 @@
   //   POST /api/v1/admin/accounts/models/sync-upstream-preview
   //                                                        用户点击后用当次凭据识别平台/模型
   //   POST /api/v1/admin/accounts                       用户确认后创建一个已分组 API Key 账号
-  // 外部余额查询（凭据由用户逐账号保存在 Tampermonkey，仅点击时发送）：
+  //   GET  /api/v1/admin/accounts/data?ids=:id&include_proxies=false
+  //                                                        用户点击后只导出当前账号凭据
+  // 外部余额查询（自动模式临时使用单账号导出的 Key；旧手工凭据仍兼容）：
   //   GET  <allowlisted-origin>/v1/usage                 sub2api 余额
-  //   GET  <allowlisted-origin>/api/user/self            newapi 余额
+  //   GET  <allowlisted-origin>/api/status               New API quota 配置（不带凭据）
+  //   GET  <allowlisted-origin>/api/usage/token/          New API 模型 Key 余额
+  //   GET  <allowlisted-origin>/api/user/self             旧 New API AT + User ID 兼容
   // 用户脚本不调用任何 test / probe / 测活类接口。模型同步和账号识别/创建只会由用户明确点击触发；
   // OpenAI 创建后的 Responses 能力探测是官方 create 端点的后端异步副作用。健康度仍然只反映“真实流量触发的状态”。
   // ===========================================================================
@@ -87,19 +112,40 @@
   const SUB2_BALANCE_CONFIG_STORAGE_KEY_PREFIX = `${SUB2_STORAGE_PREFIX}balanceConfig:`;
   const SUB2_BALANCE_QUERY_TIMEOUT_MS = 15000;
   const SUB2_TODAY_STATS_MAX_AGE_MS = SUB2_POLL_SECONDS * 3 * 1000;
-  const SUB2_NEWAPI_QUOTA_DIVISOR = 500000;
   const SUB2_HIGH_AVERAGE_COST_USD = 0.5;
   const SUB2_HIGH_AVERAGE_COST_MIN_REQUESTS = 3;
-  const SUB2_BALANCE_ALLOWED_HOSTS = Object.freeze([
-    'api.aijws.com',
-    'api.ark717.com',
-    'api.123nhh.com',
-    'sub.100xlabs.space',
-    'muyuan.do',
-    'welfare.0xpsyche.me',
-    'runanytime.hxi.me',
-    'new.ambition.qz.io',
-  ]);
+  const SUB2_BALANCE_PROTOCOL_BY_HOST = Object.freeze({
+    'ai.52ccl.cn': 'newapi',
+    'ai.centos.hk': 'newapi',
+    'ai.hubijun.vip': 'newapi',
+    'ai.venlacy.com': 'newapi',
+    'aihub.top': 'sub2api',
+    'aitoken.forum': 'newapi',
+    'api.123nhh.com': 'newapi',
+    'api.7x.hk': 'newapi',
+    'api.aijws.com': 'sub2api',
+    'api.ambition.qzz.io': 'sub2api',
+    'api.ark717.com': 'newapi',
+    'api.hlool.top': 'newapi',
+    'api.maoyulin.xyz': 'newapi',
+    'elysiver.h-e.top': 'newapi',
+    'free.lyclaude.site': 'newapi',
+    'gancaopu.com': 'newapi',
+    'icoe.pp.ua': 'sub2api',
+    'jianzhile.vip': 'newapi',
+    'kuai.dmxcode.com': '',
+    'metapi.lilililwan.xyz': 'newapi',
+    'muyuan.do': 'newapi',
+    'new.397710.xyz': 'newapi',
+    'new.ambition.qzz.io': 'newapi',
+    'ooioo.work': 'newapi',
+    'runanytime.hxi.me': 'newapi',
+    'sub2.zmoon.top': 'sub2api',
+    'welfare.0xpsyche.me': 'newapi',
+    'windhub.cc': 'newapi',
+    'x666.me': 'newapi',
+  });
+  const SUB2_BALANCE_ALLOWED_HOSTS = Object.freeze(Object.keys(SUB2_BALANCE_PROTOCOL_BY_HOST));
   const SUB2_ROUTING_LOOKBACK_MS = 30 * 60 * 1000;
   const SUB2_REQUEST_HISTORY_LIMIT = 30;
   const SUB2_RELIABILITY_HISTORY_LIMIT = 1000;
@@ -123,7 +169,7 @@
   const SUB2_CAPACITY_HIGH_LOAD_RATIO = 0.8;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '2.6.0';
+    : '2.7.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -520,6 +566,125 @@
     }
   }
 
+  function sub2IsPlainObject(value) {
+    return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+  }
+
+  function sub2NormalizeAutomaticBalanceBaseUrl(rawBaseUrl) {
+    const normalized = sub2NormalizeAccountBaseUrl(rawBaseUrl);
+    if (!normalized.ok) {
+      return {
+        ok: false,
+        baseUrl: '',
+        origin: '',
+        hostname: '',
+        providerType: '',
+        registered: false,
+        reason: normalized.reason,
+      };
+    }
+
+    const parsedUrl = new URL(normalized.baseUrl);
+    if (parsedUrl.protocol !== 'https:' || parsedUrl.port) {
+      return {
+        ok: false,
+        baseUrl: '',
+        origin: '',
+        hostname: normalized.hostname,
+        providerType: '',
+        registered: false,
+        reason: parsedUrl.protocol !== 'https:' ? 'https-required' : 'custom-port-not-allowed',
+      };
+    }
+
+    const registered = Object.prototype.hasOwnProperty.call(
+      SUB2_BALANCE_PROTOCOL_BY_HOST,
+      normalized.hostname,
+    );
+    return {
+      ok: true,
+      baseUrl: normalized.baseUrl,
+      origin: parsedUrl.origin,
+      hostname: normalized.hostname,
+      providerType: registered ? SUB2_BALANCE_PROTOCOL_BY_HOST[normalized.hostname] : '',
+      registered,
+      reason: '',
+    };
+  }
+
+  function sub2BuildAutomaticBalanceDescriptor(account) {
+    const accountId = Number(account?.id);
+    if (!Number.isInteger(accountId) || accountId <= 0) {
+      return { descriptor: null, error: '账号 ID 无效，不能自动查询余额。' };
+    }
+
+    const accountType = String(account?.type || '').trim().toLowerCase();
+    if (accountType !== 'apikey') {
+      return { descriptor: null, error: '只有 API Key 账号支持自动余额查询。' };
+    }
+
+    const normalizedTarget = sub2NormalizeAutomaticBalanceBaseUrl(sub2GetUpstreamBaseUrl(account));
+    if (!normalizedTarget.ok || !normalizedTarget.registered) {
+      return { descriptor: null, error: '该账号的 HTTPS 上游地址不在自动余额查询白名单中。' };
+    }
+    if (!normalizedTarget.providerType) {
+      return { descriptor: null, error: '该账号域名尚无可靠余额协议，请使用手工兼容配置。' };
+    }
+
+    const name = String(account?.name || '').trim();
+    const platform = String(account?.platform || '').trim().toLowerCase();
+    if (!name || !platform) {
+      return { descriptor: null, error: '账号名称或平台缺失，不能安全绑定单账号导出。' };
+    }
+
+    return {
+      descriptor: {
+        accountId,
+        name,
+        platform,
+        type: accountType,
+        baseUrl: normalizedTarget.baseUrl,
+        origin: normalizedTarget.origin,
+        hostname: normalizedTarget.hostname,
+        providerType: normalizedTarget.providerType,
+      },
+      error: '',
+    };
+  }
+
+  function sub2ValidateExportedBalanceAccount(account, exportPayload) {
+    const automatic = sub2BuildAutomaticBalanceDescriptor(account);
+    if (automatic.error) {
+      return { descriptor: null, exportedAccount: null, error: automatic.error };
+    }
+    if (!sub2IsPlainObject(exportPayload) || !Array.isArray(exportPayload.accounts)) {
+      return { descriptor: null, exportedAccount: null, error: '单账号导出响应格式无效。' };
+    }
+    if (exportPayload.accounts.length !== 1) {
+      return { descriptor: null, exportedAccount: null, error: '单账号导出没有恰好返回一个账号，已拒绝查询。' };
+    }
+
+    const exportedAccount = exportPayload.accounts[0];
+    if (!sub2IsPlainObject(exportedAccount) || !sub2IsPlainObject(exportedAccount.credentials)) {
+      return { descriptor: null, exportedAccount: null, error: '单账号导出缺少有效账号凭据对象。' };
+    }
+
+    const descriptor = automatic.descriptor;
+    const exportedName = String(exportedAccount.name || '').trim();
+    const exportedPlatform = String(exportedAccount.platform || '').trim().toLowerCase();
+    const exportedType = String(exportedAccount.type || '').trim().toLowerCase();
+    const exportedTarget = sub2NormalizeAutomaticBalanceBaseUrl(exportedAccount.credentials.base_url);
+    if (exportedName !== descriptor.name
+      || exportedPlatform !== descriptor.platform
+      || exportedType !== descriptor.type
+      || !exportedTarget.ok
+      || exportedTarget.baseUrl !== descriptor.baseUrl) {
+      return { descriptor: null, exportedAccount: null, error: '单账号导出与当前账号不一致，已拒绝发送凭据。' };
+    }
+
+    return { descriptor, exportedAccount, error: '' };
+  }
+
   function sub2ParseBalanceTarget(rawProviderType, rawBaseUrl) {
     const providerType = String(rawProviderType || '').trim().toLowerCase();
     if (providerType !== 'sub2api' && providerType !== 'newapi') {
@@ -561,24 +726,42 @@
     return `${parsedTarget.target.type}|${parsedTarget.target.baseUrl}`;
   }
 
+  function sub2ParseLowBalanceThreshold(rawLowBalanceThreshold) {
+    if (rawLowBalanceThreshold === null
+      || rawLowBalanceThreshold === undefined
+      || rawLowBalanceThreshold === '') {
+      return { value: null, error: '' };
+    }
+    const lowBalanceThreshold = Number(rawLowBalanceThreshold);
+    if (!Number.isFinite(lowBalanceThreshold) || lowBalanceThreshold < 0) {
+      return { value: null, error: '低余额阈值必须是大于或等于 0 的数字，也可以留空。' };
+    }
+    return { value: lowBalanceThreshold, error: '' };
+  }
+
   function sub2ParseBalanceConfig(rawConfig) {
+    const requestedMode = String(rawConfig?.mode || '').trim().toLowerCase();
+    const parsedThreshold = sub2ParseLowBalanceThreshold(rawConfig?.lowBalanceThreshold);
+    if (parsedThreshold.error) return { config: null, error: parsedThreshold.error };
+    if (requestedMode === 'auto') {
+      return {
+        config: { mode: 'auto', lowBalanceThreshold: parsedThreshold.value },
+        error: '',
+      };
+    }
+    if (requestedMode && requestedMode !== 'manual') {
+      return { config: null, error: '余额查询模式无效。' };
+    }
+
     const parsedTarget = sub2ParseBalanceTarget(rawConfig?.type, rawConfig?.baseUrl);
     if (parsedTarget.error) return { config: null, error: parsedTarget.error };
     const { type: providerType, baseUrl } = parsedTarget.target;
 
-    const rawLowBalanceThreshold = rawConfig?.lowBalanceThreshold;
-    let lowBalanceThreshold = null;
-    if (rawLowBalanceThreshold !== null && rawLowBalanceThreshold !== undefined && rawLowBalanceThreshold !== '') {
-      lowBalanceThreshold = Number(rawLowBalanceThreshold);
-      if (!Number.isFinite(lowBalanceThreshold) || lowBalanceThreshold < 0) {
-        return { config: null, error: '低余额阈值必须是大于或等于 0 的数字，也可以留空。' };
-      }
-    }
-
     const normalizedConfig = {
+      mode: 'manual',
       type: providerType,
       baseUrl,
-      lowBalanceThreshold,
+      lowBalanceThreshold: parsedThreshold.value,
     };
     if (providerType === 'sub2api') {
       const apiKey = String(rawConfig?.apiKey || '').trim();
@@ -656,11 +839,46 @@
     GM_deleteValue(storageKey);
   }
 
+  function sub2ResolveBalanceQuery(account, storedConfig = null) {
+    const normalizedConfig = storedConfig ? sub2NormalizeStoredBalanceConfig(storedConfig) : null;
+    if (normalizedConfig?.mode === 'manual') {
+      return {
+        query: { mode: 'manual', config: normalizedConfig },
+        displayConfig: normalizedConfig,
+        error: '',
+      };
+    }
+
+    const automatic = sub2BuildAutomaticBalanceDescriptor(account);
+    if (automatic.error) {
+      return {
+        query: null,
+        displayConfig: normalizedConfig,
+        error: automatic.error,
+      };
+    }
+
+    const automaticConfig = {
+      mode: 'auto',
+      type: automatic.descriptor.providerType,
+      baseUrl: automatic.descriptor.origin,
+      lowBalanceThreshold: normalizedConfig?.lowBalanceThreshold ?? null,
+    };
+    return {
+      query: { mode: 'auto', descriptor: automatic.descriptor, config: automaticConfig },
+      displayConfig: automaticConfig,
+      error: '',
+    };
+  }
+
   function sub2BuildBalanceRequest(rawConfig) {
     const parsedConfig = sub2ParseBalanceConfig(rawConfig);
     if (parsedConfig.error) return { request: null, config: null, error: parsedConfig.error };
 
     const balanceConfig = parsedConfig.config;
+    if (balanceConfig.mode !== 'manual') {
+      return { request: null, config: null, error: '自动余额查询必须先安全导出当前账号凭据。' };
+    }
     if (balanceConfig.type === 'sub2api') {
       return {
         config: balanceConfig,
@@ -708,7 +926,54 @@
     return normalizedValue || fallback;
   }
 
-  function sub2ExtractBalanceResult(providerType, responsePayload) {
+  function sub2ExtractNewApiQuotaPerUnit(responsePayload) {
+    if (responsePayload?.success !== true || !sub2IsPlainObject(responsePayload.data)) {
+      return { isValid: false, quotaPerUnit: null, invalidMessage: 'New API 状态接口响应无效。' };
+    }
+    const quotaPerUnit = sub2ParseBalanceNumericValue(responsePayload.data.quota_per_unit);
+    if (quotaPerUnit === null || quotaPerUnit <= 0) {
+      return { isValid: false, quotaPerUnit: null, invalidMessage: 'New API 状态接口缺少有效 quota_per_unit。' };
+    }
+    return { isValid: true, quotaPerUnit, invalidMessage: '' };
+  }
+
+  function sub2ExtractNewApiTokenBalance(responsePayload, rawQuotaPerUnit) {
+    const quotaPerUnit = sub2ParseBalanceNumericValue(rawQuotaPerUnit);
+    if (quotaPerUnit === null || quotaPerUnit <= 0) {
+      return { isValid: false, invalidMessage: 'New API quota_per_unit 无效。' };
+    }
+    if (responsePayload?.code !== true || !sub2IsPlainObject(responsePayload.data)) {
+      return { isValid: false, invalidMessage: 'New API 模型 Key 用量响应无效。' };
+    }
+
+    const availableQuota = sub2ParseBalanceNumericValue(responsePayload.data.total_available);
+    const usedQuota = sub2ParseBalanceNumericValue(responsePayload.data.total_used);
+    const grantedQuota = sub2ParseBalanceNumericValue(responsePayload.data.total_granted);
+    if (availableQuota === null
+      || usedQuota === null
+      || grantedQuota === null
+      || availableQuota < 0
+      || usedQuota < 0
+      || grantedQuota < 0) {
+      return { isValid: false, invalidMessage: 'New API 模型 Key 用量字段缺失或无效。' };
+    }
+
+    const unlimited = responsePayload.data.unlimited_quota === true;
+    const expiresAt = sub2ParseBalanceNumericValue(responsePayload.data.expires_at);
+    return {
+      isValid: true,
+      unlimited,
+      provider: 'newapi',
+      planName: sub2SanitizeUpstreamText(responsePayload.data.name, 'API Key'),
+      remaining: unlimited ? null : availableQuota / quotaPerUnit,
+      used: usedQuota / quotaPerUnit,
+      total: grantedQuota / quotaPerUnit,
+      unit: 'USD',
+      expiresAt: expiresAt !== null && expiresAt >= 0 ? expiresAt : null,
+    };
+  }
+
+  function sub2ExtractBalanceResult(providerType, responsePayload, rawQuotaPerUnit = null) {
     if (providerType === 'sub2api') {
       const rawRemaining = responsePayload?.remaining
         ?? responsePayload?.quota?.remaining
@@ -723,7 +988,7 @@
       }
       const unit = sub2NormalizeBalanceUnit(responsePayload?.unit ?? responsePayload?.quota?.unit ?? 'USD');
       if (!unit) return { isValid: false, invalidMessage: '上游响应中的余额单位无效。' };
-      return { isValid: true, remaining, unit };
+      return { isValid: true, unlimited: false, provider: 'sub2api', remaining, unit };
     }
 
     if (providerType === 'newapi') {
@@ -742,18 +1007,24 @@
         if (quota === null || usedQuota === null) {
           return { isValid: false, invalidMessage: 'newapi 响应中的 quota 或 used_quota 无效。' };
         }
+        const quotaPerUnit = sub2ParseBalanceNumericValue(rawQuotaPerUnit);
+        if (quotaPerUnit === null || quotaPerUnit <= 0) {
+          return { isValid: false, invalidMessage: 'New API quota_per_unit 无效。' };
+        }
         return {
           isValid: true,
+          unlimited: false,
+          provider: 'newapi',
           planName: sub2SanitizeUpstreamText(responsePayload.data.group, '默认套餐'),
-          remaining: quota / SUB2_NEWAPI_QUOTA_DIVISOR,
-          used: usedQuota / SUB2_NEWAPI_QUOTA_DIVISOR,
-          total: (quota + usedQuota) / SUB2_NEWAPI_QUOTA_DIVISOR,
+          remaining: quota / quotaPerUnit,
+          used: usedQuota / quotaPerUnit,
+          total: (quota + usedQuota) / quotaPerUnit,
           unit: 'USD',
         };
       }
       return {
         isValid: false,
-        invalidMessage: sub2SanitizeUpstreamText(responsePayload?.message, '查询失败'),
+        invalidMessage: 'New API 用户余额响应无效。',
       };
     }
 
@@ -842,19 +1113,34 @@
       : `本次今日统计不可用${statsFetchedAt ? `；上次成功读取于 ${sub2FormatRelative(statsFetchedAt, now)}` : ''}，未使用旧快照估算续航。`;
     const evidenceDescription = `${evidenceNote}${highAverageCostNote ? ` ${highAverageCostNote}` : ''}`;
     const stateStatus = String(balanceState?.status || '');
+    const previousSuccess = balanceState?.previousSuccess;
+    const previousSnapshot = (stateStatus === 'loading' || stateStatus === 'error')
+      && previousSuccess?.result?.isValid
+      ? sub2BuildBalanceStatusSnapshot(
+        balanceConfig,
+        { status: 'success', result: previousSuccess.result, queriedAt: previousSuccess.queriedAt },
+        rawStats,
+        now,
+        usageContext,
+      )
+      : null;
 
     if (stateStatus === 'loading') {
       return {
-        text: `余额查询中… · ${usageText}`,
-        title: `${evidenceDescription} 查询由本次点击触发。`,
+        text: previousSnapshot ? `余额查询中… · 上次${previousSnapshot.text}` : `余额查询中… · ${usageText}`,
+        title: previousSnapshot
+          ? `查询由本次点击触发。上次成功证据仍保留：${previousSnapshot.title}`
+          : `${evidenceDescription} 查询由本次点击触发。`,
         tone: usageAvailable && usageSnapshot.highAverageCost ? 'warn' : 'info',
         usageSnapshot,
       };
     }
     if (stateStatus === 'error') {
       return {
-        text: `余额查询失败 · ${usageText}`,
-        title: `${String(balanceState?.error || '未知错误')} ${evidenceDescription}`,
+        text: previousSnapshot ? `余额查询失败 · 上次${previousSnapshot.text}` : `余额查询失败 · ${usageText}`,
+        title: previousSnapshot
+          ? `${String(balanceState?.error || '未知错误')} 上次成功证据仍保留：${previousSnapshot.title}`
+          : `${String(balanceState?.error || '未知错误')} ${evidenceDescription}`,
         tone: 'error',
         usageSnapshot,
       };
@@ -870,6 +1156,40 @@
 
     const balanceResult = balanceState.result;
     const normalizedUnit = String(balanceResult.unit || 'USD').trim().toLocaleUpperCase() || 'USD';
+    const providerType = String(balanceResult.provider || balanceConfig?.type || '').trim().toLowerCase();
+    const protocolText = providerType === 'newapi'
+      ? '协议 New API'
+      : providerType === 'sub2api'
+        ? '协议 sub2api'
+        : '';
+    if (balanceResult.unlimited === true) {
+      const textParts = ['余额 无限额度'];
+      if (protocolText) textParts.push(protocolText);
+      textParts.push(`今日消耗 ${todayCostLabel}`);
+      if (usageAvailable) textParts.push(averageCostLabel);
+
+      const titleParts = [
+        evidenceDescription,
+        '上游模型 Key 为无限额度，未执行低余额判断或续航估算。',
+      ];
+      if (balanceResult.planName) titleParts.push(`套餐：${balanceResult.planName}。`);
+      if (Number.isFinite(Number(balanceResult.used))) {
+        titleParts.push(`上游返回已用 ${sub2FormatBalanceAmount(balanceResult.used, normalizedUnit)}。`);
+      }
+      if (balanceState.queriedAt) {
+        titleParts.push(`查询于 ${sub2FormatRelative(balanceState.queriedAt, now)}。`);
+      }
+      return {
+        text: textParts.join(' · '),
+        title: titleParts.join(' '),
+        tone: usageAvailable && usageSnapshot.highAverageCost ? 'warn' : 'ok',
+        usageSnapshot,
+        estimatedHours: null,
+        lowBalance: false,
+        usageAvailable,
+      };
+    }
+
     const remaining = Number(balanceResult.remaining);
     const threshold = balanceConfig?.lowBalanceThreshold;
     const thresholdConfigured = threshold !== null
@@ -886,8 +1206,9 @@
     const estimatedHoursLabel = sub2FormatEstimatedBalanceHours(estimatedHours);
     const textParts = [
       `余额 ${sub2FormatBalanceAmount(remaining, normalizedUnit)}`,
-      `今日消耗 ${todayCostLabel}`,
     ];
+    if (protocolText) textParts.push(protocolText);
+    textParts.push(`今日消耗 ${todayCostLabel}`);
     if (estimatedHoursLabel) textParts.push(`按今日平均速率约剩 ${estimatedHoursLabel}`);
     if (usageAvailable) textParts.push(averageCostLabel);
 
@@ -3895,11 +4216,88 @@
     return true;
   }
 
-  function sub2QueryUpstreamBalance(rawConfig) {
-    const requestDefinition = sub2BuildBalanceRequest(rawConfig);
-    if (requestDefinition.error) return Promise.reject(new Error(requestDefinition.error));
+  function sub2BuildNewApiStatusRequest(rawBaseUrl) {
+    const parsedTarget = sub2ParseBalanceTarget('newapi', rawBaseUrl);
+    if (parsedTarget.error) return { request: null, error: parsedTarget.error };
+    return {
+      request: {
+        url: `${parsedTarget.target.baseUrl}/api/status`,
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        label: 'New API 状态接口',
+      },
+      error: '',
+    };
+  }
+
+  function sub2BuildAutomaticBalanceRequestPlan(descriptor, rawApiKey) {
+    const providerType = String(descriptor?.providerType || '').trim().toLowerCase();
+    if (providerType !== 'sub2api' && providerType !== 'newapi') {
+      return { plan: null, error: '账号余额协议不受支持。' };
+    }
+    const descriptorTarget = sub2NormalizeAutomaticBalanceBaseUrl(descriptor?.baseUrl);
+    if (!descriptorTarget.ok
+      || !descriptorTarget.registered
+      || descriptorTarget.providerType !== providerType
+      || descriptorTarget.origin !== descriptor?.origin
+      || descriptorTarget.hostname !== descriptor?.hostname) {
+      return { plan: null, error: '账号余额目标与已验证导出地址不一致。' };
+    }
+    const target = sub2ParseBalanceTarget(providerType, descriptorTarget.origin);
+    if (target.error) return { plan: null, error: target.error };
+    if (target.target.baseUrl !== descriptorTarget.origin) {
+      return { plan: null, error: '账号余额目标与已验证导出地址不一致。' };
+    }
+
+    const apiKey = typeof rawApiKey === 'string' ? rawApiKey.trim() : '';
+    if (!apiKey || /\r|\n/.test(apiKey)) {
+      return { plan: null, error: '导出账号没有可用的 API Key。' };
+    }
+
+    if (providerType === 'sub2api') {
+      return {
+        plan: {
+          providerType,
+          balanceRequest: {
+            url: `${target.target.baseUrl}/v1/usage`,
+            method: 'GET',
+            headers: { Authorization: `Bearer ${apiKey}` },
+            label: 'sub2api 余额接口',
+          },
+        },
+        error: '',
+      };
+    }
+
+    return {
+      plan: {
+        providerType,
+        statusRequest: {
+          url: `${target.target.baseUrl}/api/status`,
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+          label: 'New API 状态接口',
+        },
+        balanceRequest: {
+          url: `${target.target.baseUrl}/api/usage/token/`,
+          method: 'GET',
+          headers: { Authorization: `Bearer ${apiKey}` },
+          label: 'New API 模型 Key 用量接口',
+        },
+      },
+      error: '',
+    };
+  }
+
+  function sub2RequestBalanceJson(request) {
     if (typeof GM_xmlhttpRequest !== 'function') {
       return Promise.reject(new Error('Tampermonkey 跨域请求能力不可用。'));
+    }
+
+    const expectedUrl = String(request?.url || '');
+    const requestLabel = String(request?.label || '余额接口');
+    if (!expectedUrl || request?.method !== 'GET') {
+      return Promise.reject(new Error('余额请求定义无效。'));
     }
 
     return new Promise((resolve, reject) => {
@@ -3926,7 +4324,7 @@
       };
 
       timeoutWatchdogId = window.setTimeout(() => {
-        rejectOnce(`余额查询超过 ${SUB2_BALANCE_QUERY_TIMEOUT_MS / 1000} 秒。`);
+        rejectOnce(`${requestLabel}超过 ${SUB2_BALANCE_QUERY_TIMEOUT_MS / 1000} 秒。`);
         try {
           requestHandle?.abort?.();
         } catch {
@@ -3936,7 +4334,9 @@
 
       try {
         requestHandle = GM_xmlhttpRequest({
-          ...requestDefinition.request,
+          url: expectedUrl,
+          method: 'GET',
+          headers: request.headers || {},
           anonymous: true,
           nocache: true,
           redirect: 'error',
@@ -3945,17 +4345,17 @@
           onload(response) {
             const status = Number(response?.status);
             if (!Number.isInteger(status) || status < 200 || status >= 300) {
-              rejectOnce(`余额接口返回 HTTP ${Number.isInteger(status) ? status : '未知状态'}。`);
+              rejectOnce(`${requestLabel}返回 HTTP ${Number.isInteger(status) ? status : '未知状态'}。`);
               return;
             }
 
             const finalUrl = typeof response?.finalUrl === 'string' ? response.finalUrl : '';
             if (!finalUrl) {
-              rejectOnce('余额接口未提供可验证的最终地址，已拒绝使用响应。');
+              rejectOnce(`${requestLabel}未提供可验证的最终地址，已拒绝使用响应。`);
               return;
             }
-            if (finalUrl !== requestDefinition.request.url) {
-              rejectOnce('余额接口发生了重定向或最终地址不匹配，已拒绝使用响应。');
+            if (finalUrl !== expectedUrl) {
+              rejectOnce(`${requestLabel}发生了重定向或最终地址不匹配，已拒绝使用响应。`);
               return;
             }
 
@@ -3964,31 +4364,97 @@
               try {
                 responsePayload = JSON.parse(String(response?.responseText || ''));
               } catch {
-                rejectOnce('余额接口没有返回有效 JSON。');
+                rejectOnce(`${requestLabel}没有返回有效 JSON。`);
                 return;
               }
             }
-            const balanceResult = sub2ExtractBalanceResult(requestDefinition.config.type, responsePayload);
-            if (!balanceResult.isValid) {
-              rejectOnce(balanceResult.invalidMessage || '余额响应无效。');
+            if (!sub2IsPlainObject(responsePayload)) {
+              rejectOnce(`${requestLabel}没有返回有效 JSON 对象。`);
               return;
             }
-            resolveOnce(balanceResult);
+            resolveOnce(responsePayload);
           },
           onabort() {
             rejectOnce('余额查询已取消。');
           },
           onerror() {
-            rejectOnce('余额接口网络请求失败。');
+            rejectOnce(`${requestLabel}网络请求失败。`);
           },
           ontimeout() {
-            rejectOnce(`余额查询超过 ${SUB2_BALANCE_QUERY_TIMEOUT_MS / 1000} 秒。`);
+            rejectOnce(`${requestLabel}超过 ${SUB2_BALANCE_QUERY_TIMEOUT_MS / 1000} 秒。`);
           },
         });
       } catch {
         rejectOnce('无法发起余额查询。');
       }
     });
+  }
+
+  async function sub2QueryUpstreamBalance(rawConfig) {
+    const requestDefinition = sub2BuildBalanceRequest(rawConfig);
+    if (requestDefinition.error) throw new Error(requestDefinition.error);
+
+    let statusRequest = null;
+    try {
+      let quotaPerUnit = null;
+      if (requestDefinition.config.type === 'newapi') {
+        const statusDefinition = sub2BuildNewApiStatusRequest(requestDefinition.config.baseUrl);
+        if (statusDefinition.error) throw new Error(statusDefinition.error);
+        statusRequest = statusDefinition.request;
+        const statusPayload = await sub2RequestBalanceJson(statusRequest);
+        const statusResult = sub2ExtractNewApiQuotaPerUnit(statusPayload);
+        if (!statusResult.isValid) throw new Error(statusResult.invalidMessage);
+        quotaPerUnit = statusResult.quotaPerUnit;
+      }
+
+      const responsePayload = await sub2RequestBalanceJson({
+        ...requestDefinition.request,
+        label: requestDefinition.config.type === 'newapi'
+          ? 'New API 用户余额接口'
+          : 'sub2api 余额接口',
+      });
+      const balanceResult = sub2ExtractBalanceResult(
+        requestDefinition.config.type,
+        responsePayload,
+        quotaPerUnit,
+      );
+      if (!balanceResult.isValid) throw new Error(balanceResult.invalidMessage || '余额响应无效。');
+      return balanceResult;
+    } finally {
+      if (requestDefinition.request?.headers) {
+        requestDefinition.request.headers.Authorization = '';
+        requestDefinition.request.headers['New-Api-User'] = '';
+      }
+      statusRequest = null;
+    }
+  }
+
+  async function sub2QueryAutomaticUpstreamBalance(descriptor, rawApiKey) {
+    let transientApiKey = typeof rawApiKey === 'string' ? rawApiKey.trim() : '';
+    let requestPlan = null;
+    try {
+      const planned = sub2BuildAutomaticBalanceRequestPlan(descriptor, transientApiKey);
+      if (planned.error) throw new Error(planned.error);
+      requestPlan = planned.plan;
+      let quotaPerUnit = null;
+      if (requestPlan.providerType === 'newapi') {
+        const statusPayload = await sub2RequestBalanceJson(requestPlan.statusRequest);
+        const statusResult = sub2ExtractNewApiQuotaPerUnit(statusPayload);
+        if (!statusResult.isValid) throw new Error(statusResult.invalidMessage);
+        quotaPerUnit = statusResult.quotaPerUnit;
+      }
+
+      const balancePayload = await sub2RequestBalanceJson(requestPlan.balanceRequest);
+      const balanceResult = requestPlan.providerType === 'newapi'
+        ? sub2ExtractNewApiTokenBalance(balancePayload, quotaPerUnit)
+        : sub2ExtractBalanceResult('sub2api', balancePayload);
+      if (!balanceResult.isValid) throw new Error(balanceResult.invalidMessage || '余额响应无效。');
+      return balanceResult;
+    } finally {
+      if (requestPlan?.balanceRequest?.headers) requestPlan.balanceRequest.headers.Authorization = '';
+      transientApiKey = '';
+      requestPlan = null;
+    }
   }
 
   async function sub2ApiRequest(method, path, body, signal = null, additionalHeaders = null) {
@@ -4075,6 +4541,23 @@
 
   async function sub2FetchAccount(accountId) {
     return sub2ApiRequest('GET', `/admin/accounts/${accountId}`);
+  }
+
+  async function sub2FetchSingleAccountDataExport(accountId) {
+    const normalizedAccountId = Number(accountId);
+    if (!Number.isInteger(normalizedAccountId) || normalizedAccountId <= 0) {
+      throw new Error('账号 ID 无效，不能读取单账号导出。');
+    }
+    try {
+      return await sub2ApiRequestWithTimeout(
+        'GET',
+        `/admin/accounts/data?ids=${encodeURIComponent(normalizedAccountId)}&include_proxies=false`,
+        undefined,
+        SUB2_BALANCE_QUERY_TIMEOUT_MS,
+      );
+    } catch {
+      throw new Error('无法读取当前账号的单账号导出，请确认管理员会话仍然有效。');
+    }
   }
 
   async function sub2FetchGroups() {
@@ -5211,9 +5694,12 @@
       const accountId = Number(account?.id);
       if (kind === 'balance') {
         const currentConfig = this.getBalanceConfig(accountId);
+        const automatic = sub2BuildAutomaticBalanceDescriptor(account);
+        const mode = currentConfig?.mode || (automatic.descriptor ? 'auto' : 'manual');
         return {
           accountId,
-          type: currentConfig?.type || 'sub2api',
+          mode,
+          type: currentConfig?.type || automatic.descriptor?.providerType || 'sub2api',
           baseUrl: currentConfig?.baseUrl || sub2GetUpstreamWebsiteUrl(account).replace(/\/$/, ''),
           lowBalanceThreshold: currentConfig?.lowBalanceThreshold === null
             || currentConfig?.lowBalanceThreshold === undefined
@@ -5270,7 +5756,7 @@
 
       this.discardActiveEditorDraft();
       const draft = this.createAccountEditorDraft(account, target.kind, options);
-      const focusField = target.kind === 'balance' ? 'provider' : 'value';
+      const focusField = target.kind === 'balance' ? 'mode' : 'value';
       this.activeEditor = {
         ...target,
         draft,
@@ -6339,11 +6825,20 @@
       return this.balanceConfigsById[String(Number(accountId))] || null;
     }
 
-    saveBalanceConfig(accountId, rawConfig) {
+    getBalanceResolution(account) {
+      return sub2ResolveBalanceQuery(account, this.getBalanceConfig(account?.id));
+    }
+
+    saveBalanceConfig(account, rawConfig) {
       const parsedConfig = sub2ParseBalanceConfig(rawConfig);
       if (parsedConfig.error) return { config: null, error: parsedConfig.error };
 
-      const normalizedAccountId = Number(accountId);
+      if (parsedConfig.config.mode === 'auto') {
+        const automatic = sub2BuildAutomaticBalanceDescriptor(account);
+        if (automatic.error) return { config: null, error: automatic.error };
+      }
+
+      const normalizedAccountId = Number(account?.id);
       try {
         sub2SaveBalanceConfig(normalizedAccountId, parsedConfig.config);
       } catch (error) {
@@ -6375,7 +6870,7 @@
 
     buildBalanceSummaryElement(account, stats, now) {
       const accountId = Number(account.id);
-      const balanceConfig = this.getBalanceConfig(accountId);
+      const balanceConfig = this.getBalanceResolution(account).displayConfig;
       const balanceState = this.balanceStateById.get(accountId) || null;
       const balanceSnapshot = sub2BuildBalanceStatusSnapshot(
         balanceConfig,
@@ -6414,7 +6909,7 @@
       for (const account of this.accounts) {
         const accountId = Number(account?.id);
         const stats = this.statsById?.[accountId] || {};
-        const balanceConfig = this.getBalanceConfig(accountId);
+        const balanceConfig = this.getBalanceResolution(account).displayConfig;
         const balanceState = this.balanceStateById.get(accountId) || null;
         const balanceSnapshot = sub2BuildBalanceStatusSnapshot(
           balanceConfig,
@@ -6439,6 +6934,8 @@
     buildBalanceControls(account, busy) {
       const accountId = Number(account.id);
       const currentConfig = this.getBalanceConfig(accountId);
+      const automatic = sub2BuildAutomaticBalanceDescriptor(account);
+      const queryResolution = this.getBalanceResolution(account);
       const activeBalanceDraft = this.isAccountEditorActive(accountId, 'balance')
         ? this.activeEditor.draft
         : null;
@@ -6452,10 +6949,12 @@
       queryButton.className = 'sub2-btn primary';
       queryButton.textContent = balanceQuerying
         ? '查询中…'
-        : currentConfig ? '查余额' : '配置余额';
-      queryButton.title = currentConfig
-        ? '仅本次点击会向该账号配置的上游发送余额请求'
-        : '先为该账号单独配置余额来源与凭据';
+        : queryResolution.query ? '查余额' : '配置余额';
+      queryButton.title = queryResolution.query?.mode === 'auto'
+        ? '本次点击会单账号导出并临时使用 sub2 已保存的 Key 查询余额'
+        : queryResolution.query
+          ? '本次点击会使用该账号的手工兼容配置查询余额'
+          : queryResolution.error;
       queryButton.disabled = busy || balanceQuerying;
       actionButtons.push(queryButton);
 
@@ -6463,9 +6962,9 @@
       settingsButton.type = 'button';
       settingsButton.className = 'sub2-btn';
       settingsButton.textContent = '余额设置';
-      settingsButton.title = '修改或清除该账号保存在 Tampermonkey 中的余额凭据';
+      settingsButton.title = '修改余额查询模式、低余额阈值或手工兼容配置';
       settingsButton.disabled = busy || balanceQuerying;
-      if (currentConfig) actionButtons.push(settingsButton);
+      if (currentConfig || automatic.descriptor) actionButtons.push(settingsButton);
 
       const editor = document.createElement('div');
       editor.className = 'sub2-balance-editor';
@@ -6485,6 +6984,19 @@
         field.append(label, inputElement);
         return field;
       };
+
+      const modeSelect = document.createElement('select');
+      const automaticOption = document.createElement('option');
+      automaticOption.value = 'auto';
+      automaticOption.textContent = '自动使用 sub2 已保存的 Key';
+      automaticOption.disabled = !automatic.descriptor;
+      const manualOption = document.createElement('option');
+      manualOption.value = 'manual';
+      manualOption.textContent = '手工兼容配置';
+      modeSelect.append(automaticOption, manualOption);
+      modeSelect.value = balanceDraft.mode === 'auto' ? 'auto' : 'manual';
+      this.trackAccountEditorField(modeSelect, 'mode');
+      const modeField = createBalanceField('查询方式', modeSelect, true);
 
       const providerSelect = document.createElement('select');
       const sub2apiOption = document.createElement('option');
@@ -6562,7 +7074,7 @@
       const clearButton = document.createElement('button');
       clearButton.type = 'button';
       clearButton.className = 'sub2-btn danger';
-      clearButton.textContent = '清除凭据';
+      clearButton.textContent = '清除设置';
       clearButton.hidden = !currentConfig;
       const cancelButton = document.createElement('button');
       cancelButton.type = 'button';
@@ -6572,7 +7084,6 @@
 
       const securityNotice = document.createElement('div');
       securityNotice.className = 'sub2-balance-notice';
-      securityNotice.textContent = '凭据以未加密形式保存在 Tampermonkey 的脚本存储中，已保存值不会回填到页面 DOM，也不写入网页 localStorage、sub2 或日志；仅点击查询时发送到所填白名单 HTTPS 域名。';
       const editorMessage = document.createElement('div');
       editorMessage.className = 'sub2-balance-message';
       editorMessage.textContent = showBalanceEditor ? this.activeEditor?.message || '' : '';
@@ -6580,10 +7091,9 @@
       const credentialInputs = { apiKey: apiKeyInput, accessToken: accessTokenInput, userId: userIdInput };
       const credentialDraftContexts = activeBalanceDraft?.credentialContexts
         || { apiKey: '', accessToken: '', userId: '' };
-      const getCurrentCredentialContext = () => sub2BuildBalanceCredentialContext(
-        providerSelect.value,
-        baseUrlInput.value,
-      );
+      const getCurrentCredentialContext = () => modeSelect.value === 'manual'
+        ? sub2BuildBalanceCredentialContext(providerSelect.value, baseUrlInput.value)
+        : '';
       const clearMismatchedCredentialDrafts = (clearAll = false) => {
         const currentCredentialContext = getCurrentCredentialContext();
         let clearedCredential = false;
@@ -6600,24 +7110,37 @@
           this.setActiveEditorMessage('余额来源已变更，请重新输入对应凭据。', editorMessage);
         }
       };
-      const updateProviderFields = () => {
+      const updateModeFields = () => {
+        const usesAutomatic = modeSelect.value === 'auto';
         const usesSub2api = providerSelect.value === 'sub2api';
-        apiKeyField.hidden = !usesSub2api;
-        accessTokenField.hidden = usesSub2api;
-        userIdField.hidden = usesSub2api;
+        providerField.hidden = usesAutomatic;
+        baseUrlField.hidden = usesAutomatic;
+        apiKeyField.hidden = usesAutomatic || !usesSub2api;
+        accessTokenField.hidden = usesAutomatic || usesSub2api;
+        userIdField.hidden = usesAutomatic || usesSub2api;
+        securityNotice.textContent = usesAutomatic
+          ? '自动查询只在本次点击中单账号导出并临时使用 sub2 已保存的 Key；设置仅保存模式和低余额阈值。'
+          : '手工兼容凭据保存在 Tampermonkey 脚本存储中，不回填 DOM 或写入网页 localStorage、sub2、日志；仅点击查询时发送到所填白名单 HTTPS 域名。';
       };
       const openEditor = () => this.toggleAccountEditor(account, 'balance');
       const collectDraftConfig = () => {
         if (!this.isAccountEditorActive(accountId, 'balance')) return null;
         const draft = this.activeEditor.draft;
         if (Number(draft?.accountId) !== accountId) return null;
+        if (draft.mode === 'auto') {
+          return {
+            mode: 'auto',
+            lowBalanceThreshold: draft.lowBalanceThreshold,
+          };
+        }
         const selectedProviderType = draft.type;
         const latestPersistedConfig = sub2LoadBalanceConfig(accountId);
         const finalCredentialContext = sub2BuildBalanceCredentialContext(draft.type, draft.baseUrl);
         const persistedCredentialContext = latestPersistedConfig
           ? sub2BuildBalanceCredentialContext(latestPersistedConfig.type, latestPersistedConfig.baseUrl)
           : '';
-        const canReuseStoredCredentials = Boolean(finalCredentialContext)
+        const canReuseStoredCredentials = latestPersistedConfig?.mode === 'manual'
+          && Boolean(finalCredentialContext)
           && persistedCredentialContext === finalCredentialContext;
         const getBoundDraftCredential = (credentialName) => {
           const inputValue = draft[credentialName];
@@ -6628,6 +7151,7 @@
             : '';
         };
         return {
+          mode: 'manual',
           type: selectedProviderType,
           baseUrl: draft.baseUrl,
           lowBalanceThreshold: draft.lowBalanceThreshold,
@@ -6643,7 +7167,7 @@
         if (!userEvent?.isTrusted) return;
         const draftConfig = collectDraftConfig();
         if (!draftConfig) return;
-        const saveResult = this.saveBalanceConfig(accountId, draftConfig);
+        const saveResult = this.saveBalanceConfig(account, draftConfig);
         if (saveResult.error) {
           this.setActiveEditorMessage(saveResult.error, editorMessage);
           return;
@@ -6666,12 +7190,19 @@
           }
         });
       }
+      modeSelect.addEventListener('change', () => {
+        if (this.isAccountEditorActive(accountId, 'balance')) {
+          this.activeEditor.draft.mode = modeSelect.value;
+        }
+        clearMismatchedCredentialDrafts(true);
+        updateModeFields();
+      });
       providerSelect.addEventListener('change', () => {
         if (this.isAccountEditorActive(accountId, 'balance')) {
           this.activeEditor.draft.type = providerSelect.value;
         }
         clearMismatchedCredentialDrafts(true);
-        updateProviderFields();
+        updateModeFields();
       });
       baseUrlInput.addEventListener('input', () => {
         if (this.isAccountEditorActive(accountId, 'balance')) {
@@ -6686,7 +7217,7 @@
       });
       queryButton.addEventListener('click', (event) => {
         if (!event.isTrusted) return;
-        if (currentConfig) this.handleBalanceQuery(account, true);
+        if (queryResolution.query) this.handleBalanceQuery(account, true);
         else openEditor();
       });
       settingsButton.addEventListener('click', (event) => {
@@ -6697,7 +7228,7 @@
       clearButton.addEventListener('click', (event) => {
         if (!event.isTrusted) return;
         const accountName = String(account.name || `账号 ${account.id}`).trim() || `账号 ${account.id}`;
-        if (!window.confirm(`确定清除“${accountName}”保存在 Tampermonkey 中的余额凭据吗？`)) return;
+        if (!window.confirm(`确定清除“${accountName}”保存在 Tampermonkey 中的余额设置吗？`)) return;
         const clearError = this.clearBalanceConfig(accountId);
         if (clearError) {
           this.setActiveEditorMessage(clearError, editorMessage);
@@ -6712,9 +7243,10 @@
         this.renderList({ captureEditorFocus: false });
         this.refresh();
       });
-      updateProviderFields();
+      updateModeFields();
       editor.append(
         editorTitle,
+        modeField,
         providerField,
         thresholdField,
         baseUrlField,
@@ -8392,42 +8924,88 @@
       const accountId = Number(account?.id);
       if (userInitiated !== true || this.balanceQueryingIds.has(accountId)) return;
       const balanceConfig = sub2LoadBalanceConfig(accountId);
-      if (!balanceConfig) {
-        const updatedConfigs = { ...this.balanceConfigsById };
-        delete updatedConfigs[String(accountId)];
-        this.balanceConfigsById = updatedConfigs;
-        this.balanceStateById.delete(accountId);
+      const updatedConfigs = { ...this.balanceConfigsById };
+      if (balanceConfig) updatedConfigs[String(accountId)] = balanceConfig;
+      else delete updatedConfigs[String(accountId)];
+      this.balanceConfigsById = updatedConfigs;
+
+      const queryResolution = sub2ResolveBalanceQuery(account, balanceConfig);
+      const previousState = this.balanceStateById.get(accountId) || null;
+      const previousSuccess = previousState?.status === 'success' && previousState.result?.isValid
+        ? { result: previousState.result, queriedAt: previousState.queriedAt }
+        : previousState?.previousSuccess || null;
+      if (!queryResolution.query) {
+        this.balanceStateById.set(accountId, {
+          status: 'error',
+          error: queryResolution.error || '该账号尚未配置可用的余额查询方式。',
+          queriedAt: Date.now(),
+          previousSuccess,
+        });
         this.renderList();
         return;
       }
-      this.balanceConfigsById = {
-        ...this.balanceConfigsById,
-        [String(accountId)]: balanceConfig,
-      };
 
       this.balanceQueryingIds.add(accountId);
-      this.balanceStateById.set(accountId, { status: 'loading', startedAt: Date.now() });
+      this.balanceStateById.set(accountId, {
+        status: 'loading',
+        startedAt: Date.now(),
+        previousSuccess,
+      });
       // 查询期间暂停自动刷新，避免卡片重建影响本次明确的用户操作。
       this.refreshRequestSequence += 1;
       this.pendingRefresh = false;
       this.renderList();
+      let exportPayload = null;
+      let exportedAccount = null;
+      let apiKey = '';
       try {
-        const balanceResult = await sub2QueryUpstreamBalance(balanceConfig);
+        let balanceResult;
+        if (queryResolution.query.mode === 'auto') {
+          exportPayload = await sub2FetchSingleAccountDataExport(accountId);
+          const validatedExport = sub2ValidateExportedBalanceAccount(account, exportPayload);
+          if (validatedExport.error) throw new Error(validatedExport.error);
+          exportedAccount = validatedExport.exportedAccount;
+          try {
+            apiKey = exportedAccount.credentials.api_key;
+          } catch {
+            throw new Error('导出账号没有可用的 API Key。');
+          }
+          if (typeof apiKey !== 'string') apiKey = '';
+          else apiKey = apiKey.trim();
+          if (!apiKey || /\r|\n/.test(apiKey)) throw new Error('导出账号没有可用的 API Key。');
+          balanceResult = await sub2QueryAutomaticUpstreamBalance(validatedExport.descriptor, apiKey);
+        } else {
+          balanceResult = await sub2QueryUpstreamBalance(queryResolution.query.config);
+        }
         this.balanceStateById.set(accountId, {
           status: 'success',
           result: balanceResult,
           queriedAt: Date.now(),
         });
       } catch (error) {
-        const errorMessage = String(error?.message || error || '未知错误')
+        const rawErrorMessage = String(error?.message || error || '未知错误')
           .replace(/[\r\n]+/g, ' ')
           .slice(0, 300);
+        const errorMessage = apiKey
+          ? rawErrorMessage.split(apiKey).join('[已隐藏]')
+          : rawErrorMessage;
         this.balanceStateById.set(accountId, {
           status: 'error',
           error: errorMessage,
           queriedAt: Date.now(),
+          previousSuccess,
         });
       } finally {
+        if (exportedAccount?.credentials && sub2IsPlainObject(exportedAccount.credentials)) {
+          try {
+            exportedAccount.credentials.api_key = '';
+          } catch {
+            // The remaining local references are still discarded below.
+          }
+        }
+        apiKey = '';
+        exportedAccount = null;
+        exportPayload = null;
         this.balanceQueryingIds.delete(accountId);
         this.renderList();
       }
@@ -8590,11 +9168,22 @@
     sub2SupportsDailyQuota,
     sub2GetUpstreamBaseUrl,
     sub2GetUpstreamWebsiteUrl,
+    SUB2_BALANCE_PROTOCOL_BY_HOST,
+    sub2NormalizeAutomaticBalanceBaseUrl,
+    sub2BuildAutomaticBalanceDescriptor,
+    sub2ValidateExportedBalanceAccount,
     sub2BuildBalanceCredentialContext,
     sub2ParseBalanceConfig,
     sub2NormalizeStoredBalanceConfig,
     sub2BuildBalanceConfigStorageKey,
+    sub2ResolveBalanceQuery,
     sub2BuildBalanceRequest,
+    sub2BuildNewApiStatusRequest,
+    sub2BuildAutomaticBalanceRequestPlan,
+    sub2QueryUpstreamBalance,
+    sub2QueryAutomaticUpstreamBalance,
+    sub2ExtractNewApiQuotaPerUnit,
+    sub2ExtractNewApiTokenBalance,
     sub2ExtractBalanceResult,
     sub2BuildAccountUsageSnapshot,
     sub2FormatEstimatedBalanceHours,
