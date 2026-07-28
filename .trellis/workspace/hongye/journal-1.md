@@ -65,3 +65,26 @@ Released exclusive account editors, canonical audit rendering, route-scoped even
 ### Next Steps
 
 - Monitor the published userscript against the installed sub2api 0.1.165 Admin API.
+
+
+## Session 3: Complete automatic balance queries
+
+**Date**: 2026-07-28
+**Task**: Complete automatic balance queries
+**Branch**: `main`
+
+### Summary
+
+Implemented trusted-click single-account credential export, exact protocol routing, dynamic New API quota conversion, unlimited quota handling, and compatible automatic/manual settings; verified with fake-secret assertions and static security checks.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `799f253` | (see git log) |
+| `05cd1ed` | (see git log) |
+| `793cc0f` | (see git log) |
+
+### Status
+
+[OK] **Completed**
