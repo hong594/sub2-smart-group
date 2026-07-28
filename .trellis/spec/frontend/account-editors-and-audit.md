@@ -62,12 +62,15 @@ Sub2Controller.renderList(options?) -> void
 
 ### Balance Draft Boundary
 
-- A balance draft includes its positive account ID and follows the provider and
-  canonical-origin credential binding in `manual-balance-monitoring.md`.
+- A balance draft includes its positive account ID and an `auto` or `manual`
+  mode. Automatic mode contains no secret value; manual mode follows the
+  provider and canonical-origin binding in `manual-balance-monitoring.md`.
 - Switching, closing, filtering out the account, or losing the capability must
   blank password/token/user-ID DOM values and in-memory draft fields.
 - Saved credentials are never copied into the editor DOM. A draft can reuse a
   saved credential only through the existing exact provider/origin check.
+- Switching modes clears all typed secrets. Saving automatic mode persists only
+  mode plus threshold and overwrites any prior manual secret fields.
 
 ### Canonical Membership and Audit Data
 
@@ -114,7 +117,8 @@ Before release, Node assertions and static checks must cover:
 - Same-control close, cross-kind switch, and cross-account switch.
 - Filter/sort/view rebuild with a visible draft and filter removal with secret
   clearing.
-- Balance draft account/provider/origin isolation and failed-save retention.
+- Balance draft account/mode/provider/origin isolation, automatic secret
+  exclusion, and failed-save retention.
 - Late capacity/quota save completion after a switch or close-and-reopen of the
   same key; assert the newer editor instance remains active.
 - Object-form, primitive-ID, `account_groups`, duplicate, missing-name, and
