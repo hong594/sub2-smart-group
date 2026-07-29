@@ -277,6 +277,10 @@ Before release, fake-secret Node assertions and static checks must cover:
 - local import schema, hostname matching, exact-name disambiguation, threshold
   preservation, missing/conflict/complete/direct classification, sub2api
   non-import, cancellation, and secret-free summary/controller state;
+- authenticated browser evidence from the same tab that performed the import;
+  GM storage is shared across tabs, but each page keeps its own
+  `balanceConfigsById` summary cache, so another open tab must reload before
+  its buttons or counts are treated as post-import evidence;
 - `node --check sub2-smart-group.user.js`, focused CommonJS assertions,
   `git diff --check`, secret-pattern review, and temporary-test cleanup.
 
