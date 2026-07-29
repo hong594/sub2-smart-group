@@ -88,3 +88,25 @@ Implemented trusted-click single-account credential export, exact protocol routi
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: All API Hub balance import v2.7.1
+
+**Date**: 2026-07-29
+**Task**: All API Hub balance import v2.7.1
+**Branch**: `main`
+
+### Summary
+
+Implemented method-first balance setup and strict local import; recorded sanitized live validation for 31 New API and 12 direct sub2api configurations.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8d4b3e4545b4d900336cc0f8a246834f35fe3578` | (see git log) |
+| `f81235a` | (see git log) |
+
+### Status
+
+[OK] **Completed**

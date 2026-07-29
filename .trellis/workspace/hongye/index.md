@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 3
-- **Last Active**: 2026-07-28
+- **Total Sessions**: 4
+- **Last Active**: 2026-07-29
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~90 | Active |
+| `journal-1.md` | ~112 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 4 | 2026-07-29 | All API Hub balance import v2.7.1 | `8d4b3e4545b4d900336cc0f8a246834f35fe3578`, `f81235a` | `main` |
 | 3 | 2026-07-28 | Complete automatic balance queries | `799f253`, `05cd1ed`, `793cc0f` | `main` |
 | 2 | 2026-07-27 | Release v2.6.0 routing reliability and account tools | `b8613fc`, `7f7f789`, `3a0ef54`, `c43ab23`, `7f4996d`, `23a1bc5` | `main` |
 | 1 | 2026-07-27 | Release v2.5.0 manual balance monitoring | `7d4f1e3`, `ccf90a1` | `main` |
