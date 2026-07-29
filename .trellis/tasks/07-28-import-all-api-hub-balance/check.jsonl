@@ -1,0 +1,6 @@
+{"file":".trellis/spec/frontend/index.md","reason":"Verify frontend scope and documentation routing."}
+{"file":".trellis/spec/frontend/manual-balance-monitoring.md","reason":"Verify import, matching, GM persistence, trusted query, and secret handling."}
+{"file":".trellis/spec/frontend/account-editors-and-audit.md","reason":"Verify controller cache and balance draft remain secret-safe and compatible."}
+{"file":".trellis/spec/frontend/quality-guidelines.md","reason":"Run the established userscript syntax, focused assertion, and diff quality gate."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Verify the local file to GM storage flow does not leak into backend or network behavior."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Verify method, config, and missing-field decisions are centralized rather than duplicated across UI, import, and query paths."}

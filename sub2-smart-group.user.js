@@ -2,7 +2,7 @@
 // @name         Sub2 Smart Group
 // @name:zh-CN   Sub2 智能分组
 // @namespace    local.sub2.smart-group
-// @version      2.7.0
+// @version      2.7.1
 // @description  Sub2 account health, route history, reliability events, manual upstream balance queries, and protected controls (no active probing).
 // @description:zh-CN 为 sub2api 提供账号健康度、路由历史、可靠性事件、手动上游余额查询与受保护控制（不主动测活）
 // @license      MIT
@@ -95,11 +95,10 @@
   //   POST /api/v1/admin/accounts                       用户确认后创建一个已分组 API Key 账号
   //   GET  /api/v1/admin/accounts/data?ids=:id&include_proxies=false
   //                                                        用户点击后只导出当前账号凭据
-  // 外部余额查询（自动模式临时使用单账号导出的 Key；旧手工凭据仍兼容）：
+  // 外部余额查询（sub2api 临时使用单账号导出的 Key；New API 使用账号余额凭据）：
   //   GET  <allowlisted-origin>/v1/usage                 sub2api 余额
   //   GET  <allowlisted-origin>/api/status               New API quota 配置（不带凭据）
-  //   GET  <allowlisted-origin>/api/usage/token/          New API 模型 Key 余额
-  //   GET  <allowlisted-origin>/api/user/self             旧 New API AT + User ID 兼容
+  //   GET  <allowlisted-origin>/api/user/self             New API Access Token + User ID 账号余额
   // 用户脚本不调用任何 test / probe / 测活类接口。模型同步和账号识别/创建只会由用户明确点击触发；
   // OpenAI 创建后的 Responses 能力探测是官方 create 端点的后端异步副作用。健康度仍然只反映“真实流量触发的状态”。
   // ===========================================================================
@@ -169,7 +168,7 @@
   const SUB2_CAPACITY_HIGH_LOAD_RATIO = 0.8;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '2.7.0';
+    : '2.7.1';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -615,20 +614,20 @@
   function sub2BuildAutomaticBalanceDescriptor(account) {
     const accountId = Number(account?.id);
     if (!Number.isInteger(accountId) || accountId <= 0) {
-      return { descriptor: null, error: '账号 ID 无效，不能自动查询余额。' };
+      return { descriptor: null, error: '账号 ID 无效，不能安全绑定余额查询。' };
     }
 
     const accountType = String(account?.type || '').trim().toLowerCase();
     if (accountType !== 'apikey') {
-      return { descriptor: null, error: '只有 API Key 账号支持自动余额查询。' };
+      return { descriptor: null, error: '只有 API Key 账号支持当前余额查询。' };
     }
 
     const normalizedTarget = sub2NormalizeAutomaticBalanceBaseUrl(sub2GetUpstreamBaseUrl(account));
     if (!normalizedTarget.ok || !normalizedTarget.registered) {
-      return { descriptor: null, error: '该账号的 HTTPS 上游地址不在自动余额查询白名单中。' };
+      return { descriptor: null, error: '该账号的 HTTPS 上游地址未在余额协议注册表中。' };
     }
     if (!normalizedTarget.providerType) {
-      return { descriptor: null, error: '该账号域名尚无可靠余额协议，请使用手工兼容配置。' };
+      return { descriptor: null, error: '该账号域名尚无已确认的余额协议。' };
     }
 
     const name = String(account?.name || '').trim();
@@ -688,7 +687,7 @@
   function sub2ParseBalanceTarget(rawProviderType, rawBaseUrl) {
     const providerType = String(rawProviderType || '').trim().toLowerCase();
     if (providerType !== 'sub2api' && providerType !== 'newapi') {
-      return { target: null, error: '余额来源必须选择 sub2api 或 newapi。' };
+      return { target: null, error: '余额协议必须是 sub2api 或 newapi。' };
     }
 
     const normalizedBaseUrl = String(rawBaseUrl || '').trim();
@@ -750,7 +749,7 @@
       };
     }
     if (requestedMode && requestedMode !== 'manual') {
-      return { config: null, error: '余额查询模式无效。' };
+      return { config: null, error: '余额设置格式无效。' };
     }
 
     const parsedTarget = sub2ParseBalanceTarget(rawConfig?.type, rawConfig?.baseUrl);
@@ -764,16 +763,18 @@
       lowBalanceThreshold: parsedThreshold.value,
     };
     if (providerType === 'sub2api') {
-      const apiKey = String(rawConfig?.apiKey || '').trim();
+      const rawApiKey = String(rawConfig?.apiKey || '');
+      const apiKey = rawApiKey.trim();
       if (!apiKey) return { config: null, error: 'sub2api 余额查询需要 API Key。' };
-      if (/\r|\n/.test(apiKey)) return { config: null, error: 'API Key 不能包含换行符。' };
+      if (/\r|\n/.test(rawApiKey)) return { config: null, error: 'API Key 不能包含换行符。' };
       normalizedConfig.apiKey = apiKey;
     } else {
-      const accessToken = String(rawConfig?.accessToken || '').trim();
-      const userId = String(rawConfig?.userId || '').trim();
+      const rawAccessToken = String(rawConfig?.accessToken || '');
+      const accessToken = rawAccessToken.trim();
+      const userId = sub2NormalizePositiveIntegerText(rawConfig?.userId);
       if (!accessToken) return { config: null, error: 'newapi 余额查询需要 Access Token。' };
-      if (/\r|\n/.test(accessToken)) return { config: null, error: 'Access Token 不能包含换行符。' };
-      if (!/^\d+$/.test(userId) || Number(userId) <= 0) {
+      if (/\r|\n/.test(rawAccessToken)) return { config: null, error: 'Access Token 不能包含换行符。' };
+      if (!userId) {
         return { config: null, error: 'newapi User ID 必须是正整数。' };
       }
       normalizedConfig.accessToken = accessToken;
@@ -793,6 +794,372 @@
     }
     const parsedConfig = sub2ParseBalanceConfig(candidateConfig);
     return parsedConfig.error ? null : parsedConfig.config;
+  }
+
+  function sub2ClearBalanceConfigSecrets(config) {
+    if (!sub2IsPlainObject(config)) return;
+    try {
+      if (sub2HasOwnProperty(config, 'apiKey')) config.apiKey = '';
+      if (sub2HasOwnProperty(config, 'accessToken')) config.accessToken = '';
+      if (sub2HasOwnProperty(config, 'userId')) config.userId = '';
+    } catch {
+      // Remaining local references are still discarded by their boundary.
+    }
+  }
+
+  function sub2BuildBalanceConfigSummary(rawConfig) {
+    const normalizedConfig = sub2NormalizeStoredBalanceConfig(rawConfig);
+    if (!normalizedConfig) return null;
+    if (normalizedConfig.mode === 'auto') return { ...normalizedConfig };
+    const summary = {
+      mode: 'manual',
+      type: normalizedConfig.type,
+      baseUrl: normalizedConfig.baseUrl,
+      lowBalanceThreshold: normalizedConfig.lowBalanceThreshold,
+      hasStoredCredentials: true,
+    };
+    sub2ClearBalanceConfigSecrets(normalizedConfig);
+    return summary;
+  }
+
+  function sub2NormalizeBalanceConfigSummary(rawSummary) {
+    if (!sub2IsPlainObject(rawSummary)) return null;
+    const parsedThreshold = sub2ParseLowBalanceThreshold(rawSummary.lowBalanceThreshold);
+    if (parsedThreshold.error) return null;
+    if (rawSummary.mode === 'auto') {
+      return { mode: 'auto', lowBalanceThreshold: parsedThreshold.value };
+    }
+    if (rawSummary.mode !== 'manual' || rawSummary.hasStoredCredentials !== true) return null;
+    const parsedTarget = sub2ParseBalanceTarget(rawSummary.type, rawSummary.baseUrl);
+    if (parsedTarget.error) return null;
+    return {
+      mode: 'manual',
+      type: parsedTarget.target.type,
+      baseUrl: parsedTarget.target.baseUrl,
+      lowBalanceThreshold: parsedThreshold.value,
+      hasStoredCredentials: true,
+    };
+  }
+
+  function sub2BuildBalanceSetupState(account, storedConfigOrSummary = null) {
+    const storedSummary = storedConfigOrSummary
+      ? sub2BuildBalanceConfigSummary(storedConfigOrSummary)
+        || sub2NormalizeBalanceConfigSummary(storedConfigOrSummary)
+      : null;
+    const lowBalanceThreshold = storedSummary?.lowBalanceThreshold ?? null;
+    const unsupported = (message, origin = '') => ({
+      method: 'unsupported',
+      providerType: '',
+      origin,
+      requiredFields: [],
+      missingFields: [],
+      credentialState: 'unsupported',
+      queryAvailable: false,
+      lowBalanceThreshold,
+      message,
+    });
+
+    const accountId = Number(account?.id);
+    if (!Number.isInteger(accountId) || accountId <= 0) {
+      return unsupported('账号 ID 无效，无法确定余额查询方法。');
+    }
+    if (String(account?.type || '').trim().toLowerCase() !== 'apikey') {
+      return unsupported('只有 API Key 账号支持余额查询。');
+    }
+
+    const target = sub2NormalizeAutomaticBalanceBaseUrl(sub2GetUpstreamBaseUrl(account));
+    if (!target.ok) {
+      return unsupported('账号上游必须是无凭据、无查询参数且使用标准端口的 HTTPS 地址。');
+    }
+    if (!target.registered) {
+      return unsupported('该上游未在余额协议注册表中，无法确定查询方法。', target.origin);
+    }
+    if (!target.providerType) {
+      return unsupported('该上游尚无已确认的余额协议，不会猜测或探测。', target.origin);
+    }
+
+    if (target.providerType === 'sub2api') {
+      const descriptor = sub2BuildAutomaticBalanceDescriptor(account);
+      const queryAvailable = !descriptor.error;
+      return {
+        method: 'sub2api-key',
+        providerType: 'sub2api',
+        origin: target.origin,
+        requiredFields: [],
+        missingFields: [],
+        credentialState: 'direct',
+        queryAvailable,
+        lowBalanceThreshold,
+        message: queryAvailable
+          ? '可直接使用 sub2 中当前账号已保存的模型 API Key。'
+          : descriptor.error,
+      };
+    }
+
+    const complete = storedSummary?.mode === 'manual'
+      && storedSummary.type === 'newapi'
+      && storedSummary.baseUrl === target.origin
+      && storedSummary.hasStoredCredentials === true;
+    const credentialState = complete ? 'complete' : storedSummary ? 'conflict' : 'missing';
+    return {
+      method: 'newapi-account',
+      providerType: 'newapi',
+      origin: target.origin,
+      requiredFields: ['accessToken', 'userId'],
+      missingFields: complete ? [] : ['accessToken', 'userId'],
+      credentialState,
+      queryAvailable: complete,
+      lowBalanceThreshold,
+      message: complete
+        ? '账号余额信息已齐全。'
+        : credentialState === 'conflict'
+          ? '已存设置与当前 New API 账号余额方法不一致，需要补充当前方法的信息。'
+          : '需要补充 New API 账号余额所需信息。',
+    };
+  }
+
+  function sub2BuildBalanceSetupSaveConfig(account, storedConfig, draft = {}) {
+    const setupState = sub2BuildBalanceSetupState(account, storedConfig);
+    if (setupState.method === 'unsupported') {
+      return { config: null, setupState, error: setupState.message };
+    }
+    const parsedThreshold = sub2ParseLowBalanceThreshold(draft.lowBalanceThreshold);
+    if (parsedThreshold.error) return { config: null, setupState, error: parsedThreshold.error };
+
+    let normalizedStored = storedConfig ? sub2NormalizeStoredBalanceConfig(storedConfig) : null;
+    try {
+      if (setupState.method === 'sub2api-key') {
+        return {
+          config: normalizedStored
+            ? { ...normalizedStored, lowBalanceThreshold: parsedThreshold.value }
+            : { mode: 'auto', lowBalanceThreshold: parsedThreshold.value },
+          setupState,
+          error: '',
+        };
+      }
+
+      if (setupState.credentialState === 'complete') {
+        if (!normalizedStored
+          || normalizedStored.mode !== 'manual'
+          || normalizedStored.type !== 'newapi'
+          || normalizedStored.baseUrl !== setupState.origin) {
+          return { config: null, setupState, error: '已存余额凭据无法安全读取，请重新打开设置。' };
+        }
+        return {
+          config: { ...normalizedStored, lowBalanceThreshold: parsedThreshold.value },
+          setupState,
+          error: '',
+        };
+      }
+
+      const candidate = {
+        mode: 'manual',
+        type: 'newapi',
+        baseUrl: setupState.origin,
+        accessToken: draft.accessToken,
+        userId: draft.userId,
+        lowBalanceThreshold: parsedThreshold.value,
+      };
+      const parsedConfig = sub2ParseBalanceConfig(candidate);
+      sub2ClearBalanceConfigSecrets(candidate);
+      return { config: parsedConfig.config, setupState, error: parsedConfig.error };
+    } finally {
+      sub2ClearBalanceConfigSecrets(normalizedStored);
+      normalizedStored = null;
+    }
+  }
+
+  function sub2NormalizePositiveIntegerText(rawValue) {
+    if (typeof rawValue === 'number') {
+      return Number.isSafeInteger(rawValue) && rawValue > 0 ? String(rawValue) : '';
+    }
+    if (typeof rawValue !== 'string') return '';
+    const normalizedValue = rawValue.trim();
+    if (!/^\d+$/.test(normalizedValue)) return '';
+    const numericValue = Number(normalizedValue);
+    return Number.isSafeInteger(numericValue) && numericValue > 0 ? normalizedValue : '';
+  }
+
+  function sub2NormalizeAllApiHubImportEntry(rawEntry) {
+    if (!sub2IsPlainObject(rawEntry) || rawEntry.disabled !== false) return null;
+    if (typeof rawEntry.site_name !== 'string'
+      || typeof rawEntry.site_url !== 'string'
+      || typeof rawEntry.site_type !== 'string') return null;
+    const siteName = rawEntry.site_name.trim();
+    if (!siteName) return null;
+    const normalizedTarget = sub2NormalizeAutomaticBalanceBaseUrl(rawEntry.site_url);
+    if (!normalizedTarget.ok) return null;
+    const siteType = rawEntry.site_type === 'new-api'
+      ? 'newapi'
+      : rawEntry.site_type === 'sub2api'
+        ? 'sub2api'
+        : '';
+    if (!siteType) return null;
+    const candidate = {
+      siteName,
+      hostname: normalizedTarget.hostname,
+      origin: normalizedTarget.origin,
+      siteType,
+    };
+    const accountInfo = rawEntry.account_info;
+    if (!sub2IsPlainObject(accountInfo)) return null;
+    // A sub2api backup token is not a model API Key. Do not even read that
+    // property while planning; the existing single-account export path owns it.
+    if (siteType === 'sub2api') return candidate;
+
+    const rawAccessToken = typeof accountInfo.access_token === 'string' ? accountInfo.access_token : '';
+    const accessToken = rawAccessToken.trim();
+    const userId = sub2NormalizePositiveIntegerText(accountInfo.id);
+    if (!accessToken || /\r|\n/.test(rawAccessToken) || !userId) return null;
+    return {
+      ...candidate,
+      accessToken,
+      userId,
+    };
+  }
+
+  function sub2BuildAllApiHubImportAccountDescriptor(account) {
+    if (!sub2IsPlainObject(account)) return null;
+    const accountIdText = sub2NormalizePositiveIntegerText(account.id);
+    if (!accountIdText
+      || typeof account.type !== 'string'
+      || account.type.trim().toLowerCase() !== 'apikey') return null;
+    const normalizedTarget = sub2NormalizeAutomaticBalanceBaseUrl(sub2GetUpstreamBaseUrl(account));
+    if (!normalizedTarget.ok || !normalizedTarget.registered || !normalizedTarget.providerType) return null;
+    return {
+      accountId: Number(accountIdText),
+      name: typeof account.name === 'string' ? account.name.trim() : '',
+      hostname: normalizedTarget.hostname,
+      providerType: normalizedTarget.providerType,
+    };
+  }
+
+  function sub2BuildAllApiHubBalanceImportPlan(rawBackup, accounts, existingConfigById = {}) {
+    const emptySummary = () => ({
+      missing: 0,
+      conflict: 0,
+      complete: 0,
+      directSub2api: 0,
+      ambiguous: 0,
+      unmatched: 0,
+      skipped: 0,
+    });
+    if (!sub2IsPlainObject(rawBackup)
+      || !sub2IsPlainObject(rawBackup.accounts)
+      || !Array.isArray(rawBackup.accounts.accounts)) {
+      return {
+        writes: [],
+        summary: emptySummary(),
+        error: '余额备份格式无效，未写入任何设置。',
+      };
+    }
+
+    const summary = emptySummary();
+    const candidatesByHost = new Map();
+    for (const rawEntry of rawBackup.accounts.accounts) {
+      const candidate = sub2NormalizeAllApiHubImportEntry(rawEntry);
+      if (!candidate) {
+        summary.skipped += 1;
+        continue;
+      }
+      const hostCandidates = candidatesByHost.get(candidate.hostname) || [];
+      hostCandidates.push(candidate);
+      candidatesByHost.set(candidate.hostname, hostCandidates);
+    }
+
+    const writes = [];
+    for (const account of Array.isArray(accounts) ? accounts : []) {
+      const accountDescriptor = sub2BuildAllApiHubImportAccountDescriptor(account);
+      if (!accountDescriptor) {
+        summary.skipped += 1;
+        continue;
+      }
+      const { accountId } = accountDescriptor;
+      const hostCandidates = candidatesByHost.get(accountDescriptor.hostname) || [];
+      if (!hostCandidates.length) {
+        summary.unmatched += 1;
+        continue;
+      }
+      let matchedCandidate = null;
+      if (hostCandidates.length === 1) {
+        matchedCandidate = hostCandidates[0];
+      } else {
+        const exactNameMatches = hostCandidates.filter(
+          (candidate) => candidate.siteName === accountDescriptor.name,
+        );
+        if (exactNameMatches.length !== 1) {
+          summary.ambiguous += 1;
+          continue;
+        }
+        matchedCandidate = exactNameMatches[0];
+      }
+      if (matchedCandidate.siteType !== accountDescriptor.providerType) {
+        summary.skipped += 1;
+        continue;
+      }
+      if (matchedCandidate.siteType === 'sub2api') {
+        summary.directSub2api += 1;
+        continue;
+      }
+
+      const existingConfig = existingConfigById?.[String(accountId)] || null;
+      const existingSummary = sub2BuildBalanceConfigSummary(existingConfig)
+        || sub2NormalizeBalanceConfigSummary(existingConfig);
+      const setupState = sub2BuildBalanceSetupState(account, existingSummary);
+      if (setupState.credentialState === 'complete') {
+        summary.complete += 1;
+        continue;
+      }
+      const reason = setupState.credentialState === 'conflict' ? 'conflict' : 'missing';
+      const config = {
+        mode: 'manual',
+        type: 'newapi',
+        baseUrl: matchedCandidate.origin,
+        accessToken: matchedCandidate.accessToken,
+        userId: matchedCandidate.userId,
+        lowBalanceThreshold: existingSummary?.lowBalanceThreshold ?? null,
+      };
+      const parsedConfig = sub2ParseBalanceConfig(config);
+      sub2ClearBalanceConfigSecrets(config);
+      if (parsedConfig.error) {
+        summary.skipped += 1;
+        continue;
+      }
+      writes.push({
+        accountId,
+        config: parsedConfig.config,
+        reason,
+      });
+      summary[reason] += 1;
+    }
+    return { writes, summary, error: '' };
+  }
+
+  function sub2FormatAllApiHubBalanceImportPreview(summary) {
+    const counts = summary || {};
+    return [
+      '余额设置导入预览',
+      `将补充 ${Number(counts.missing) || 0} 个，将纠正 ${Number(counts.conflict) || 0} 个`,
+      `信息已齐全 ${Number(counts.complete) || 0} 个，可直接查询 ${Number(counts.directSub2api) || 0} 个`,
+      `跳过：歧义 ${Number(counts.ambiguous) || 0} 个、无匹配 ${Number(counts.unmatched) || 0} 个、其它无效 ${Number(counts.skipped) || 0} 个`,
+      '确认后只写入余额设置，不会立即查询余额。',
+    ].join('\n');
+  }
+
+  function sub2FormatAllApiHubBalanceImportResult(summary, savedCount, failedCount) {
+    const counts = summary || {};
+    return [
+      `余额设置导入完成：成功 ${Number(savedCount) || 0} 个，失败 ${Number(failedCount) || 0} 个。`,
+      `无需写入 ${(
+        (Number(counts.complete) || 0)
+        + (Number(counts.directSub2api) || 0)
+      )} 个；跳过 ${(
+        (Number(counts.ambiguous) || 0)
+        + (Number(counts.unmatched) || 0)
+        + (Number(counts.skipped) || 0)
+      )} 个。`,
+      '请在需要的账号上点击“查余额”验证结果。',
+    ].join('\n');
   }
 
   function sub2BuildBalanceConfigStorageKey(accountId, sub2Origin = null) {
@@ -840,33 +1207,50 @@
   }
 
   function sub2ResolveBalanceQuery(account, storedConfig = null) {
-    const normalizedConfig = storedConfig ? sub2NormalizeStoredBalanceConfig(storedConfig) : null;
-    if (normalizedConfig?.mode === 'manual') {
+    const setupState = sub2BuildBalanceSetupState(account, storedConfig);
+    const displayConfig = setupState.method === 'unsupported'
+      || (setupState.method === 'newapi-account' && !setupState.queryAvailable)
+      ? null
+      : {
+        mode: setupState.method === 'sub2api-key' ? 'auto' : 'manual',
+        type: setupState.providerType,
+        baseUrl: setupState.origin,
+        lowBalanceThreshold: setupState.lowBalanceThreshold,
+      };
+
+    if (setupState.method === 'sub2api-key') {
+      const descriptor = sub2BuildAutomaticBalanceDescriptor(account);
+      if (descriptor.error) {
+        return { query: null, displayConfig, setupState, error: descriptor.error };
+      }
       return {
-        query: { mode: 'manual', config: normalizedConfig },
-        displayConfig: normalizedConfig,
+        query: { mode: 'sub2api-key', descriptor: descriptor.descriptor },
+        displayConfig,
+        setupState,
         error: '',
       };
     }
 
-    const automatic = sub2BuildAutomaticBalanceDescriptor(account);
-    if (automatic.error) {
-      return {
-        query: null,
-        displayConfig: normalizedConfig,
-        error: automatic.error,
-      };
+    if (setupState.method !== 'newapi-account' || !setupState.queryAvailable) {
+      return { query: null, displayConfig, setupState, error: setupState.message };
     }
 
-    const automaticConfig = {
-      mode: 'auto',
-      type: automatic.descriptor.providerType,
-      baseUrl: automatic.descriptor.origin,
-      lowBalanceThreshold: normalizedConfig?.lowBalanceThreshold ?? null,
-    };
+    const normalizedConfig = storedConfig ? sub2NormalizeStoredBalanceConfig(storedConfig) : null;
+    if (normalizedConfig?.mode === 'manual'
+      && normalizedConfig.type === 'newapi'
+      && normalizedConfig.baseUrl === setupState.origin) {
+      return {
+        query: { mode: 'newapi-account', config: normalizedConfig },
+        displayConfig,
+        setupState,
+        error: '',
+      };
+    }
+    sub2ClearBalanceConfigSecrets(normalizedConfig);
     return {
-      query: { mode: 'auto', descriptor: automatic.descriptor, config: automaticConfig },
-      displayConfig: automaticConfig,
+      query: { mode: 'newapi-account', config: null, storedCredentials: true },
+      displayConfig,
+      setupState,
       error: '',
     };
   }
@@ -877,17 +1261,14 @@
 
     const balanceConfig = parsedConfig.config;
     if (balanceConfig.mode !== 'manual') {
-      return { request: null, config: null, error: '自动余额查询必须先安全导出当前账号凭据。' };
+      return { request: null, config: null, error: '当前余额查询方法必须先解析完整凭据。' };
     }
-    if (balanceConfig.type === 'sub2api') {
+    if (balanceConfig.type !== 'newapi') {
+      sub2ClearBalanceConfigSecrets(balanceConfig);
       return {
-        config: balanceConfig,
-        error: '',
-        request: {
-          url: `${balanceConfig.baseUrl}/v1/usage`,
-          method: 'GET',
-          headers: { Authorization: `Bearer ${balanceConfig.apiKey}` },
-        },
+        request: null,
+        config: null,
+        error: 'sub2api 固定使用 sub2 当前账号已保存的模型 API Key。',
       };
     }
     return {
@@ -935,42 +1316,6 @@
       return { isValid: false, quotaPerUnit: null, invalidMessage: 'New API 状态接口缺少有效 quota_per_unit。' };
     }
     return { isValid: true, quotaPerUnit, invalidMessage: '' };
-  }
-
-  function sub2ExtractNewApiTokenBalance(responsePayload, rawQuotaPerUnit) {
-    const quotaPerUnit = sub2ParseBalanceNumericValue(rawQuotaPerUnit);
-    if (quotaPerUnit === null || quotaPerUnit <= 0) {
-      return { isValid: false, invalidMessage: 'New API quota_per_unit 无效。' };
-    }
-    if (responsePayload?.code !== true || !sub2IsPlainObject(responsePayload.data)) {
-      return { isValid: false, invalidMessage: 'New API 模型 Key 用量响应无效。' };
-    }
-
-    const availableQuota = sub2ParseBalanceNumericValue(responsePayload.data.total_available);
-    const usedQuota = sub2ParseBalanceNumericValue(responsePayload.data.total_used);
-    const grantedQuota = sub2ParseBalanceNumericValue(responsePayload.data.total_granted);
-    if (availableQuota === null
-      || usedQuota === null
-      || grantedQuota === null
-      || availableQuota < 0
-      || usedQuota < 0
-      || grantedQuota < 0) {
-      return { isValid: false, invalidMessage: 'New API 模型 Key 用量字段缺失或无效。' };
-    }
-
-    const unlimited = responsePayload.data.unlimited_quota === true;
-    const expiresAt = sub2ParseBalanceNumericValue(responsePayload.data.expires_at);
-    return {
-      isValid: true,
-      unlimited,
-      provider: 'newapi',
-      planName: sub2SanitizeUpstreamText(responsePayload.data.name, 'API Key'),
-      remaining: unlimited ? null : availableQuota / quotaPerUnit,
-      used: usedQuota / quotaPerUnit,
-      total: grantedQuota / quotaPerUnit,
-      unit: 'USD',
-      expiresAt: expiresAt !== null && expiresAt >= 0 ? expiresAt : null,
-    };
   }
 
   function sub2ExtractBalanceResult(providerType, responsePayload, rawQuotaPerUnit = null) {
@@ -4232,8 +4577,8 @@
 
   function sub2BuildAutomaticBalanceRequestPlan(descriptor, rawApiKey) {
     const providerType = String(descriptor?.providerType || '').trim().toLowerCase();
-    if (providerType !== 'sub2api' && providerType !== 'newapi') {
-      return { plan: null, error: '账号余额协议不受支持。' };
+    if (providerType !== 'sub2api') {
+      return { plan: null, error: '只有 sub2api 余额方法使用 sub2 导出的模型 API Key。' };
     }
     const descriptorTarget = sub2NormalizeAutomaticBalanceBaseUrl(descriptor?.baseUrl);
     if (!descriptorTarget.ok
@@ -4250,39 +4595,18 @@
     }
 
     const apiKey = typeof rawApiKey === 'string' ? rawApiKey.trim() : '';
-    if (!apiKey || /\r|\n/.test(apiKey)) {
+    if (!apiKey || typeof rawApiKey !== 'string' || /\r|\n/.test(rawApiKey)) {
       return { plan: null, error: '导出账号没有可用的 API Key。' };
-    }
-
-    if (providerType === 'sub2api') {
-      return {
-        plan: {
-          providerType,
-          balanceRequest: {
-            url: `${target.target.baseUrl}/v1/usage`,
-            method: 'GET',
-            headers: { Authorization: `Bearer ${apiKey}` },
-            label: 'sub2api 余额接口',
-          },
-        },
-        error: '',
-      };
     }
 
     return {
       plan: {
         providerType,
-        statusRequest: {
-          url: `${target.target.baseUrl}/api/status`,
-          method: 'GET',
-          headers: { Accept: 'application/json' },
-          label: 'New API 状态接口',
-        },
         balanceRequest: {
-          url: `${target.target.baseUrl}/api/usage/token/`,
+          url: `${target.target.baseUrl}/v1/usage`,
           method: 'GET',
           headers: { Authorization: `Bearer ${apiKey}` },
-          label: 'New API 模型 Key 用量接口',
+          label: 'sub2api 余额接口',
         },
       },
       error: '',
@@ -4425,29 +4749,20 @@
         requestDefinition.request.headers.Authorization = '';
         requestDefinition.request.headers['New-Api-User'] = '';
       }
+      sub2ClearBalanceConfigSecrets(requestDefinition.config);
       statusRequest = null;
     }
   }
 
   async function sub2QueryAutomaticUpstreamBalance(descriptor, rawApiKey) {
-    let transientApiKey = typeof rawApiKey === 'string' ? rawApiKey.trim() : '';
+    let transientApiKey = typeof rawApiKey === 'string' ? rawApiKey : '';
     let requestPlan = null;
     try {
       const planned = sub2BuildAutomaticBalanceRequestPlan(descriptor, transientApiKey);
       if (planned.error) throw new Error(planned.error);
       requestPlan = planned.plan;
-      let quotaPerUnit = null;
-      if (requestPlan.providerType === 'newapi') {
-        const statusPayload = await sub2RequestBalanceJson(requestPlan.statusRequest);
-        const statusResult = sub2ExtractNewApiQuotaPerUnit(statusPayload);
-        if (!statusResult.isValid) throw new Error(statusResult.invalidMessage);
-        quotaPerUnit = statusResult.quotaPerUnit;
-      }
-
       const balancePayload = await sub2RequestBalanceJson(requestPlan.balanceRequest);
-      const balanceResult = requestPlan.providerType === 'newapi'
-        ? sub2ExtractNewApiTokenBalance(balancePayload, quotaPerUnit)
-        : sub2ExtractBalanceResult('sub2api', balancePayload);
+      const balanceResult = sub2ExtractBalanceResult('sub2api', balancePayload);
       if (!balanceResult.isValid) throw new Error(balanceResult.invalidMessage || '余额响应无效。');
       return balanceResult;
     } finally {
@@ -4903,6 +5218,10 @@
     #${SUB2_PANEL_ID} .sub2-refresh{height:30px;background:#2563eb;color:#fff;border:none;border-radius:8px;padding:0 12px;
       cursor:pointer;font-size:12px;font-weight:650;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-refresh:hover{background:#1d4ed8;}
+    #${SUB2_PANEL_ID} .sub2-balance-import{height:30px;background:#fff;border:1px solid #94a3b8;border-radius:8px;padding:0 10px;
+      color:#334155;cursor:pointer;font-size:12px;font-weight:650;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-balance-import:hover{background:#f1f5f9;}
+    #${SUB2_PANEL_ID} .sub2-balance-import:disabled{cursor:wait;opacity:.6;}
     #${SUB2_PANEL_ID} .sub2-list-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;
       padding:5px 12px;border-bottom:1px solid #f1f5f9;background:#fcfdff;}
     #${SUB2_PANEL_ID} .sub2-list-count{color:#64748b;font-size:10px;}
@@ -5211,6 +5530,8 @@
       this.summaryElement = null;
       this.statusElement = null;
       this.searchElement = null;
+      this.balanceImportButtonElement = null;
+      this.balanceImportInputElement = null;
       this.viewElement = null;
       this.sortElement = null;
       this.groupElement = null;
@@ -5243,6 +5564,7 @@
       this.loadedBalanceConfigIds = new Set();
       this.balanceStateById = new Map();
       this.balanceQueryingIds = new Set();
+      this.balanceImportPending = false;
       this.recentRequest = null;
       this.requestHistory = [];
       this.selectedDiagnosticsRequestKey = '';
@@ -5403,6 +5725,8 @@
           <div class="sub2-search-row">
             <input type="text" class="sub2-account-search" placeholder="搜索账号 / 平台 / 分组…" />
             <button class="sub2-refresh">刷新</button>
+            <button type="button" class="sub2-balance-import">导入余额</button>
+            <input type="file" class="sub2-balance-import-input" accept=".json,application/json" hidden />
           </div>
           <div class="sub2-filter-grid">
             <div class="sub2-groupfilter">
@@ -5553,6 +5877,8 @@
       this.clearFiltersButtonElement = this.root.querySelector('.sub2-clear-filters');
       this.statusElement = this.root.querySelector('.sub2-status');
       this.searchElement = this.root.querySelector('.sub2-account-search');
+      this.balanceImportButtonElement = this.root.querySelector('.sub2-balance-import');
+      this.balanceImportInputElement = this.root.querySelector('.sub2-balance-import-input');
       this.viewElement = this.root.querySelector('.sub2-view');
       this.sortElement = this.root.querySelector('.sub2-sort');
       this.groupFilterEl = this.root.querySelector('.sub2-groupfilter');
@@ -5600,6 +5926,16 @@
       this.root.querySelector('.sub2-events-open')?.addEventListener('click', () => this.openEventsDrawer());
       this.root.querySelector('.sub2-diagnostics-open')?.addEventListener('click', () => this.openDiagnosticsDrawer());
       this.root.querySelector('.sub2-refresh').addEventListener('click', () => this.refresh());
+      this.balanceImportButtonElement?.addEventListener('click', (event) => {
+        if (!event.isTrusted || this.balanceImportPending || !this.balanceImportInputElement) return;
+        if (this.isAccountInteractionActive()) {
+          window.alert('请先完成或取消当前账号操作，再导入余额设置。');
+          return;
+        }
+        this.balanceImportInputElement.value = '';
+        this.balanceImportInputElement.click();
+      });
+      this.balanceImportInputElement?.addEventListener('change', (event) => this.handleBalanceImport(event));
       this.clearFiltersButtonElement?.addEventListener('click', () => this.clearAllFilters());
       this.searchElement.addEventListener('input', () => {
         this.filterText = this.searchElement.value.trim().toLocaleLowerCase();
@@ -5693,22 +6029,20 @@
     createAccountEditorDraft(account, kind, options = {}) {
       const accountId = Number(account?.id);
       if (kind === 'balance') {
-        const currentConfig = this.getBalanceConfig(accountId);
-        const automatic = sub2BuildAutomaticBalanceDescriptor(account);
-        const mode = currentConfig?.mode || (automatic.descriptor ? 'auto' : 'manual');
+        const setupState = sub2BuildBalanceSetupState(account, this.getBalanceConfig(accountId));
         return {
           accountId,
-          mode,
-          type: currentConfig?.type || automatic.descriptor?.providerType || 'sub2api',
-          baseUrl: currentConfig?.baseUrl || sub2GetUpstreamWebsiteUrl(account).replace(/\/$/, ''),
-          lowBalanceThreshold: currentConfig?.lowBalanceThreshold === null
-            || currentConfig?.lowBalanceThreshold === undefined
+          method: setupState.method,
+          providerType: setupState.providerType,
+          origin: setupState.origin,
+          credentialState: setupState.credentialState,
+          missingFields: [...setupState.missingFields],
+          lowBalanceThreshold: setupState.lowBalanceThreshold === null
+            || setupState.lowBalanceThreshold === undefined
             ? ''
-            : String(currentConfig.lowBalanceThreshold),
-          apiKey: '',
+            : String(setupState.lowBalanceThreshold),
           accessToken: '',
           userId: '',
-          credentialContexts: { apiKey: '', accessToken: '', userId: '' },
         };
       }
       if (kind === 'capacity') {
@@ -5732,10 +6066,8 @@
         inputElement.value = '';
       }
       if (this.activeEditor.kind === 'balance' && this.activeEditor.draft) {
-        this.activeEditor.draft.apiKey = '';
         this.activeEditor.draft.accessToken = '';
         this.activeEditor.draft.userId = '';
-        this.activeEditor.draft.credentialContexts = { apiKey: '', accessToken: '', userId: '' };
       }
       this.activeEditor.draft = null;
       this.activeEditor = null;
@@ -5756,7 +6088,9 @@
 
       this.discardActiveEditorDraft();
       const draft = this.createAccountEditorDraft(account, target.kind, options);
-      const focusField = target.kind === 'balance' ? 'mode' : 'value';
+      const focusField = target.kind === 'balance'
+        ? draft.missingFields?.[0] || (draft.method === 'unsupported' ? '' : 'threshold')
+        : 'value';
       this.activeEditor = {
         ...target,
         draft,
@@ -5884,6 +6218,7 @@
     isAccountInteractionActive() {
       return this.quotaSaving
         || this.capacitySaving
+        || this.balanceImportPending
         || this.balanceQueryingIds.size > 0
         || this.accountCreateOpen
         || this.hasOpenQuotaEditor()
@@ -6432,11 +6767,14 @@
           sub2FetchAccounts(),
           sub2FetchGroups().catch(() => null),
         ]);
+        if (requestSequence !== this.refreshRequestSequence || this.isAccountInteractionActive()) return;
         for (const account of accounts) {
           const accountId = Number(account?.id);
           if (!Number.isInteger(accountId) || accountId <= 0 || this.loadedBalanceConfigIds.has(accountId)) continue;
           const balanceConfig = sub2LoadBalanceConfig(accountId);
-          if (balanceConfig) this.balanceConfigsById[String(accountId)] = balanceConfig;
+          const balanceSummary = sub2BuildBalanceConfigSummary(balanceConfig);
+          if (balanceSummary) this.balanceConfigsById[String(accountId)] = balanceSummary;
+          sub2ClearBalanceConfigSecrets(balanceConfig);
           this.loadedBalanceConfigIds.add(accountId);
         }
         const ids = accounts.map((account) => account.id).filter((id) => Number.isFinite(Number(id)));
@@ -6841,16 +7179,19 @@
       const normalizedAccountId = Number(account?.id);
       try {
         sub2SaveBalanceConfig(normalizedAccountId, parsedConfig.config);
-      } catch (error) {
-        return { config: null, error: error?.message || String(error) };
+      } catch {
+        sub2ClearBalanceConfigSecrets(parsedConfig.config);
+        return { config: null, error: 'Tampermonkey 私密存储写入失败，未保存余额凭据。' };
       }
+      const balanceSummary = sub2BuildBalanceConfigSummary(parsedConfig.config);
+      sub2ClearBalanceConfigSecrets(parsedConfig.config);
       this.balanceConfigsById = {
         ...this.balanceConfigsById,
-        [String(normalizedAccountId)]: parsedConfig.config,
+        [String(normalizedAccountId)]: balanceSummary,
       };
       this.loadedBalanceConfigIds.add(normalizedAccountId);
       this.balanceStateById.delete(normalizedAccountId);
-      return { config: parsedConfig.config, error: '' };
+      return { config: balanceSummary, error: '' };
     }
 
     clearBalanceConfig(accountId) {
@@ -6934,8 +7275,9 @@
     buildBalanceControls(account, busy) {
       const accountId = Number(account.id);
       const currentConfig = this.getBalanceConfig(accountId);
-      const automatic = sub2BuildAutomaticBalanceDescriptor(account);
       const queryResolution = this.getBalanceResolution(account);
+      const setupState = queryResolution.setupState
+        || sub2BuildBalanceSetupState(account, currentConfig);
       const activeBalanceDraft = this.isAccountEditorActive(accountId, 'balance')
         ? this.activeEditor.draft
         : null;
@@ -6949,22 +7291,31 @@
       queryButton.className = 'sub2-btn primary';
       queryButton.textContent = balanceQuerying
         ? '查询中…'
-        : queryResolution.query ? '查余额' : '配置余额';
-      queryButton.title = queryResolution.query?.mode === 'auto'
-        ? '本次点击会单账号导出并临时使用 sub2 已保存的 Key 查询余额'
-        : queryResolution.query
-          ? '本次点击会使用该账号的手工兼容配置查询余额'
-          : queryResolution.error;
-      queryButton.disabled = busy || balanceQuerying;
+        : setupState.queryAvailable
+          ? '查余额'
+          : setupState.method === 'newapi-account'
+            ? '补充信息'
+            : '不可查询';
+      queryButton.title = setupState.method === 'sub2api-key' && setupState.queryAvailable
+        ? '本次点击会单账号导出并临时使用 sub2 已保存的模型 API Key'
+        : setupState.method === 'newapi-account' && setupState.queryAvailable
+          ? '本次点击会使用已存的 New API 账号余额信息'
+          : setupState.message;
+      queryButton.disabled = busy
+        || balanceQuerying
+        || (setupState.method !== 'newapi-account' && !setupState.queryAvailable);
       actionButtons.push(queryButton);
 
       const settingsButton = document.createElement('button');
       settingsButton.type = 'button';
       settingsButton.className = 'sub2-btn';
       settingsButton.textContent = '余额设置';
-      settingsButton.title = '修改余额查询模式、低余额阈值或手工兼容配置';
+      settingsButton.title = '查看已确定的余额方法、信息状态和低余额阈值';
       settingsButton.disabled = busy || balanceQuerying;
-      if (currentConfig || automatic.descriptor) actionButtons.push(settingsButton);
+      const canOpenBalanceSetup = Number.isInteger(accountId)
+        && accountId > 0
+        && String(account?.type || '').trim().toLowerCase() === 'apikey';
+      if (canOpenBalanceSetup) actionButtons.push(settingsButton);
 
       const editor = document.createElement('div');
       editor.className = 'sub2-balance-editor';
@@ -6974,7 +7325,17 @@
 
       const editorTitle = document.createElement('div');
       editorTitle.className = 'sub2-balance-editor-title';
-      editorTitle.textContent = '账号余额来源';
+      editorTitle.textContent = setupState.method === 'sub2api-key'
+        ? 'sub2api 模型 Key 余额'
+        : setupState.method === 'newapi-account'
+          ? 'New API 账号余额'
+          : '无法确定余额查询方法';
+
+      const methodNotice = document.createElement('div');
+      methodNotice.className = 'sub2-balance-notice';
+      methodNotice.textContent = setupState.origin
+        ? `${setupState.origin} · ${setupState.message}`
+        : setupState.message;
 
       const createBalanceField = (labelText, inputElement, fullWidth = false) => {
         const field = document.createElement('label');
@@ -6985,31 +7346,6 @@
         return field;
       };
 
-      const modeSelect = document.createElement('select');
-      const automaticOption = document.createElement('option');
-      automaticOption.value = 'auto';
-      automaticOption.textContent = '自动使用 sub2 已保存的 Key';
-      automaticOption.disabled = !automatic.descriptor;
-      const manualOption = document.createElement('option');
-      manualOption.value = 'manual';
-      manualOption.textContent = '手工兼容配置';
-      modeSelect.append(automaticOption, manualOption);
-      modeSelect.value = balanceDraft.mode === 'auto' ? 'auto' : 'manual';
-      this.trackAccountEditorField(modeSelect, 'mode');
-      const modeField = createBalanceField('查询方式', modeSelect, true);
-
-      const providerSelect = document.createElement('select');
-      const sub2apiOption = document.createElement('option');
-      sub2apiOption.value = 'sub2api';
-      sub2apiOption.textContent = 'sub2api';
-      const newapiOption = document.createElement('option');
-      newapiOption.value = 'newapi';
-      newapiOption.textContent = 'newapi';
-      providerSelect.append(sub2apiOption, newapiOption);
-      providerSelect.value = balanceDraft.type || 'sub2api';
-      this.trackAccountEditorField(providerSelect, 'provider');
-      const providerField = createBalanceField('来源类型', providerSelect);
-
       const thresholdInput = document.createElement('input');
       thresholdInput.type = 'number';
       thresholdInput.min = '0';
@@ -7019,31 +7355,9 @@
       this.trackAccountEditorField(thresholdInput, 'threshold');
       const thresholdField = createBalanceField('低余额阈值（余额单位）', thresholdInput);
 
-      const baseUrlInput = document.createElement('input');
-      baseUrlInput.type = 'url';
-      baseUrlInput.placeholder = 'https://example.com';
-      baseUrlInput.autocomplete = 'off';
-      baseUrlInput.spellcheck = false;
-      baseUrlInput.value = balanceDraft.baseUrl || '';
-      this.trackAccountEditorField(baseUrlInput, 'baseUrl');
-      const baseUrlField = createBalanceField('HTTPS 上游站点根地址', baseUrlInput, true);
-
-      const apiKeyInput = document.createElement('input');
-      apiKeyInput.type = 'password';
-      apiKeyInput.placeholder = currentConfig?.type === 'sub2api'
-        ? '已保存；留空保持不变'
-        : 'sub2api API Key';
-      apiKeyInput.autocomplete = 'new-password';
-      apiKeyInput.spellcheck = false;
-      apiKeyInput.value = activeBalanceDraft?.apiKey || '';
-      this.trackAccountEditorField(apiKeyInput, 'apiKey');
-      const apiKeyField = createBalanceField('API Key', apiKeyInput, true);
-
       const accessTokenInput = document.createElement('input');
       accessTokenInput.type = 'password';
-      accessTokenInput.placeholder = currentConfig?.type === 'newapi'
-        ? '已保存；留空保持不变'
-        : 'newapi Access Token（不是 sub2 API Key）';
+      accessTokenInput.placeholder = 'New API Access Token';
       accessTokenInput.autocomplete = 'new-password';
       accessTokenInput.spellcheck = false;
       accessTokenInput.value = activeBalanceDraft?.accessToken || '';
@@ -7053,9 +7367,7 @@
       const userIdInput = document.createElement('input');
       userIdInput.type = 'text';
       userIdInput.inputMode = 'numeric';
-      userIdInput.placeholder = currentConfig?.type === 'newapi'
-        ? '已保存；留空保持不变'
-        : 'newapi User ID';
+      userIdInput.placeholder = 'New API User ID';
       userIdInput.autocomplete = 'off';
       userIdInput.value = activeBalanceDraft?.userId || '';
       this.trackAccountEditorField(userIdInput, 'userId');
@@ -7080,6 +7392,8 @@
       cancelButton.type = 'button';
       cancelButton.className = 'sub2-btn';
       cancelButton.textContent = '取消';
+      saveButton.hidden = setupState.method === 'unsupported';
+      saveAndQueryButton.hidden = setupState.method === 'unsupported';
       editorActions.append(saveButton, saveAndQueryButton, clearButton, cancelButton);
 
       const securityNotice = document.createElement('div');
@@ -7088,86 +7402,41 @@
       editorMessage.className = 'sub2-balance-message';
       editorMessage.textContent = showBalanceEditor ? this.activeEditor?.message || '' : '';
 
-      const credentialInputs = { apiKey: apiKeyInput, accessToken: accessTokenInput, userId: userIdInput };
-      const credentialDraftContexts = activeBalanceDraft?.credentialContexts
-        || { apiKey: '', accessToken: '', userId: '' };
-      const getCurrentCredentialContext = () => modeSelect.value === 'manual'
-        ? sub2BuildBalanceCredentialContext(providerSelect.value, baseUrlInput.value)
-        : '';
-      const clearMismatchedCredentialDrafts = (clearAll = false) => {
-        const currentCredentialContext = getCurrentCredentialContext();
-        let clearedCredential = false;
-        for (const [credentialName, inputElement] of Object.entries(credentialInputs)) {
-          if (inputElement.value
-            && (clearAll || credentialDraftContexts[credentialName] !== currentCredentialContext)) {
-            inputElement.value = '';
-            clearedCredential = true;
-          }
-          if (!inputElement.value) credentialDraftContexts[credentialName] = '';
-          if (activeBalanceDraft) activeBalanceDraft[credentialName] = inputElement.value;
-        }
-        if (clearedCredential) {
-          this.setActiveEditorMessage('余额来源已变更，请重新输入对应凭据。', editorMessage);
-        }
-      };
-      const updateModeFields = () => {
-        const usesAutomatic = modeSelect.value === 'auto';
-        const usesSub2api = providerSelect.value === 'sub2api';
-        providerField.hidden = usesAutomatic;
-        baseUrlField.hidden = usesAutomatic;
-        apiKeyField.hidden = usesAutomatic || !usesSub2api;
-        accessTokenField.hidden = usesAutomatic || usesSub2api;
-        userIdField.hidden = usesAutomatic || usesSub2api;
-        securityNotice.textContent = usesAutomatic
-          ? '自动查询只在本次点击中单账号导出并临时使用 sub2 已保存的 Key；设置仅保存模式和低余额阈值。'
-          : '手工兼容凭据保存在 Tampermonkey 脚本存储中，不回填 DOM 或写入网页 localStorage、sub2、日志；仅点击查询时发送到所填白名单 HTTPS 域名。';
-      };
+      securityNotice.textContent = setupState.method === 'sub2api-key'
+        ? '低余额阈值与查询 Key 无关；Key 只在点击查询后从 sub2 单账号导出中临时读取。'
+        : setupState.method === 'newapi-account'
+          ? '已存凭据不回填页面；仅在点击查询时发送到当前已注册的 HTTPS 上游。'
+          : '没有已确认方法时不接收凭据、不导出 Key、不探测上游。';
       const openEditor = () => this.toggleAccountEditor(account, 'balance');
       const collectDraftConfig = () => {
-        if (!this.isAccountEditorActive(accountId, 'balance')) return null;
-        const draft = this.activeEditor.draft;
-        if (Number(draft?.accountId) !== accountId) return null;
-        if (draft.mode === 'auto') {
-          return {
-            mode: 'auto',
-            lowBalanceThreshold: draft.lowBalanceThreshold,
-          };
+        if (!this.isAccountEditorActive(accountId, 'balance')) {
+          return { config: null, error: '余额设置已关闭。' };
         }
-        const selectedProviderType = draft.type;
-        const latestPersistedConfig = sub2LoadBalanceConfig(accountId);
-        const finalCredentialContext = sub2BuildBalanceCredentialContext(draft.type, draft.baseUrl);
-        const persistedCredentialContext = latestPersistedConfig
-          ? sub2BuildBalanceCredentialContext(latestPersistedConfig.type, latestPersistedConfig.baseUrl)
-          : '';
-        const canReuseStoredCredentials = latestPersistedConfig?.mode === 'manual'
-          && Boolean(finalCredentialContext)
-          && persistedCredentialContext === finalCredentialContext;
-        const getBoundDraftCredential = (credentialName) => {
-          const inputValue = draft[credentialName];
-          return inputValue
-            && finalCredentialContext
-            && credentialDraftContexts[credentialName] === finalCredentialContext
-            ? inputValue
-            : '';
-        };
-        return {
-          mode: 'manual',
-          type: selectedProviderType,
-          baseUrl: draft.baseUrl,
-          lowBalanceThreshold: draft.lowBalanceThreshold,
-          apiKey: getBoundDraftCredential('apiKey')
-            || (canReuseStoredCredentials ? latestPersistedConfig?.apiKey : ''),
-          accessToken: getBoundDraftCredential('accessToken')
-            || (canReuseStoredCredentials ? latestPersistedConfig?.accessToken : ''),
-          userId: getBoundDraftCredential('userId')
-            || (canReuseStoredCredentials ? latestPersistedConfig?.userId : ''),
-        };
+        const draft = this.activeEditor.draft;
+        if (Number(draft?.accountId) !== accountId) {
+          return { config: null, error: '余额设置与当前账号不一致。' };
+        }
+        let latestPersistedConfig = sub2LoadBalanceConfig(accountId);
+        try {
+          return sub2BuildBalanceSetupSaveConfig(account, latestPersistedConfig, draft);
+        } finally {
+          sub2ClearBalanceConfigSecrets(latestPersistedConfig);
+          latestPersistedConfig = null;
+        }
       };
       const saveDraftConfig = (queryAfterSave, userEvent) => {
         if (!userEvent?.isTrusted) return;
-        const draftConfig = collectDraftConfig();
-        if (!draftConfig) return;
-        const saveResult = this.saveBalanceConfig(account, draftConfig);
+        const builtConfig = collectDraftConfig();
+        if (builtConfig.error || !builtConfig.config) {
+          this.setActiveEditorMessage(builtConfig.error || '余额设置无效。', editorMessage);
+          return;
+        }
+        let saveResult;
+        try {
+          saveResult = this.saveBalanceConfig(account, builtConfig.config);
+        } finally {
+          sub2ClearBalanceConfigSecrets(builtConfig.config);
+        }
         if (saveResult.error) {
           this.setActiveEditorMessage(saveResult.error, editorMessage);
           return;
@@ -7179,37 +7448,13 @@
         if (queryAfterSave) this.handleBalanceQuery(account, true);
       };
 
-      for (const [credentialName, inputElement] of Object.entries(credentialInputs)) {
+      for (const [credentialName, inputElement] of Object.entries({ accessToken: accessTokenInput, userId: userIdInput })) {
         inputElement.addEventListener('input', () => {
-          credentialDraftContexts[credentialName] = inputElement.value
-            ? getCurrentCredentialContext()
-            : '';
           if (this.isAccountEditorActive(accountId, 'balance')) {
             this.activeEditor.draft[credentialName] = inputElement.value;
-            this.activeEditor.draft.credentialContexts = credentialDraftContexts;
           }
         });
       }
-      modeSelect.addEventListener('change', () => {
-        if (this.isAccountEditorActive(accountId, 'balance')) {
-          this.activeEditor.draft.mode = modeSelect.value;
-        }
-        clearMismatchedCredentialDrafts(true);
-        updateModeFields();
-      });
-      providerSelect.addEventListener('change', () => {
-        if (this.isAccountEditorActive(accountId, 'balance')) {
-          this.activeEditor.draft.type = providerSelect.value;
-        }
-        clearMismatchedCredentialDrafts(true);
-        updateModeFields();
-      });
-      baseUrlInput.addEventListener('input', () => {
-        if (this.isAccountEditorActive(accountId, 'balance')) {
-          this.activeEditor.draft.baseUrl = baseUrlInput.value;
-        }
-        clearMismatchedCredentialDrafts();
-      });
       thresholdInput.addEventListener('input', () => {
         if (this.isAccountEditorActive(accountId, 'balance')) {
           this.activeEditor.draft.lowBalanceThreshold = thresholdInput.value;
@@ -7217,8 +7462,8 @@
       });
       queryButton.addEventListener('click', (event) => {
         if (!event.isTrusted) return;
-        if (queryResolution.query) this.handleBalanceQuery(account, true);
-        else openEditor();
+        if (setupState.queryAvailable) this.handleBalanceQuery(account, true);
+        else if (setupState.method === 'newapi-account') openEditor();
       });
       settingsButton.addEventListener('click', (event) => {
         if (event.isTrusted) openEditor();
@@ -7243,20 +7488,11 @@
         this.renderList({ captureEditorFocus: false });
         this.refresh();
       });
-      updateModeFields();
-      editor.append(
-        editorTitle,
-        modeField,
-        providerField,
-        thresholdField,
-        baseUrlField,
-        apiKeyField,
-        accessTokenField,
-        userIdField,
-        editorActions,
-        securityNotice,
-        editorMessage,
-      );
+      editor.append(editorTitle, methodNotice);
+      if (setupState.method !== 'unsupported') editor.append(thresholdField);
+      if (setupState.missingFields.includes('accessToken')) editor.append(accessTokenField);
+      if (setupState.missingFields.includes('userId')) editor.append(userIdField);
+      editor.append(editorActions, securityNotice, editorMessage);
       return { actionButtons, editor };
     }
 
@@ -8920,16 +9156,105 @@
       this.renderList();
     }
 
+    async handleBalanceImport(event) {
+      if (!event?.isTrusted || this.balanceImportPending) return;
+      let selectedFile = event.target?.files?.[0];
+      if (!selectedFile) return;
+      if (this.isAccountInteractionActive()) {
+        if (this.balanceImportInputElement) this.balanceImportInputElement.value = '';
+        window.alert('请先完成或取消当前账号操作，再导入余额设置。');
+        selectedFile = null;
+        return;
+      }
+      if (typeof selectedFile.name !== 'string' || !selectedFile.name.toLowerCase().endsWith('.json')) {
+        if (this.balanceImportInputElement) this.balanceImportInputElement.value = '';
+        window.alert('请选择 JSON 格式的余额备份文件。');
+        selectedFile = null;
+        return;
+      }
+      if (this.loading || !this.lastUpdatedAt) {
+        if (this.balanceImportInputElement) this.balanceImportInputElement.value = '';
+        window.alert('账号列表尚未加载完成，请稍后重试。');
+        selectedFile = null;
+        return;
+      }
+      this.balanceImportPending = true;
+      if (this.balanceImportButtonElement) this.balanceImportButtonElement.disabled = true;
+      let rawText = '';
+      let parsedBackup = null;
+      let importPlan = null;
+      let failureMessage = '';
+      try {
+        // Invalidate an already-running refresh before capturing the current
+        // account snapshot, so its later response cannot replace this plan's rows.
+        this.refreshRequestSequence += 1;
+        this.pendingRefresh = false;
+        try {
+          rawText = await selectedFile.text();
+          parsedBackup = JSON.parse(rawText);
+        } catch {
+          failureMessage = '余额备份文件无法解析，未写入任何设置。';
+          throw new Error('balance-import-parse-failed');
+        }
+        importPlan = sub2BuildAllApiHubBalanceImportPlan(
+          parsedBackup,
+          this.accounts,
+          this.balanceConfigsById,
+        );
+        if (importPlan.error) {
+          failureMessage = importPlan.error;
+          throw new Error('balance-import-schema-failed');
+        }
+        if (!window.confirm(sub2FormatAllApiHubBalanceImportPreview(importPlan.summary))) return;
+
+        let savedCount = 0;
+        let failedCount = 0;
+        for (const item of importPlan.writes) {
+          try {
+            const saveResult = this.saveBalanceConfig(
+              this.accounts.find((account) => Number(account?.id) === item.accountId) || { id: item.accountId },
+              item.config,
+            );
+            if (saveResult.error) failedCount += 1;
+            else savedCount += 1;
+          } catch {
+            failedCount += 1;
+          } finally {
+            sub2ClearBalanceConfigSecrets(item.config);
+          }
+        }
+        this.renderList({ captureEditorFocus: false });
+        window.alert(sub2FormatAllApiHubBalanceImportResult(importPlan.summary, savedCount, failedCount));
+      } catch {
+        window.alert(failureMessage || '余额设置导入失败，未完成写入。');
+      } finally {
+        if (Array.isArray(importPlan?.writes)) {
+          for (const item of importPlan.writes) sub2ClearBalanceConfigSecrets(item?.config);
+        }
+        rawText = '';
+        parsedBackup = null;
+        importPlan = null;
+        failureMessage = '';
+        selectedFile = null;
+        if (this.balanceImportInputElement) this.balanceImportInputElement.value = '';
+        this.balanceImportPending = false;
+        if (this.balanceImportButtonElement) this.balanceImportButtonElement.disabled = false;
+      }
+    }
+
     async handleBalanceQuery(account, userInitiated = false) {
       const accountId = Number(account?.id);
       if (userInitiated !== true || this.balanceQueryingIds.has(accountId)) return;
-      const balanceConfig = sub2LoadBalanceConfig(accountId);
+      let balanceConfig = sub2LoadBalanceConfig(accountId);
+      const balanceSummary = sub2BuildBalanceConfigSummary(balanceConfig);
       const updatedConfigs = { ...this.balanceConfigsById };
-      if (balanceConfig) updatedConfigs[String(accountId)] = balanceConfig;
+      if (balanceSummary) updatedConfigs[String(accountId)] = balanceSummary;
       else delete updatedConfigs[String(accountId)];
       this.balanceConfigsById = updatedConfigs;
 
-      const queryResolution = sub2ResolveBalanceQuery(account, balanceConfig);
+      let queryResolution = sub2ResolveBalanceQuery(account, balanceConfig);
+      sub2ClearBalanceConfigSecrets(balanceConfig);
+      balanceConfig = null;
       const previousState = this.balanceStateById.get(accountId) || null;
       const previousSuccess = previousState?.status === 'success' && previousState.result?.isValid
         ? { result: previousState.result, queriedAt: previousState.queriedAt }
@@ -8941,6 +9266,8 @@
           queriedAt: Date.now(),
           previousSuccess,
         });
+        sub2ClearBalanceConfigSecrets(queryResolution?.query?.config);
+        queryResolution = null;
         this.renderList();
         return;
       }
@@ -8960,7 +9287,7 @@
       let apiKey = '';
       try {
         let balanceResult;
-        if (queryResolution.query.mode === 'auto') {
+        if (queryResolution.query.mode === 'sub2api-key') {
           exportPayload = await sub2FetchSingleAccountDataExport(accountId);
           const validatedExport = sub2ValidateExportedBalanceAccount(account, exportPayload);
           if (validatedExport.error) throw new Error(validatedExport.error);
@@ -8970,12 +9297,14 @@
           } catch {
             throw new Error('导出账号没有可用的 API Key。');
           }
-          if (typeof apiKey !== 'string') apiKey = '';
+          if (typeof apiKey !== 'string' || /\r|\n/.test(apiKey)) apiKey = '';
           else apiKey = apiKey.trim();
-          if (!apiKey || /\r|\n/.test(apiKey)) throw new Error('导出账号没有可用的 API Key。');
+          if (!apiKey) throw new Error('导出账号没有可用的 API Key。');
           balanceResult = await sub2QueryAutomaticUpstreamBalance(validatedExport.descriptor, apiKey);
-        } else {
+        } else if (queryResolution.query.mode === 'newapi-account' && queryResolution.query.config) {
           balanceResult = await sub2QueryUpstreamBalance(queryResolution.query.config);
+        } else {
+          throw new Error('当前账号没有可用的余额查询信息。');
         }
         this.balanceStateById.set(accountId, {
           status: 'success',
@@ -8986,9 +9315,16 @@
         const rawErrorMessage = String(error?.message || error || '未知错误')
           .replace(/[\r\n]+/g, ' ')
           .slice(0, 300);
-        const errorMessage = apiKey
-          ? rawErrorMessage.split(apiKey).join('[已隐藏]')
-          : rawErrorMessage;
+        const secretValues = [
+          apiKey,
+          queryResolution?.query?.config?.apiKey,
+          queryResolution?.query?.config?.accessToken,
+          queryResolution?.query?.config?.userId,
+        ].filter((value) => typeof value === 'string' && value);
+        const errorMessage = secretValues.reduce(
+          (message, secretValue) => message.split(secretValue).join('[已隐藏]'),
+          rawErrorMessage,
+        );
         this.balanceStateById.set(accountId, {
           status: 'error',
           error: errorMessage,
@@ -8996,6 +9332,8 @@
           previousSuccess,
         });
       } finally {
+        sub2ClearBalanceConfigSecrets(queryResolution?.query?.config);
+        queryResolution = null;
         if (exportedAccount?.credentials && sub2IsPlainObject(exportedAccount.credentials)) {
           try {
             exportedAccount.credentials.api_key = '';
@@ -9175,6 +9513,13 @@
     sub2BuildBalanceCredentialContext,
     sub2ParseBalanceConfig,
     sub2NormalizeStoredBalanceConfig,
+    sub2BuildBalanceConfigSummary,
+    sub2NormalizeBalanceConfigSummary,
+    sub2BuildBalanceSetupState,
+    sub2BuildBalanceSetupSaveConfig,
+    sub2BuildAllApiHubBalanceImportPlan,
+    sub2FormatAllApiHubBalanceImportPreview,
+    sub2FormatAllApiHubBalanceImportResult,
     sub2BuildBalanceConfigStorageKey,
     sub2ResolveBalanceQuery,
     sub2BuildBalanceRequest,
@@ -9183,7 +9528,6 @@
     sub2QueryUpstreamBalance,
     sub2QueryAutomaticUpstreamBalance,
     sub2ExtractNewApiQuotaPerUnit,
-    sub2ExtractNewApiTokenBalance,
     sub2ExtractBalanceResult,
     sub2BuildAccountUsageSnapshot,
     sub2FormatEstimatedBalanceHours,

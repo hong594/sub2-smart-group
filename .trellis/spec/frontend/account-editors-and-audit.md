@@ -62,15 +62,23 @@ Sub2Controller.renderList(options?) -> void
 
 ### Balance Draft Boundary
 
-- A balance draft includes its positive account ID and an `auto` or `manual`
-  mode. Automatic mode contains no secret value; manual mode follows the
-  provider and canonical-origin binding in `manual-balance-monitoring.md`.
+- A balance draft includes its positive account ID plus account-derived
+  `method`, `providerType`, canonical `origin`, `credentialState`, and
+  `missingFields`. None of those fields is user-selectable.
+- The only editable balance fields are the optional low-balance threshold and
+  currently missing New API Access Token / User ID. A resolved sub2api method
+  has no credential field; an unsupported method has no credential or save-and-
+  query controls.
 - Switching, closing, filtering out the account, or losing the capability must
-  blank password/token/user-ID DOM values and in-memory draft fields.
-- Saved credentials are never copied into the editor DOM. A draft can reuse a
-  saved credential only through the existing exact provider/origin check.
-- Switching modes clears all typed secrets. Saving automatic mode persists only
-  mode plus threshold and overwrites any prior manual secret fields.
+  blank token/user-ID DOM values and in-memory draft fields.
+- Saved credentials are never copied into the editor DOM. A complete New API
+  summary renders no credential inputs; replacement requires explicit clear
+  followed by new input or import.
+- Threshold-only save reloads the full config at the save boundary, changes only
+  `lowBalanceThreshold`, and preserves hidden New API credentials or a legacy
+  sub2api config. The visible draft must never reconstruct hidden storage.
+- Closing, filtering, method capability changes, cancel, or a successful save
+  clears all typed secrets. A failed save retains the same bound draft for retry.
 
 ### Canonical Membership and Audit Data
 
@@ -92,6 +100,11 @@ Sub2Controller.renderList(options?) -> void
 | Different account or kind requested | Discard the old draft and render only the new editor |
 | Filter keeps the active account | Rebuild the list and retain draft/focus state |
 | Filter removes the active account | Clear the editor and unsaved sensitive values |
+| Account resolves to sub2api | Show method plus threshold; no credential input |
+| New API has exact complete config | Show complete state; do not render stored credentials |
+| New API is missing or conflicting | Show only required Access Token and User ID inputs |
+| Method is unsupported | Show fixed reason; no credential or save-and-query controls |
+| Threshold changes with hidden config | Merge threshold and preserve every hidden credential field |
 | Save fails | Keep the editor, draft, message, and retry path active |
 | Save succeeds or value is unchanged | Close the editor, then refresh server evidence |
 | Old save succeeds after switch or same-key reopen | Refresh evidence without closing the new editor instance |
@@ -101,7 +114,7 @@ Sub2Controller.renderList(options?) -> void
 
 ## 5. Good / Base / Bad Cases
 
-- Good: a user types a balance key, changes sorting, and the same account remains
+- Good: a user types a missing New API Access Token, changes sorting, and the same account remains
   visible with the same bound draft and focus location.
 - Base: a capacity editor is open and a filter hides the account; the editor
   closes and normal background refresh can resume.
@@ -117,8 +130,9 @@ Before release, Node assertions and static checks must cover:
 - Same-control close, cross-kind switch, and cross-account switch.
 - Filter/sort/view rebuild with a visible draft and filter removal with secret
   clearing.
-- Balance draft account/mode/provider/origin isolation, automatic secret
-  exclusion, and failed-save retention.
+- Balance draft account/method/origin isolation, sub2api secret exclusion,
+  New API missing-field rendering, complete-config non-fill, threshold merge,
+  and failed-save retention.
 - Late capacity/quota save completion after a switch or close-and-reopen of the
   same key; assert the newer editor instance remains active.
 - Object-form, primitive-ID, `account_groups`, duplicate, missing-name, and
