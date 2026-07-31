@@ -1,6 +1,6 @@
 # Sub2 Smart Group
 
-面向个人 sub2api 后台的 Tampermonkey 管理工具。它在不修改 sub2api 源码、前端文件或容器镜像的前提下，提供账号健康状态、客户端 Key 命中查询、真实路由记录、首字耗时、配置审计、优先级、日配额、手动余额查询、账号创建和分组感知模型管理能力。
+面向个人 sub2api 后台的 Tampermonkey 管理工具。它在不修改 sub2api 源码、前端文件或容器镜像的前提下，提供账号健康状态、真实请求中的客户端 Key 名称、真实路由记录、首字耗时、配置审计、优先级、日配额、手动余额查询、账号创建和分组感知模型管理能力。
 
 从 `v2.0.0` 开始，项目已经移除全部 AIHub 页面匹配和业务代码，成为纯 sub2 专属工具。原有 `sub2-smart-group:` 存储键、GitHub Raw 更新地址和 userscript namespace 保持不变，升级后已有面板偏好不会因此丢失。
 
@@ -46,12 +46,12 @@ https://your-sub2-domain.com/*
 
 ## 当前版本
 
-`v2.9.0`
+`v2.10.0`
 
-`v2.9.0` 新增：
+`v2.10.0` 新增：
 
-- 增加“查 Key 命中”功能：输入客户端 API Key 后，先用 Key 前缀定位候选用户，再在内存中做完整 Key 精确匹配，读取最近 24 小时真实 Ops 请求并显示实际命中的上游账号、分组、模型和时间。
-- 完整客户端 Key 不写入 Tampermonkey、不显示在结果中，也不会访问上游；只把必要的 Key 前缀用于候选用户检索，最终请求仍按 `api_key_id` 严格过滤。
+- 移除单独输入完整客户端 Key 的查询流程，改为在“真实请求历史”每条记录中直接显示 Key 名称；名称按请求中的 `api_key_id + user_id` 从 Admin API 读取并在内存中缓存，无法读取时显示 Key ID。
+- 只读取 Key 元数据中的名称，不显示或保存完整客户端 Key，也不会访问上游。
 
 `v2.8.0` 新增：
 
@@ -178,12 +178,11 @@ https://your-sub2-domain.com/*
 ### 请求历史与路由回放
 
 - 展示最近 30 分钟内最多 30 条真实成功和失败请求；
-- 展示请求时间、模型、分组、最终账号、状态、总耗时和可用的真实首字耗时；
+- 展示请求时间、Key 名称、模型、分组、最终账号、状态、总耗时和可用的真实首字耗时；
 - 可按模型、分组、最终账号和直接成功 / 故障转移 / 最终失败筛选；
 - 只有点击某条历史记录时，才按请求 ID 读取其关联上游错误和最多 8 条详情；
 - 详情缺失时继续保持“部分详情 / 摘要 / 信息不足”证据边界；
 - 请求回放只读取本机 Ops 日志，不会重发请求或访问模型上游；
-- “查 Key 命中”只统计该客户端 Key 最近 24 小时有真实成功记录的上游账号；没有成功记录时明确显示“没有可证明命中”，不根据当前分组或模型配置猜测；
 - 账号 TTFT 汇总读取最新最多 1000 条流式记录，展示滚动 24 小时 P90、P50、最新样本、样本数和分页覆盖状态；
 - 缺失 `first_token_ms` 时不会用总耗时补值，也不会根据 TTFT 自动摘出、挂回或调整账号。
 
@@ -284,14 +283,12 @@ GET  /api/v1/admin/accounts/:id
 GET  /api/v1/admin/groups/all
 POST /api/v1/admin/accounts/today-stats/batch
 GET  /api/v1/admin/ops/requests
-GET  /api/v1/admin/ops/requests?api_key_id=<id>&time_range=24h
 GET  /api/v1/admin/ops/upstream-errors
 GET  /api/v1/admin/ops/upstream-errors/:id
 GET  /api/v1/admin/ops/concurrency
 GET  /api/v1/admin/usage
 GET  /api/v1/admin/accounts/:id/models
-GET  /api/v1/admin/users?search=<incomplete-key-prefix>
-GET  /api/v1/admin/users/:id/api-keys
+GET  /api/v1/admin/users/:id/api-keys                 读取请求历史中 API Key 的名称
 ```
 
 只有用户明确点击时才调用上游模型读取接口；这两个 POST 本身不持久化账号配置：
@@ -327,7 +324,7 @@ GET <allowlisted-https-origin>/api/user/self
 - 复用当前 sub2 后台的 `localStorage.auth_token`，不会在仓库中保存管理员凭据；
 - sub2api 查询只在可信点击后调用带单个账号 ID 的只读导出接口，并在发送 Key 前复核单条响应、名称、平台、类型和完整规范化地址；
 - 导出的 sub2api Key、地址或协议副本不写入 Tampermonkey、DOM、`localStorage`、日志、诊断、剪贴板、文件或 GitHub；完成后清空局部 Key 和导出对象引用；
-- “查 Key 命中”只把不完整的 Key 前缀放入候选用户检索 URL，之后在内存中精确比对完整 Key；完整 Key 不写入 Tampermonkey、DOM、`localStorage`、日志、诊断、剪贴板、文件或 GitHub，查询结束后清空局部引用；
+- 请求历史 Key 名称只根据真实请求中的 `api_key_id` 和 `user_id` 读取 API Key 元数据；完整客户端 Key 不写入 Tampermonkey、DOM、`localStorage`、日志、诊断、剪贴板、文件或 GitHub；
 - New API 账号余额凭据以未加密形式按“当前 sub2 地址 + 账号 ID”存入 Tampermonkey；已保存秘密不回填 DOM，新输入凭据只绑定当前方法解析出的规范化 origin；
 - 本地导入的原始 JSON、Access Token、User ID 和原始响应不会进入 DOM 文本、控制器状态、日志、诊断、剪贴板、文件或仓库；确认取消或文件 schema 无效时零写入；
 - 新账号 API Key 不写入 Tampermonkey、`localStorage`、日志、诊断、剪贴板、页面结果或仓库文件，只进入当次同源预览 / 创建请求，并在完成、取消或终止失败后清除；
