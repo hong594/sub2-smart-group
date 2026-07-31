@@ -2,8 +2,8 @@
 // @name         Sub2 Smart Group
 // @name:zh-CN   Sub2 智能分组
 // @namespace    local.sub2.smart-group
-// @version      2.8.0
-// @description  Sub2 account health, route history, reliability events, manual upstream balance queries, and protected controls (no active probing).
+// @version      2.9.0
+// @description  Sub2 account health, client-key hit lookup, route history, reliability events, manual upstream balance queries, and protected controls (no active probing).
 // @description:zh-CN 为 sub2api 提供账号健康度、路由历史、可靠性事件、手动上游余额查询与受保护控制（不主动测活）
 // @license      MIT
 // @homepageURL   https://github.com/hong594/sub2-smart-group
@@ -79,6 +79,8 @@
   //   GET  /api/v1/admin/groups/all                    完整分组列表
   //   GET  /api/v1/admin/ops/concurrency               当前容量 / 并发 / 排队快照
   //   GET  /api/v1/admin/ops/requests                  最近真实请求
+  //   GET  /api/v1/admin/users?search=<key-prefix>     客户端 Key 候选用户
+  //   GET  /api/v1/admin/users/:id/api-keys             客户端 Key 精确匹配
   //   GET  /api/v1/admin/ops/upstream-errors           真实上游故障摘要
   //   GET  /api/v1/admin/ops/upstream-errors/:id       故障转移事件详情
   //   GET  /api/v1/admin/usage                         流式请求首字耗时样本
@@ -147,6 +149,12 @@
   const SUB2_BALANCE_ALLOWED_HOSTS = Object.freeze(Object.keys(SUB2_BALANCE_PROTOCOL_BY_HOST));
   const SUB2_ROUTING_LOOKBACK_MS = 30 * 60 * 1000;
   const SUB2_REQUEST_HISTORY_LIMIT = 30;
+  const SUB2_CLIENT_KEY_HISTORY_LIMIT = 100;
+  const SUB2_CLIENT_KEY_LOOKUP_PAGE_SIZE = 100;
+  const SUB2_CLIENT_KEY_LOOKUP_PREFIX_LENGTH = 12;
+  const SUB2_CLIENT_KEY_LOOKUP_MAX_USERS = 200;
+  const SUB2_CLIENT_KEY_LOOKUP_CONCURRENCY = 8;
+  const SUB2_CLIENT_KEY_QUERY_TIMEOUT_MS = 8000;
   const SUB2_RELIABILITY_HISTORY_LIMIT = 1000;
   const SUB2_TTFT_HISTORY_LIMIT = 1000;
   const SUB2_TTFT_REFRESH_MS = 60 * 1000;
@@ -168,7 +176,7 @@
   const SUB2_CAPACITY_HIGH_LOAD_RATIO = 0.8;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '2.8.0';
+    : '2.9.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -1614,6 +1622,125 @@
     return [];
   }
 
+  function sub2NormalizeClientApiKey(rawValue) {
+    if (typeof rawValue !== 'string') return '';
+    const normalizedValue = rawValue.trim();
+    if (!normalizedValue || /[\r\n]/.test(normalizedValue)) return '';
+    return normalizedValue;
+  }
+
+  function sub2RedactClientApiKeyError(rawError, rawClientApiKey) {
+    const errorMessage = String(rawError || '客户端 Key 查询失败。')
+      .replace(/[\r\n]+/g, ' ')
+      .slice(0, 300);
+    const normalizedClientApiKey = sub2NormalizeClientApiKey(rawClientApiKey);
+    const searchTerm = sub2BuildClientApiKeyLookupSearchTerm(normalizedClientApiKey);
+    const encodedSearchTerm = searchTerm ? encodeURIComponent(searchTerm) : '';
+    return [normalizedClientApiKey, searchTerm, encodedSearchTerm]
+      .filter(Boolean)
+      .reduce((safeMessage, secretValue) => safeMessage.split(secretValue).join('[已隐藏]'), errorMessage);
+  }
+
+  function sub2BuildClientApiKeyLookupSearchTerm(rawValue, prefixLength = SUB2_CLIENT_KEY_LOOKUP_PREFIX_LENGTH) {
+    const normalizedClientApiKey = sub2NormalizeClientApiKey(rawValue);
+    if (!normalizedClientApiKey) return '';
+    const numericPrefixLength = Number(prefixLength);
+    const safePrefixLength = Number.isInteger(numericPrefixLength) && numericPrefixLength > 0
+      ? numericPrefixLength
+      : SUB2_CLIENT_KEY_LOOKUP_PREFIX_LENGTH;
+    if (normalizedClientApiKey.length <= safePrefixLength) return '';
+    return normalizedClientApiKey.slice(0, Math.min(normalizedClientApiKey.length, safePrefixLength));
+  }
+
+  function sub2CollectMatchingClientApiKeys(apiKeyRecords, rawClientApiKey, fallbackUserId = null) {
+    const normalizedClientApiKey = sub2NormalizeClientApiKey(rawClientApiKey);
+    if (!normalizedClientApiKey) return [];
+
+    const numericFallbackUserId = Number(fallbackUserId);
+    const matches = [];
+    const seenApiKeyIds = new Set();
+    for (const apiKeyRecord of Array.isArray(apiKeyRecords) ? apiKeyRecords : []) {
+      const candidateKey = typeof apiKeyRecord?.key === 'string'
+        ? apiKeyRecord.key.trim()
+        : typeof apiKeyRecord?.api_key === 'string'
+          ? apiKeyRecord.api_key.trim()
+          : '';
+      if (candidateKey !== normalizedClientApiKey) continue;
+
+      const numericApiKeyId = Number(apiKeyRecord?.id);
+      const numericUserId = Number(apiKeyRecord?.user_id);
+      const resolvedUserId = Number.isInteger(numericUserId) && numericUserId > 0
+        ? numericUserId
+        : Number.isInteger(numericFallbackUserId) && numericFallbackUserId > 0
+          ? numericFallbackUserId
+          : null;
+      if (!Number.isInteger(numericApiKeyId) || numericApiKeyId <= 0 || !resolvedUserId) continue;
+      if (seenApiKeyIds.has(numericApiKeyId)) continue;
+      seenApiKeyIds.add(numericApiKeyId);
+      const numericGroupId = Number(apiKeyRecord?.group_id);
+      matches.push({
+        apiKeyId: numericApiKeyId,
+        groupId: Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null,
+        name: String(apiKeyRecord?.name || '').trim(),
+        status: String(apiKeyRecord?.status || '').trim(),
+        userId: resolvedUserId,
+      });
+    }
+    return matches;
+  }
+
+  function sub2BuildClientKeyHitAccountSummary(requestHistory) {
+    const summariesByAccountId = new Map();
+    for (const requestItem of Array.isArray(requestHistory) ? requestHistory : []) {
+      if (requestItem?.kind !== 'success') continue;
+      const numericAccountId = Number(requestItem?.accountId);
+      if (!Number.isInteger(numericAccountId) || numericAccountId <= 0) continue;
+
+      let summary = summariesByAccountId.get(numericAccountId);
+      if (!summary) {
+        summary = {
+          accountId: numericAccountId,
+          failoverCount: 0,
+          groupIds: new Set(),
+          latestAt: 0,
+          latestGroupId: null,
+          latestModel: '',
+          latestPlatform: '',
+          latestRequestId: '',
+          models: new Set(),
+          requestCount: 0,
+        };
+        summariesByAccountId.set(numericAccountId, summary);
+      }
+
+      summary.requestCount += 1;
+      if (requestItem.routeStatus === 'failover') summary.failoverCount += 1;
+      const numericGroupId = Number(requestItem?.groupId);
+      if (Number.isInteger(numericGroupId) && numericGroupId > 0) summary.groupIds.add(numericGroupId);
+      const model = String(requestItem?.model || '').trim();
+      if (model) summary.models.add(model);
+
+      const createdAt = Number(requestItem?.createdAt);
+      if (Number.isFinite(createdAt) && createdAt >= summary.latestAt) {
+        summary.latestAt = createdAt;
+        summary.latestGroupId = Number.isInteger(numericGroupId) && numericGroupId > 0 ? numericGroupId : null;
+        summary.latestModel = model;
+        summary.latestPlatform = String(requestItem?.platform || '').trim();
+        summary.latestRequestId = String(requestItem?.requestId || '').trim();
+      }
+    }
+
+    return [...summariesByAccountId.values()]
+      .map((summary) => ({
+        ...summary,
+        groupIds: [...summary.groupIds].sort((leftGroupId, rightGroupId) => leftGroupId - rightGroupId),
+        models: [...summary.models].sort((leftModel, rightModel) => leftModel.localeCompare(rightModel)),
+      }))
+      .sort((leftSummary, rightSummary) => rightSummary.latestAt - leftSummary.latestAt
+        || rightSummary.requestCount - leftSummary.requestCount
+        || leftSummary.accountId - rightSummary.accountId);
+  }
+
   function sub2IsPaginatedPayloadComplete(payload) {
     const items = sub2GetPaginatedItems(payload);
     const numericTotal = Number(payload?.total);
@@ -1629,6 +1756,8 @@
       const kind = requestItem?.kind === 'error' ? 'error' : 'success';
       const numericAccountId = Number(requestItem?.account_id);
       const numericGroupId = Number(requestItem?.group_id);
+      const numericApiKeyId = Number(requestItem?.api_key_id);
+      const numericUserId = Number(requestItem?.user_id);
       const rawDurationMs = requestItem?.duration_ms;
       const numericDurationMs = Number(rawDurationMs);
       const firstTokenMs = requestItem?.stream === false
@@ -1639,6 +1768,7 @@
       const requestId = String(requestItem?.request_id || '').trim();
       normalizedRequests.push({
         accountId: Number.isInteger(numericAccountId) && numericAccountId > 0 ? numericAccountId : null,
+        apiKeyId: Number.isInteger(numericApiKeyId) && numericApiKeyId > 0 ? numericApiKeyId : null,
         createdAt,
         durationMs: rawDurationMs !== null
           && rawDurationMs !== undefined
@@ -1660,6 +1790,7 @@
         statusCode: Number.isInteger(numericStatusCode) && numericStatusCode >= 100 && numericStatusCode <= 599
           ? numericStatusCode
           : null,
+        userId: Number.isInteger(numericUserId) && numericUserId > 0 ? numericUserId : null,
       });
     }
     return normalizedRequests.sort((leftRequest, rightRequest) => rightRequest.createdAt - leftRequest.createdAt);
@@ -4895,6 +5026,211 @@
     }
   }
 
+  async function sub2FetchAllUserApiKeys(userId) {
+    const numericUserId = Number(userId);
+    if (!Number.isInteger(numericUserId) || numericUserId <= 0) {
+      throw new Error('候选用户 ID 无效。');
+    }
+
+    const apiKeys = [];
+    for (let page = 1; ; page += 1) {
+      const data = await sub2ApiRequestWithTimeout(
+        'GET',
+        `/admin/users/${numericUserId}/api-keys?page=${page}&page_size=${SUB2_CLIENT_KEY_LOOKUP_PAGE_SIZE}`,
+        undefined,
+        SUB2_CLIENT_KEY_QUERY_TIMEOUT_MS,
+      );
+      const items = sub2GetPaginatedItems(data);
+      apiKeys.push(...items);
+      const total = Number(data?.total);
+      if (!items.length
+        || items.length < SUB2_CLIENT_KEY_LOOKUP_PAGE_SIZE
+        || (Number.isFinite(total) && apiKeys.length >= total)) {
+        return apiKeys;
+      }
+    }
+  }
+
+  async function sub2FetchClientApiKeyCandidateUsers(rawClientApiKey) {
+    const searchTerm = sub2BuildClientApiKeyLookupSearchTerm(rawClientApiKey);
+    if (!searchTerm) throw new Error('客户端 API Key 不能为空。');
+
+    const users = [];
+    let capped = false;
+    for (let page = 1; ; page += 1) {
+      const data = await sub2ApiRequestWithTimeout(
+        'GET',
+        `/admin/users?search=${encodeURIComponent(searchTerm)}&page=${page}&page_size=${SUB2_CLIENT_KEY_LOOKUP_PAGE_SIZE}`,
+        undefined,
+        SUB2_CLIENT_KEY_QUERY_TIMEOUT_MS,
+      );
+      const items = sub2GetPaginatedItems(data);
+      users.push(...items);
+      const total = Number(data?.total);
+      if (users.length >= SUB2_CLIENT_KEY_LOOKUP_MAX_USERS) {
+        capped = Number.isFinite(total)
+          ? total > SUB2_CLIENT_KEY_LOOKUP_MAX_USERS
+          : items.length >= SUB2_CLIENT_KEY_LOOKUP_PAGE_SIZE;
+        break;
+      }
+      if (!items.length
+        || items.length < SUB2_CLIENT_KEY_LOOKUP_PAGE_SIZE
+        || (Number.isFinite(total) && users.length >= total)) {
+        break;
+      }
+    }
+
+    return {
+      capped,
+      users: users.slice(0, SUB2_CLIENT_KEY_LOOKUP_MAX_USERS),
+    };
+  }
+
+  async function sub2ResolveClientApiKey(rawClientApiKey) {
+    const normalizedClientApiKey = sub2NormalizeClientApiKey(rawClientApiKey);
+    if (!normalizedClientApiKey) throw new Error('客户端 API Key 不能为空。');
+    if (!sub2BuildClientApiKeyLookupSearchTerm(normalizedClientApiKey)) {
+      throw new Error(`客户端 API Key 长度不足 ${SUB2_CLIENT_KEY_LOOKUP_PREFIX_LENGTH + 1} 个字符，无法安全检索。`);
+    }
+
+    const candidateUsers = await sub2FetchClientApiKeyCandidateUsers(normalizedClientApiKey);
+    if (candidateUsers.capped) {
+      throw new Error('客户端 Key 的候选用户过多，为避免读取过大范围，请缩小查询范围后重试。');
+    }
+
+    const candidateUserIds = [...new Set(candidateUsers.users
+      .map((user) => Number(user?.id))
+      .filter((userId) => Number.isInteger(userId) && userId > 0))];
+    if (!candidateUserIds.length) {
+      return {
+        candidateUserCount: 0,
+        matches: [],
+        status: 'not-found',
+      };
+    }
+
+    const apiKeyResults = [];
+    for (let offset = 0; offset < candidateUserIds.length; offset += SUB2_CLIENT_KEY_LOOKUP_CONCURRENCY) {
+      const userIdBatch = candidateUserIds.slice(offset, offset + SUB2_CLIENT_KEY_LOOKUP_CONCURRENCY);
+      const batchResults = await Promise.all(userIdBatch.map(async (candidateUserId) => {
+        const apiKeys = await sub2FetchAllUserApiKeys(candidateUserId);
+        return sub2CollectMatchingClientApiKeys(apiKeys, normalizedClientApiKey, candidateUserId);
+      }));
+      apiKeyResults.push(...batchResults);
+    }
+    const matches = apiKeyResults.flat();
+    if (matches.length > 1) {
+      return {
+        candidateUserCount: candidateUserIds.length,
+        matches,
+        status: 'ambiguous',
+      };
+    }
+    return {
+      candidateUserCount: candidateUserIds.length,
+      matches,
+      status: matches.length ? 'matched' : 'not-found',
+    };
+  }
+
+  async function sub2FetchClientKeyRoutingActivity(rawClientApiKey) {
+    const lookup = await sub2ResolveClientApiKey(rawClientApiKey);
+    const matchedApiKey = lookup.matches?.length === 1 ? lookup.matches[0] : null;
+    if (!matchedApiKey) {
+      return {
+        coverageComplete: false,
+        errorsAvailable: false,
+        hitAccounts: [],
+        lookup,
+        recentHit: null,
+        requestHistory: [],
+        requestsAvailable: false,
+      };
+    }
+
+    const apiKeyId = matchedApiKey.apiKeyId;
+    const requestQuery = new URLSearchParams({
+      api_key_id: String(apiKeyId),
+      kind: 'all',
+      page: '1',
+      page_size: String(SUB2_CLIENT_KEY_HISTORY_LIMIT),
+      sort: 'created_at_desc',
+      time_range: '24h',
+    });
+    const errorQuery = new URLSearchParams({
+      api_key_id: String(apiKeyId),
+      page: '1',
+      page_size: String(SUB2_CLIENT_KEY_HISTORY_LIMIT),
+      time_range: '24h',
+    });
+    const [requestResult, errorResult] = await Promise.allSettled([
+      sub2ApiRequestWithTimeout(
+        'GET',
+        `/admin/ops/requests?${requestQuery.toString()}`,
+        undefined,
+        SUB2_CLIENT_KEY_QUERY_TIMEOUT_MS,
+      ),
+      sub2ApiRequestWithTimeout(
+        'GET',
+        `/admin/ops/upstream-errors?${errorQuery.toString()}`,
+        undefined,
+        SUB2_CLIENT_KEY_QUERY_TIMEOUT_MS,
+      ),
+    ]);
+    if (requestResult.status !== 'fulfilled') {
+      throw requestResult.reason || new Error('客户端 Key 的真实请求记录不可用。');
+    }
+
+    const rawRequestItems = sub2NormalizeRequestHistory(requestResult.value);
+    const requestHistory = rawRequestItems.filter((requestItem) => requestItem.apiKeyId === apiKeyId);
+    const discardedRequestCount = rawRequestItems.length - requestHistory.length;
+    const errorPayload = errorResult.status === 'fulfilled' ? errorResult.value : null;
+    const errorCoverageComplete = errorResult.status === 'fulfilled'
+      && sub2IsPaginatedPayloadComplete(errorPayload);
+    const annotatedRequestHistory = sub2AnnotateRequestHistory(
+      requestHistory,
+      errorPayload,
+      errorCoverageComplete,
+    );
+    const successfulRequests = annotatedRequestHistory.filter(
+      (requestItem) => requestItem.kind === 'success' && requestItem.accountId,
+    );
+    const directSuccessCount = successfulRequests.filter(
+      (requestItem) => requestItem.routeStatus === 'direct',
+    ).length;
+    const failoverSuccessCount = successfulRequests.filter(
+      (requestItem) => requestItem.routeStatus === 'failover',
+    ).length;
+    const unknownSuccessCount = Math.max(0, successfulRequests.length - directSuccessCount - failoverSuccessCount);
+    const failedRequestCount = annotatedRequestHistory.filter(
+      (requestItem) => requestItem.kind === 'error',
+    ).length;
+    const requestCoverageComplete = discardedRequestCount === 0
+      && sub2IsPaginatedPayloadComplete(requestResult.value);
+
+    return {
+      apiKeyId,
+      candidateUserCount: lookup.candidateUserCount,
+      coverageComplete: requestCoverageComplete,
+      discardedRequestCount,
+      errorsAvailable: errorResult.status === 'fulfilled',
+      errorsComplete: errorCoverageComplete,
+      hitAccounts: sub2BuildClientKeyHitAccountSummary(annotatedRequestHistory),
+      lookup: {
+        ...lookup,
+        match: matchedApiKey,
+      },
+      recentHit: successfulRequests[0] || null,
+      requestHistory: annotatedRequestHistory,
+      requestsAvailable: true,
+      directSuccessCount,
+      failedRequestCount,
+      failoverSuccessCount,
+      successfulRequestCount: successfulRequests.length,
+      unknownSuccessCount,
+    };
+  }
+
   async function sub2FetchAccount(accountId) {
     return sub2ApiRequest('GET', `/admin/accounts/${accountId}`);
   }
@@ -5267,6 +5603,10 @@
       color:#1d4ed8;cursor:pointer;font-size:12px;font-weight:650;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-model-bulk-sync:hover{background:#dbeafe;}
     #${SUB2_PANEL_ID} .sub2-model-bulk-sync:disabled{cursor:wait;opacity:.6;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-open{height:30px;background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:0 10px;
+      color:#166534;cursor:pointer;font-size:12px;font-weight:650;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-open:hover{background:#dcfce7;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-open:disabled{cursor:wait;opacity:.6;}
     #${SUB2_PANEL_ID} .sub2-model-batch-state{padding:0 12px;color:#64748b;font-size:10px;line-height:1.45;overflow-wrap:anywhere;}
     #${SUB2_PANEL_ID} .sub2-model-batch-state:empty{display:none;}
     #${SUB2_PANEL_ID} .sub2-model-batch-state.error{color:#b91c1c;}
@@ -5467,6 +5807,24 @@
     #${SUB2_PANEL_ID} .sub2-history-badge.error{background:#fee2e2;color:#991b1b;}
     #${SUB2_PANEL_ID} .sub2-history-badge.failover{background:#ffedd5;color:#9a3412;}
     #${SUB2_PANEL_ID} .sub2-history-badge.direct{background:#e0f2fe;color:#075985;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-toolbar{display:flex;align-items:center;gap:6px;margin-top:7px;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-input{flex:1;min-width:0;border:1px solid #cbd5e1;border-radius:6px;padding:6px 7px;
+      background:#fff;color:#0f172a;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;outline:none;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-input:focus{border-color:#22c55e;box-shadow:0 0 0 2px rgba(34,197,94,.12);}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-submit{border:1px solid #86efac;border-radius:6px;padding:5px 8px;background:#f0fdf4;
+      color:#166534;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-submit:hover{background:#dcfce7;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-submit:disabled{cursor:wait;opacity:.6;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-state{margin-top:7px;padding:6px 8px;border-radius:6px;background:#f8fafc;color:#64748b;
+      font-size:10px;line-height:1.5;overflow-wrap:anywhere;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-state:empty{display:none;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-state.error{background:#fef2f2;color:#b91c1c;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-result{margin-top:7px;display:flex;flex-direction:column;gap:6px;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-hit{padding:7px 8px;border:1px solid #bbf7d0;border-radius:7px;background:#f0fdf4;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-hit-title{display:block;color:#166534;font-size:11px;font-weight:700;line-height:1.4;overflow-wrap:anywhere;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-hit-detail{display:block;margin-top:3px;color:#475569;font-size:10px;line-height:1.45;overflow-wrap:anywhere;}
+    #${SUB2_PANEL_ID} .sub2-client-key-query-request{padding:5px 7px;border:1px solid #e2e8f0;border-radius:6px;background:#fff;
+      color:#475569;font-size:10px;line-height:1.45;overflow-wrap:anywhere;}
     #${SUB2_PANEL_ID} .sub2-request-facts{display:flex;flex-wrap:wrap;gap:5px 9px;color:#475569;font-size:11px;line-height:1.5;}
     #${SUB2_PANEL_ID} .sub2-diagnostics-note{padding:7px 9px;border-radius:7px;background:#f8fafc;color:#64748b;font-size:10px;line-height:1.5;}
     #${SUB2_PANEL_ID} .sub2-route-chain{display:flex;flex-direction:column;gap:0;}
@@ -5683,6 +6041,11 @@
       this.modelBatchMessage = '';
       this.modelBatchError = '';
       this.modelBatchRequestSequence = 0;
+      this.clientKeyQueryInputElement = null;
+      this.clientKeyQueryLoading = false;
+      this.clientKeyQueryResult = null;
+      this.clientKeyQueryError = '';
+      this.clientKeyQueryRequestSequence = 0;
       this.savedModelsByAccountId = new Map();
       this.accountCreateOpen = false;
       this.accountCreatePhase = 'input';
@@ -5782,6 +6145,7 @@
             <button class="sub2-refresh">刷新</button>
             <button type="button" class="sub2-balance-import">导入余额</button>
             <button type="button" class="sub2-model-bulk-sync" title="按真实 group.platform=openai 批量同步所有 GPT 分组账号">同步 GPT 模型</button>
+            <button type="button" class="sub2-client-key-query-open" title="输入客户端 API Key，查询最近实际命中的上游账号">查 Key 命中</button>
             <input type="file" class="sub2-balance-import-input" accept=".json,application/json" hidden />
           </div>
           <div class="sub2-model-batch-state"></div>
@@ -5981,6 +6345,7 @@
       this.sortElement.value = this.sortMode;
       this.root.querySelector('.sub2-min').addEventListener('click', () => this.setMinimized(true));
       this.root.querySelector('.sub2-account-add-open')?.addEventListener('click', (event) => this.openAccountCreateModal(event));
+      this.root.querySelector('.sub2-client-key-query-open')?.addEventListener('click', (event) => this.openClientKeyQuery(event));
       this.root.querySelector('.sub2-audit-open')?.addEventListener('click', () => this.openAuditDrawer());
       this.root.querySelector('.sub2-events-open')?.addEventListener('click', () => this.openEventsDrawer());
       this.root.querySelector('.sub2-diagnostics-open')?.addEventListener('click', () => this.openDiagnosticsDrawer());
@@ -6281,6 +6646,7 @@
         || this.balanceImportPending
         || this.balanceQueryingIds.size > 0
         || this.modelBatchSyncing
+        || this.clientKeyQueryLoading
         || this.accountCreateOpen
         || this.hasOpenQuotaEditor()
         || this.hasOpenCapacityEditor()
@@ -8431,6 +8797,227 @@
       this.auditBodyElement.scrollTop = savedScrollTop;
     }
 
+    renderClientKeyQueryCard(now) {
+      const queryCard = document.createElement('section');
+      queryCard.className = 'sub2-diagnostics-card';
+
+      const queryTitle = document.createElement('h3');
+      queryTitle.textContent = '客户端 Key 命中查询';
+      queryCard.appendChild(queryTitle);
+
+      const queryNotice = document.createElement('div');
+      queryNotice.className = 'sub2-diagnostics-note';
+      queryNotice.textContent = '输入 sub2 客户端 API Key，查询最近 24 小时真实请求最终命中的上游账号。完整 Key 不保存、不显示，也不会访问上游。';
+      queryCard.appendChild(queryNotice);
+
+      const queryForm = document.createElement('form');
+      queryForm.className = 'sub2-client-key-query-toolbar';
+      const queryInput = document.createElement('input');
+      queryInput.type = 'password';
+      queryInput.className = 'sub2-client-key-query-input';
+      queryInput.autocomplete = 'new-password';
+      queryInput.spellcheck = false;
+      queryInput.placeholder = '粘贴客户端 API Key';
+      queryInput.setAttribute('aria-label', '客户端 API Key');
+      const querySubmit = document.createElement('button');
+      querySubmit.type = 'submit';
+      querySubmit.className = 'sub2-client-key-query-submit';
+      querySubmit.disabled = this.clientKeyQueryLoading;
+      querySubmit.textContent = this.clientKeyQueryLoading ? '查询中…' : '查询';
+      queryForm.append(queryInput, querySubmit);
+      queryForm.addEventListener('submit', (event) => {
+        event.preventDefault();
+        this.handleClientKeyQuery(event);
+      });
+      this.clientKeyQueryInputElement = queryInput;
+      queryCard.appendChild(queryForm);
+
+      const queryState = document.createElement('div');
+      queryState.className = 'sub2-client-key-query-state';
+      queryState.classList.toggle('error', Boolean(this.clientKeyQueryError));
+      queryState.textContent = this.clientKeyQueryError
+        || (this.clientKeyQueryLoading ? '正在定位 API Key 并读取真实请求记录…' : '');
+      queryCard.appendChild(queryState);
+
+      const queryResult = this.clientKeyQueryResult;
+      if (!queryResult || this.clientKeyQueryLoading) return queryCard;
+
+      const lookupStatus = String(queryResult.lookup?.status || '');
+      if (lookupStatus === 'ambiguous') {
+        const ambiguousMessage = document.createElement('div');
+        ambiguousMessage.className = 'sub2-client-key-query-state error';
+        ambiguousMessage.textContent = '同一个客户端 Key 匹配到多个 API Key 记录，无法安全判定；未读取命中历史。';
+        queryCard.appendChild(ambiguousMessage);
+        return queryCard;
+      }
+      if (lookupStatus !== 'matched' || !queryResult.lookup?.match) {
+        const notFoundMessage = document.createElement('div');
+        notFoundMessage.className = 'sub2-client-key-query-state';
+        notFoundMessage.textContent = queryResult.lookup?.candidateUserCount
+          ? `未找到完整匹配的 API Key；已读取 ${queryResult.lookup.candidateUserCount} 个候选用户的 Key 并做精确比对。`
+          : '没有找到包含该 Key 前缀的候选用户，未读取上游。';
+        queryCard.appendChild(notFoundMessage);
+        return queryCard;
+      }
+
+      const matchedApiKey = queryResult.lookup.match;
+      const matchSummary = document.createElement('div');
+      matchSummary.className = 'sub2-client-key-query-state';
+      matchSummary.textContent = [
+        `已精确匹配 API Key #${matchedApiKey.apiKeyId}`,
+        `用户 #${matchedApiKey.userId}`,
+        matchedApiKey.name ? `名称「${matchedApiKey.name}」` : '',
+        matchedApiKey.status ? `状态 ${matchedApiKey.status}` : '',
+      ].filter(Boolean).join(' · ');
+      queryCard.appendChild(matchSummary);
+
+      const resultContainer = document.createElement('div');
+      resultContainer.className = 'sub2-client-key-query-result';
+      const requestCount = Array.isArray(queryResult.requestHistory)
+        ? queryResult.requestHistory.length
+        : 0;
+      const coverageNote = document.createElement('div');
+      coverageNote.className = 'sub2-diagnostics-note';
+      const successfulRequestCount = Number(queryResult.successfulRequestCount) || 0;
+      const failedRequestCount = Number(queryResult.failedRequestCount) || 0;
+      const directSuccessCount = Number(queryResult.directSuccessCount) || 0;
+      const failoverSuccessCount = Number(queryResult.failoverSuccessCount) || 0;
+      const unknownSuccessCount = Number(queryResult.unknownSuccessCount) || 0;
+      const successSummary = queryResult.errorsAvailable
+        ? `成功 ${successfulRequestCount} 次（直接 ${directSuccessCount}，故障转移 ${failoverSuccessCount}，转移未知 ${unknownSuccessCount}）`
+        : `成功 ${successfulRequestCount} 次（转移情况未知；故障日志不可用）`;
+      const failedSummary = `最终失败 ${failedRequestCount} 次`;
+      coverageNote.textContent = queryResult.coverageComplete
+        ? `已读取最近 24 小时的 ${requestCount} 条请求，分页覆盖完整；${successSummary}；${failedSummary}。`
+        : `已读取最近 24 小时最新 ${requestCount} 条请求样本；${successSummary}；${failedSummary}。`
+          + (queryResult.discardedRequestCount ? `另有 ${queryResult.discardedRequestCount} 条缺少 Key 归属证据，已丢弃。` : '');
+      resultContainer.appendChild(coverageNote);
+
+      const hitAccounts = Array.isArray(queryResult.hitAccounts) ? queryResult.hitAccounts : [];
+      if (!hitAccounts.length) {
+        const noHitMessage = document.createElement('div');
+        noHitMessage.className = 'sub2-diagnostics-note';
+        noHitMessage.textContent = '最近 24 小时没有可证明成功命中的上游账号；这不等于 Key 无效，也可能是没有调用或请求全部失败。';
+        resultContainer.appendChild(noHitMessage);
+      } else {
+        for (const hitAccount of hitAccounts) {
+          const hitElement = document.createElement('div');
+          hitElement.className = 'sub2-client-key-query-hit';
+          const hitTitle = document.createElement('span');
+          hitTitle.className = 'sub2-client-key-query-hit-title';
+          hitTitle.textContent = `${this.getAccountDisplayName(hitAccount.accountId)}（账号 #${hitAccount.accountId}） · ${hitAccount.requestCount} 次成功命中`;
+          hitElement.appendChild(hitTitle);
+
+          const latestGroup = hitAccount.latestGroupId
+            ? sub2GetIndexedGroup(this.groupsById, hitAccount.latestGroupId)
+            : null;
+          const groupText = latestGroup
+            ? `分组 ${latestGroup.name || hitAccount.latestGroupId}`
+            : hitAccount.latestGroupId
+              ? `分组 ${hitAccount.latestGroupId}`
+              : '';
+          const modelsText = hitAccount.models?.length ? `模型 ${hitAccount.models.join('、')}` : '';
+          const failoverText = hitAccount.failoverCount
+            ? `其中 ${hitAccount.failoverCount} 次发生故障转移`
+            : '';
+          const hitDetail = document.createElement('span');
+          hitDetail.className = 'sub2-client-key-query-hit-detail';
+          hitDetail.textContent = [
+            groupText,
+            hitAccount.latestPlatform ? `平台 ${hitAccount.latestPlatform}` : '',
+            modelsText,
+            `最近 ${sub2FormatRelative(hitAccount.latestAt, now)}`,
+            failoverText,
+          ].filter(Boolean).join(' · ');
+          hitElement.appendChild(hitDetail);
+          resultContainer.appendChild(hitElement);
+        }
+      }
+
+      const requestHistory = Array.isArray(queryResult.requestHistory)
+        ? queryResult.requestHistory.slice(0, 30)
+        : [];
+      if (requestHistory.length) {
+        const requestTitle = document.createElement('div');
+        requestTitle.className = 'sub2-client-key-query-hit-title';
+        requestTitle.textContent = '最近请求明细';
+        resultContainer.appendChild(requestTitle);
+        for (const requestItem of requestHistory) {
+          const requestElement = document.createElement('div');
+          requestElement.className = 'sub2-client-key-query-request';
+          const requestStatus = requestItem.kind === 'error'
+            ? `最终失败${requestItem.statusCode ? ` HTTP ${requestItem.statusCode}` : ''}`
+            : requestItem.routeStatus === 'failover'
+              ? '故障转移成功'
+              : requestItem.routeStatus === 'direct'
+                ? '直接成功'
+                : '成功（转移情况未知）';
+          const requestAccountText = requestItem.accountId
+            ? `${this.getAccountDisplayName(requestItem.accountId)}（账号 #${requestItem.accountId}）`
+            : '账号未知';
+          const requestGroup = requestItem.groupId
+            ? sub2GetIndexedGroup(this.groupsById, requestItem.groupId)
+            : null;
+          const requestGroupText = requestItem.groupId
+            ? `分组 ${requestGroup?.name || requestItem.groupId}`
+            : '';
+          requestElement.textContent = [
+            requestStatus,
+            requestAccountText,
+            requestGroupText,
+            requestItem.model ? `模型 ${requestItem.model}` : '',
+            sub2FormatRelative(requestItem.createdAt, now),
+          ].filter(Boolean).join(' · ');
+          requestElement.title = requestItem.requestId || '';
+          resultContainer.appendChild(requestElement);
+        }
+        if (Array.isArray(queryResult.requestHistory)
+          && queryResult.requestHistory.length > requestHistory.length) {
+          const requestOverflow = document.createElement('div');
+          requestOverflow.className = 'sub2-diagnostics-note';
+          requestOverflow.textContent = `仅显示最新 ${requestHistory.length} 条明细。`;
+          resultContainer.appendChild(requestOverflow);
+        }
+      }
+      queryCard.appendChild(resultContainer);
+      return queryCard;
+    }
+
+    async handleClientKeyQuery(event) {
+      if (!event || event.isTrusted !== true || this.clientKeyQueryLoading) return;
+      let normalizedClientApiKey = sub2NormalizeClientApiKey(this.clientKeyQueryInputElement?.value);
+      if (!normalizedClientApiKey) {
+        this.clientKeyQueryResult = null;
+        this.clientKeyQueryError = '请输入有效的客户端 API Key。';
+        this.renderDiagnosticsDrawer();
+        return;
+      }
+
+      const requestSequence = ++this.clientKeyQueryRequestSequence;
+      this.clientKeyQueryLoading = true;
+      this.clientKeyQueryResult = null;
+      this.clientKeyQueryError = '';
+      if (this.clientKeyQueryInputElement) this.clientKeyQueryInputElement.value = '';
+      this.renderDiagnosticsDrawer();
+
+      let clientApiKey = normalizedClientApiKey;
+      try {
+        const queryResult = await sub2FetchClientKeyRoutingActivity(clientApiKey);
+        if (requestSequence !== this.clientKeyQueryRequestSequence) return;
+        this.clientKeyQueryResult = queryResult;
+      } catch (error) {
+        if (requestSequence !== this.clientKeyQueryRequestSequence) return;
+        this.clientKeyQueryError = sub2RedactClientApiKeyError(error?.message || error, clientApiKey);
+      } finally {
+        clientApiKey = '';
+        normalizedClientApiKey = '';
+        if (requestSequence === this.clientKeyQueryRequestSequence) {
+          this.clientKeyQueryLoading = false;
+          this.renderDiagnosticsDrawer();
+        }
+      }
+    }
+
     getDiagnosticsRequest() {
       if (!this.selectedDiagnosticsRequestKey) return this.recentRequest || this.requestHistory[0] || null;
       return this.requestHistory.find(
@@ -8696,8 +9283,29 @@
       this.renderDiagnosticsDrawer();
     }
 
+    openClientKeyQuery(event) {
+      if (!event || event.isTrusted !== true || this.clientKeyQueryLoading) return;
+      if (!this.closeAccountCreateModal(false)) return;
+      this.closeModelDrawer();
+      this.closeAuditDrawer();
+      this.openDiagnosticsDrawer();
+      this.clientKeyQueryRequestSequence += 1;
+      this.clientKeyQueryLoading = false;
+      this.clientKeyQueryResult = null;
+      this.clientKeyQueryError = '';
+      this.renderDiagnosticsDrawer();
+      try {
+        this.clientKeyQueryInputElement?.focus({ preventScroll: true });
+      } catch {
+        this.clientKeyQueryInputElement?.focus();
+      }
+    }
+
     closeDiagnosticsDrawer() {
       this.diagnosticsOpen = false;
+      this.clientKeyQueryRequestSequence += 1;
+      this.clientKeyQueryLoading = false;
+      if (this.clientKeyQueryInputElement) this.clientKeyQueryInputElement.value = '';
       if (this.diagnosticsOverlayElement) this.diagnosticsOverlayElement.hidden = true;
     }
 
@@ -8712,6 +9320,7 @@
       const savedScrollTop = this.diagnosticsBodyElement.scrollTop;
       const now = Date.now();
       this.diagnosticsBodyElement.textContent = '';
+      this.diagnosticsBodyElement.appendChild(this.renderClientKeyQueryCard(now));
       this.diagnosticsBodyElement.appendChild(this.renderRequestHistoryCard(now));
       const diagnosticsRequest = this.getDiagnosticsRequest();
 
@@ -9836,6 +10445,11 @@
     sub2GetPoolModeState,
     sub2BuildDailyQuotaExtra,
     sub2GetPaginatedItems,
+    sub2NormalizeClientApiKey,
+    sub2BuildClientApiKeyLookupSearchTerm,
+    sub2RedactClientApiKeyError,
+    sub2CollectMatchingClientApiKeys,
+    sub2BuildClientKeyHitAccountSummary,
     sub2IsPaginatedPayloadComplete,
     sub2NormalizeRequestHistory,
     sub2GetRequestHistoryKey,
