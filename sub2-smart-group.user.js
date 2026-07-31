@@ -2,7 +2,7 @@
 // @name         Sub2 Smart Group
 // @name:zh-CN   Sub2 智能分组
 // @namespace    local.sub2.smart-group
-// @version      2.7.1
+// @version      2.8.0
 // @description  Sub2 account health, route history, reliability events, manual upstream balance queries, and protected controls (no active probing).
 // @description:zh-CN 为 sub2api 提供账号健康度、路由历史、可靠性事件、手动上游余额查询与受保护控制（不主动测活）
 // @license      MIT
@@ -168,7 +168,7 @@
   const SUB2_CAPACITY_HIGH_LOAD_RATIO = 0.8;
   const SUB2_SCRIPT_VERSION = typeof GM_info !== 'undefined' && GM_info?.script?.version
     ? String(GM_info.script.version)
-    : '2.7.1';
+    : '2.8.0';
   const SUB2_TONE_RANK = Object.freeze({ ok: 0, warn: 1, paused: 2, down: 3 });
   // 排序专用次序（与健康推断的 TONE_RANK 分开）：真正有问题的置顶，主动停用的沉底。
   // down(不可用) 最需要处理 → 最前；paused(多为手动摘出) 已知处理 → 最后。
@@ -3406,6 +3406,47 @@
     return `抓取 ${Number(counts?.fetched) || 0} 个，允许 ${Number(counts?.allowed) || 0} 个，排除 ${Number(counts?.excluded) || 0} 个，持久化 ${Number(counts?.persisted) || 0} 个`;
   }
 
+  function sub2CollectModelSyncTargets(accounts, groupsById, targetPlatform = 'openai') {
+    const normalizedTargetPlatform = sub2NormalizeModelPlatform(targetPlatform);
+    const targets = [];
+    const skipped = [];
+    if (!SUB2_MODEL_SYNC_PLATFORMS.includes(normalizedTargetPlatform)) {
+      return { targetPlatform: normalizedTargetPlatform, targets, skipped };
+    }
+
+    for (const account of Array.isArray(accounts) ? accounts : []) {
+      const accountId = Number(account?.id);
+      if (!Number.isInteger(accountId) || accountId <= 0) continue;
+      const memberships = sub2GetGroupMemberships(account, groupsById, true);
+      const belongsToTargetPlatform = memberships.some((membership) => (
+        Array.isArray(membership.strictPlatforms)
+          && membership.strictPlatforms.includes(normalizedTargetPlatform)
+      ));
+      if (!belongsToTargetPlatform) continue;
+
+      const resolution = sub2ResolveModelSyncPlatform(account, groupsById);
+      const accountName = String(account?.name || `账号 ${accountId}`).trim() || `账号 ${accountId}`;
+      if (!resolution.ok || resolution.platform !== normalizedTargetPlatform) {
+        skipped.push({
+          accountId,
+          accountName,
+          reason: resolution.reason || 'target-platform-mismatch',
+          message: resolution.message || `账号不属于唯一的 ${normalizedTargetPlatform} 分组。`,
+        });
+        continue;
+      }
+      targets.push({ accountId, accountName, platform: normalizedTargetPlatform });
+    }
+
+    const compareByNameThenId = (leftItem, rightItem) => (
+      leftItem.accountName.localeCompare(rightItem.accountName)
+      || leftItem.accountId - rightItem.accountId
+    );
+    targets.sort(compareByNameThenId);
+    skipped.sort(compareByNameThenId);
+    return { targetPlatform: normalizedTargetPlatform, targets, skipped };
+  }
+
   function sub2NormalizeAccountBaseUrl(rawValue) {
     const value = String(rawValue || '').trim();
     if (!value) return { ok: false, baseUrl: '', hostname: '', reason: 'missing-url' };
@@ -5222,6 +5263,13 @@
       color:#334155;cursor:pointer;font-size:12px;font-weight:650;white-space:nowrap;}
     #${SUB2_PANEL_ID} .sub2-balance-import:hover{background:#f1f5f9;}
     #${SUB2_PANEL_ID} .sub2-balance-import:disabled{cursor:wait;opacity:.6;}
+    #${SUB2_PANEL_ID} .sub2-model-bulk-sync{height:30px;background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:0 10px;
+      color:#1d4ed8;cursor:pointer;font-size:12px;font-weight:650;white-space:nowrap;}
+    #${SUB2_PANEL_ID} .sub2-model-bulk-sync:hover{background:#dbeafe;}
+    #${SUB2_PANEL_ID} .sub2-model-bulk-sync:disabled{cursor:wait;opacity:.6;}
+    #${SUB2_PANEL_ID} .sub2-model-batch-state{padding:0 12px;color:#64748b;font-size:10px;line-height:1.45;overflow-wrap:anywhere;}
+    #${SUB2_PANEL_ID} .sub2-model-batch-state:empty{display:none;}
+    #${SUB2_PANEL_ID} .sub2-model-batch-state.error{color:#b91c1c;}
     #${SUB2_PANEL_ID} .sub2-list-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;
       padding:5px 12px;border-bottom:1px solid #f1f5f9;background:#fcfdff;}
     #${SUB2_PANEL_ID} .sub2-list-count{color:#64748b;font-size:10px;}
@@ -5628,6 +5676,13 @@
       this.modelMessage = '';
       this.modelError = '';
       this.modelRequestSequence = 0;
+      this.modelBatchSyncButtonElement = null;
+      this.modelBatchStateElement = null;
+      this.modelBatchSyncing = false;
+      this.modelBatchProgress = { completed: 0, total: 0 };
+      this.modelBatchMessage = '';
+      this.modelBatchError = '';
+      this.modelBatchRequestSequence = 0;
       this.savedModelsByAccountId = new Map();
       this.accountCreateOpen = false;
       this.accountCreatePhase = 'input';
@@ -5726,8 +5781,10 @@
             <input type="text" class="sub2-account-search" placeholder="搜索账号 / 平台 / 分组…" />
             <button class="sub2-refresh">刷新</button>
             <button type="button" class="sub2-balance-import">导入余额</button>
+            <button type="button" class="sub2-model-bulk-sync" title="按真实 group.platform=openai 批量同步所有 GPT 分组账号">同步 GPT 模型</button>
             <input type="file" class="sub2-balance-import-input" accept=".json,application/json" hidden />
           </div>
+          <div class="sub2-model-batch-state"></div>
           <div class="sub2-filter-grid">
             <div class="sub2-groupfilter">
               <button type="button" class="sub2-groupfilter-btn" title="按分组筛选">
@@ -5879,6 +5936,8 @@
       this.searchElement = this.root.querySelector('.sub2-account-search');
       this.balanceImportButtonElement = this.root.querySelector('.sub2-balance-import');
       this.balanceImportInputElement = this.root.querySelector('.sub2-balance-import-input');
+      this.modelBatchSyncButtonElement = this.root.querySelector('.sub2-model-bulk-sync');
+      this.modelBatchStateElement = this.root.querySelector('.sub2-model-batch-state');
       this.viewElement = this.root.querySelector('.sub2-view');
       this.sortElement = this.root.querySelector('.sub2-sort');
       this.groupFilterEl = this.root.querySelector('.sub2-groupfilter');
@@ -5926,6 +5985,7 @@
       this.root.querySelector('.sub2-events-open')?.addEventListener('click', () => this.openEventsDrawer());
       this.root.querySelector('.sub2-diagnostics-open')?.addEventListener('click', () => this.openDiagnosticsDrawer());
       this.root.querySelector('.sub2-refresh').addEventListener('click', () => this.refresh());
+      this.modelBatchSyncButtonElement?.addEventListener('click', (event) => this.handleBulkModelSync(event));
       this.balanceImportButtonElement?.addEventListener('click', (event) => {
         if (!event.isTrusted || this.balanceImportPending || !this.balanceImportInputElement) return;
         if (this.isAccountInteractionActive()) {
@@ -6220,6 +6280,7 @@
         || this.capacitySaving
         || this.balanceImportPending
         || this.balanceQueryingIds.size > 0
+        || this.modelBatchSyncing
         || this.accountCreateOpen
         || this.hasOpenQuotaEditor()
         || this.hasOpenCapacityEditor()
@@ -7499,7 +7560,7 @@
     buildRow(account, now, groupMembership = null) {
       const health = sub2ComputeHealth(account, now);
       const stats = this.statsById?.[account.id] || {};
-      const busy = this.busyIds.has(account.id);
+      const busy = this.busyIds.has(account.id) || this.modelBatchSyncing;
 
       const row = document.createElement('div');
       row.className = `sub2-row tone-${health.tone}`;
@@ -8907,7 +8968,241 @@
       if (!this.isAccountInteractionActive()) this.renderList();
     }
 
+    renderModelBatchControls() {
+      if (this.modelBatchSyncButtonElement) {
+        this.modelBatchSyncButtonElement.disabled = this.modelBatchSyncing
+          || this.modelLoading
+          || this.modelSyncing
+          || Boolean(this.activeEditor)
+          || this.accountCreateOpen;
+        this.modelBatchSyncButtonElement.textContent = this.modelBatchSyncing
+          ? `同步中 ${this.modelBatchProgress.completed}/${this.modelBatchProgress.total}`
+          : '同步 GPT 模型';
+      }
+      if (this.modelBatchStateElement) {
+        this.modelBatchStateElement.classList.toggle('error', Boolean(this.modelBatchError));
+        this.modelBatchStateElement.textContent = this.modelBatchError || this.modelBatchMessage;
+      }
+    }
+
+    async handleBulkModelSync(event) {
+      if (!event
+        || event.isTrusted !== true
+        || this.modelBatchSyncing
+        || this.modelLoading
+        || this.modelSyncing) return;
+      if (!this.closeAccountCreateModal(false)) return;
+      if (this.isAccountInteractionActive()) {
+        window.alert('请先完成或关闭当前账号操作，再批量同步模型。');
+        return;
+      }
+
+      this.closeModelDrawer();
+      this.closeDiagnosticsDrawer();
+      this.closeEventsDrawer();
+      this.closeAuditDrawer();
+
+      const requestSequence = ++this.modelBatchRequestSequence;
+      const requestIsCurrent = () => requestSequence === this.modelBatchRequestSequence;
+      const skipped = [];
+      const plannedSynchronizations = [];
+      const refreshedAccountsById = new Map();
+      let targetCount = 0;
+      let upstreamAccountCount = 0;
+      let fetchedModelCount = 0;
+      let allowedModelCount = 0;
+      let excludedModelCount = 0;
+      let addedModelCount = 0;
+      let removedModelCount = 0;
+      let writtenAccountCount = 0;
+      let unchangedAccountCount = 0;
+      let failedAccountCount = 0;
+
+      this.modelBatchSyncing = true;
+      this.modelBatchProgress = { completed: 0, total: 0 };
+      this.modelBatchMessage = '正在读取最新账号和分组…';
+      this.modelBatchError = '';
+      this.renderModelBatchControls();
+      this.renderList({ captureEditorFocus: false });
+
+      try {
+        const [accounts, groups] = await Promise.all([
+          sub2FetchAllAccounts(),
+          sub2FetchGroups(),
+        ]);
+        if (!requestIsCurrent()) return;
+        const groupsById = sub2BuildGroupIndex(groups);
+        const targetSelection = sub2CollectModelSyncTargets(accounts, groupsById, 'openai');
+        targetCount = targetSelection.targets.length;
+        skipped.push(...targetSelection.skipped);
+        this.modelBatchProgress = { completed: 0, total: targetCount };
+        this.renderModelBatchControls();
+
+        if (!targetCount) {
+          this.modelBatchMessage = '没有找到 platform=openai 且分组证据完整的 GPT 账号，未访问上游。';
+          return;
+        }
+
+        const skippedPreview = targetSelection.skipped.length
+          ? `另有 ${targetSelection.skipped.length} 个 GPT 分组账号会因分组证据不完整而跳过。`
+          : '';
+        const confirmed = window.confirm(
+          `将逐个读取并同步 ${targetCount} 个 GPT 分组账号的上游模型；只保留 GPT/OpenAI 文本模型。`
+          + `${skippedPreview} 过程只会写入 model_mapping，确定继续吗？`,
+        );
+        if (!confirmed) {
+          this.modelBatchMessage = `已取消 GPT 批量同步；目标 ${targetCount} 个账号均未访问上游。`;
+          return;
+        }
+
+        for (const target of targetSelection.targets) {
+          if (!requestIsCurrent()) return;
+          this.modelBatchMessage = `正在处理 ${target.accountName}（${this.modelBatchProgress.completed + 1}/${targetCount}）…`;
+          this.renderModelBatchControls();
+          try {
+            const latestAccount = await sub2FetchAccount(target.accountId);
+            if (!requestIsCurrent()) return;
+            if (!latestAccount || Number(latestAccount.id) !== target.accountId) {
+              throw new Error('最新账号详情无效。');
+            }
+
+            const platformResolution = sub2ResolveModelSyncPlatform(latestAccount, groupsById);
+            if (!platformResolution.ok || platformResolution.platform !== 'openai') {
+              skipped.push({
+                accountId: target.accountId,
+                accountName: target.accountName,
+                reason: platformResolution.reason || 'target-platform-mismatch',
+                message: platformResolution.message || '最新分组证据不再支持 GPT 同步。',
+              });
+              continue;
+            }
+            const mappingState = sub2GetVisibleModelMappingState(latestAccount);
+            if (!mappingState.known) {
+              skipped.push({
+                accountId: target.accountId,
+                accountName: target.accountName,
+                reason: 'mapping-unavailable',
+                message: '最新账号详情没有可安全读取的 model_mapping。',
+              });
+              continue;
+            }
+
+            const upstreamModels = await sub2SyncAccountModels(target.accountId);
+            upstreamAccountCount += 1;
+            const plan = sub2BuildModelSyncPlan(mappingState.modelMapping, upstreamModels, 'openai');
+            fetchedModelCount += plan.counts.fetched;
+            allowedModelCount += plan.counts.allowed;
+            excludedModelCount += plan.counts.excluded;
+            addedModelCount += plan.counts.added;
+            removedModelCount += plan.counts.removed;
+            if (plan.blocked) {
+              skipped.push({
+                accountId: target.accountId,
+                accountName: target.accountName,
+                reason: plan.reason || 'empty-allowed-models',
+                message: `${sub2FormatModelSyncCounts(plan.counts)}；没有可保存的目标模型。`,
+              });
+              continue;
+            }
+            plannedSynchronizations.push({
+              accountId: target.accountId,
+              accountName: target.accountName,
+              plan,
+            });
+          } catch (error) {
+            skipped.push({
+              accountId: target.accountId,
+              accountName: target.accountName,
+              reason: 'account-sync-failed',
+              message: String(error?.message || error),
+            });
+          } finally {
+            this.modelBatchProgress.completed += 1;
+            this.renderModelBatchControls();
+          }
+        }
+
+        const changedSynchronizations = plannedSynchronizations.filter(({ plan }) => plan.changed);
+        if (!changedSynchronizations.length) {
+          unchangedAccountCount = plannedSynchronizations.length;
+          this.modelBatchMessage = `GPT 批量同步完成：检查 ${targetCount} 个账号，${sub2FormatModelSyncCounts({
+            fetched: fetchedModelCount,
+            allowed: allowedModelCount,
+            excluded: excludedModelCount,
+            persisted: 0,
+          })}；映射已一致，无需写入；跳过 ${skipped.length} 个。`;
+          return;
+        }
+
+        if (removedModelCount > 0) {
+          const removalConfirmed = window.confirm(
+            `模型读取完成：将从 ${changedSynchronizations.length} 个账号中移除 ${removedModelCount} 个旧的系统模型映射，`
+              + `同时保留手工映射；确定继续写入吗？`,
+          );
+          if (!removalConfirmed) {
+            this.modelBatchMessage = `已取消写入；已读取 ${upstreamAccountCount} 个账号，现有映射保持不变。`;
+            return;
+          }
+        }
+
+        for (const synchronization of changedSynchronizations) {
+          if (!requestIsCurrent()) return;
+          this.modelBatchMessage = `正在保存 ${synchronization.accountName}（${writtenAccountCount + failedAccountCount + 1}/${changedSynchronizations.length}）…`;
+          this.renderModelBatchControls();
+          try {
+            await sub2PersistAccountModelMapping(
+              synchronization.accountId,
+              synchronization.plan.modelMapping,
+            );
+            const [savedAccount, savedModels] = await Promise.all([
+              sub2FetchAccount(synchronization.accountId),
+              sub2FetchAccountModels(synchronization.accountId),
+            ]);
+            const savedMappingState = sub2GetVisibleModelMappingState(savedAccount);
+            if (!savedMappingState.known
+              || !sub2ModelMappingsEqual(savedMappingState.modelMapping, synchronization.plan.modelMapping)) {
+              throw new Error('回读的 model_mapping 与预期结果不一致。');
+            }
+            writtenAccountCount += 1;
+            refreshedAccountsById.set(synchronization.accountId, savedAccount);
+            this.savedModelsByAccountId.set(synchronization.accountId, {
+              status: 'loaded',
+              models: savedModels,
+            });
+          } catch (error) {
+            failedAccountCount += 1;
+            skipped.push({
+              accountId: synchronization.accountId,
+              accountName: synchronization.accountName,
+              reason: 'mapping-write-failed',
+              message: String(error?.message || error),
+            });
+          }
+        }
+
+        unchangedAccountCount = plannedSynchronizations.length - changedSynchronizations.length;
+        this.accounts = accounts.map((account) => (
+          refreshedAccountsById.get(Number(account?.id)) || account
+        ));
+        this.groupsById = groupsById;
+        const skippedSuffix = skipped.length ? `；跳过/失败 ${skipped.length} 个` : '';
+        this.modelBatchMessage = `GPT 批量同步完成：目标 ${targetCount} 个，成功写入 ${writtenAccountCount} 个，`
+          + `无需写入 ${unchangedAccountCount} 个，模型账号读取 ${upstreamAccountCount} 个，`
+          + `抓取 ${fetchedModelCount} 个、允许 ${allowedModelCount} 个、排除 ${excludedModelCount} 个，`
+          + `新增映射 ${addedModelCount} 个、移除 ${removedModelCount} 个${skippedSuffix}。`;
+      } catch (error) {
+        if (requestIsCurrent()) this.modelBatchError = `GPT 批量同步失败：${error?.message || error}`;
+      } finally {
+        if (requestIsCurrent()) {
+          this.modelBatchSyncing = false;
+          this.renderModelBatchControls();
+          this.renderList({ captureEditorFocus: false });
+        }
+      }
+    }
+
     async openModelDrawer(account) {
+      if (this.modelBatchSyncing) return;
       if (!this.closeAccountCreateModal(false)) return;
       this.closeEventsDrawer();
       this.closeDiagnosticsDrawer();
@@ -9035,7 +9330,11 @@
     }
 
     async handleSyncModels(userInitiated = false) {
-      if (userInitiated !== true || !this.modelAccount || this.modelLoading || this.modelSyncing) return;
+      if (userInitiated !== true
+        || !this.modelAccount
+        || this.modelLoading
+        || this.modelSyncing
+        || this.modelBatchSyncing) return;
       const accountId = Number(this.modelAccount.id);
       if (!Number.isInteger(accountId) || accountId <= 0) return;
       const requestSequence = ++this.modelRequestSequence;
@@ -9592,6 +9891,7 @@
     sub2BuildModelSyncPlan,
     sub2BuildModelMappingBulkUpdatePayload,
     sub2FormatModelSyncCounts,
+    sub2CollectModelSyncTargets,
     sub2ResolveModelSyncPlatform,
     sub2NormalizeAccountBaseUrl,
     sub2EvaluateAccountPreviewCandidates,
